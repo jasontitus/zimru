@@ -1,0 +1,1 @@
+a full re-implementation of zim file management in Rust. no shared code. ideally would be developed while running the libzim test suite against it (without including or changing the tests themselves)  
