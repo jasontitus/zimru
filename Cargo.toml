@@ -1,0 +1,60 @@
+[package]
+name = "zimru"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Independent Rust re-implementation of the ZIM file format reader (clean-room, MIT-licensed)."
+repository = "https://github.com/jasontitus/zimru"
+readme = "README.md"
+keywords = ["zim", "openzim", "wikipedia", "kiwix"]
+categories = ["filesystem", "compression", "parser-implementations"]
+
+[lib]
+name = "zimru"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zimru"
+path = "src/bin/zimru.rs"
+
+[[bin]]
+name = "zimcheck"
+path = "src/bin/zimcheck.rs"
+
+[[bin]]
+name = "zimdump"
+path = "src/bin/zimdump.rs"
+
+[[bin]]
+name = "zimbench"
+path = "src/bin/zimbench.rs"
+
+[[bin]]
+name = "zimsplit"
+path = "src/bin/zimsplit.rs"
+
+[[bin]]
+name = "zimrecreate"
+path = "src/bin/zimrecreate.rs"
+
+[[bin]]
+name = "zimwriterfs"
+path = "src/bin/zimwriterfs.rs"
+
+[dependencies]
+memmap2 = "0.9"
+zstd = { version = "0.13", default-features = false }
+xz2 = "0.1"
+md-5 = { version = "0.10", features = ["asm"] }
+rayon = "1"
+thiserror = "2"
+
+[dev-dependencies]
+hex = "0.4"
+md-5 = { version = "0.10", features = ["asm"] }
+zstd = { version = "0.13", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

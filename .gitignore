@@ -1,0 +1,10 @@
+/target
+Cargo.lock
+/zim-cache
+*.zim
+*.zim.*
+
+# Benchmark + parity output (large, regenerable)
+bench/parity-out/
+bench/upstream-out/
+bench/results-*.md
