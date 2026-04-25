@@ -64,9 +64,17 @@ fn build_site(root: &Path) {
         root.join("about.html"),
         b"<!DOCTYPE html><html><head><title>About</title></head><body><p>About this archive.</p></body></html>",
     ).unwrap();
-    fs::write(root.join("styles.css"), b"body { font-family: sans-serif; }").unwrap();
+    fs::write(
+        root.join("styles.css"),
+        b"body { font-family: sans-serif; }",
+    )
+    .unwrap();
     fs::write(root.join("icon48.png"), minimal_png()).unwrap();
-    fs::write(root.join("images/photo.jpg"), b"\xff\xd8\xff\xe0FAKE-JPEG-DATA").unwrap();
+    fs::write(
+        root.join("images/photo.jpg"),
+        b"\xff\xd8\xff\xe0FAKE-JPEG-DATA",
+    )
+    .unwrap();
 }
 
 fn tmp_dir(tag: &str) -> PathBuf {
@@ -74,7 +82,10 @@ fn tmp_dir(tag: &str) -> PathBuf {
     p.push(format!(
         "zimru-zwfs-{tag}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
     ));
     fs::create_dir_all(&p).unwrap();
     p
@@ -84,12 +95,18 @@ fn tmp_dir(tag: &str) -> PathBuf {
 fn zimwriterfs_packs_a_directory_into_a_valid_zim() {
     let bin = binary();
     if !bin.exists() {
-        eprintln!("skip: {} not built (run `cargo build --release`)", bin.display());
+        eprintln!(
+            "skip: {} not built (run `cargo build --release`)",
+            bin.display()
+        );
         return;
     }
     let site = tmp_dir("site");
     build_site(&site);
-    let zim = site.parent().unwrap().join(format!("{}.zim", site.file_name().unwrap().to_string_lossy()));
+    let zim = site.parent().unwrap().join(format!(
+        "{}.zim",
+        site.file_name().unwrap().to_string_lossy()
+    ));
 
     let status = Command::new(&bin)
         .args([
@@ -120,7 +137,10 @@ fn zimwriterfs_packs_a_directory_into_a_valid_zim() {
     ];
     for (path, needle) in want {
         let body = a.get_text(path).expect(path);
-        assert!(body.contains(needle), "{path} missing `{needle}` (got: {body})");
+        assert!(
+            body.contains(needle),
+            "{path} missing `{needle}` (got: {body})"
+        );
     }
     // Non-text file bytes survive.
     assert_eq!(
@@ -129,7 +149,10 @@ fn zimwriterfs_packs_a_directory_into_a_valid_zim() {
     );
 
     // Mandatory metadata round-trips.
-    assert_eq!(a.metadata_str("Title").unwrap(), "zimru zimwriterfs e2e test");
+    assert_eq!(
+        a.metadata_str("Title").unwrap(),
+        "zimru zimwriterfs e2e test"
+    );
     assert_eq!(a.metadata_str("Language").unwrap(), "eng");
     assert_eq!(a.metadata_str("Creator").unwrap(), "zimru-tests");
     assert!(a.has_metadata("Illustration_48x48@1"));
@@ -137,7 +160,11 @@ fn zimwriterfs_packs_a_directory_into_a_valid_zim() {
     // Our checksum and (if available) upstream zimcheck both pass.
     assert!(a.check().unwrap(), "trailing MD5 mismatch");
     if let Some(zc) = upstream_zimcheck() {
-        let out = Command::new(&zc).arg("-A").arg(&zim).output().expect("zimcheck");
+        let out = Command::new(&zc)
+            .arg("-A")
+            .arg(&zim)
+            .output()
+            .expect("zimcheck");
         let s = String::from_utf8_lossy(&out.stdout);
         assert!(
             s.contains("Overall Test Status: Pass"),
@@ -153,12 +180,17 @@ fn zimwriterfs_packs_a_directory_into_a_valid_zim() {
 #[test]
 fn zimwriterfs_redirects_file_is_honoured() {
     let bin = binary();
-    if !bin.exists() { return; }
+    if !bin.exists() {
+        return;
+    }
     let site = tmp_dir("redir");
     build_site(&site);
     let redir = site.join("redirects.tsv");
     fs::write(&redir, "start\tStart\tindex.html\nhome\tHome\tindex.html\n").unwrap();
-    let zim = site.parent().unwrap().join(format!("{}.zim", site.file_name().unwrap().to_string_lossy()));
+    let zim = site.parent().unwrap().join(format!(
+        "{}.zim",
+        site.file_name().unwrap().to_string_lossy()
+    ));
     let status = Command::new(&bin)
         .args([
             "--welcome=index.html",
@@ -170,10 +202,12 @@ fn zimwriterfs_redirects_file_is_honoured() {
             "--creator=zimru",
             "--publisher=zimru",
         ])
-        .arg("--redirects").arg(&redir)
+        .arg("--redirects")
+        .arg(&redir)
         .arg(&site)
         .arg(&zim)
-        .status().expect("run");
+        .status()
+        .expect("run");
     assert!(status.success());
 
     let a = Archive::open(&zim).unwrap();
@@ -200,13 +234,15 @@ fn zimwriterfs_matches_upstream_writerfs_shape() {
         eprintln!("skip: upstream zimwriterfs not installed");
         return;
     };
-    if !bin.exists() { return; }
+    if !bin.exists() {
+        return;
+    }
 
     let site = tmp_dir("compare");
     build_site(&site);
 
     let our_zim = site.parent().unwrap().join("our.zim");
-    let up_zim  = site.parent().unwrap().join("up.zim");
+    let up_zim = site.parent().unwrap().join("up.zim");
 
     let common_args = [
         "--welcome=index.html",
@@ -225,10 +261,26 @@ fn zimwriterfs_matches_upstream_writerfs_shape() {
     let _ = fs::remove_file(&our_zim);
     let _ = fs::remove_file(&up_zim);
 
-    let our_status = Command::new(&bin).args(common_args).arg(&site).arg(&our_zim).status().unwrap();
-    assert!(our_status.success(), "zimru zimwriterfs failed: {our_status:?}");
-    let up_status = Command::new(&up_bin).args(common_args).arg(&site).arg(&up_zim).status().unwrap();
-    assert!(up_status.success(), "upstream zimwriterfs failed: {up_status:?}");
+    let our_status = Command::new(&bin)
+        .args(common_args)
+        .arg(&site)
+        .arg(&our_zim)
+        .status()
+        .unwrap();
+    assert!(
+        our_status.success(),
+        "zimru zimwriterfs failed: {our_status:?}"
+    );
+    let up_status = Command::new(&up_bin)
+        .args(common_args)
+        .arg(&site)
+        .arg(&up_zim)
+        .status()
+        .unwrap();
+    assert!(
+        up_status.success(),
+        "upstream zimwriterfs failed: {up_status:?}"
+    );
 
     // Both should be valid per upstream zimcheck.
     if let Some(zc) = upstream_zimcheck() {
@@ -241,9 +293,15 @@ fn zimwriterfs_matches_upstream_writerfs_shape() {
 
     // Same set of C-namespace paths in both archives.
     let our = Archive::open(&our_zim).unwrap();
-    let up  = Archive::open(&up_zim).unwrap();
-    let mut our_paths: Vec<String> = our.content_entries().filter_map(|e| e.ok().map(|e| e.path().to_string())).collect();
-    let mut up_paths:  Vec<String> = up .content_entries().filter_map(|e| e.ok().map(|e| e.path().to_string())).collect();
+    let up = Archive::open(&up_zim).unwrap();
+    let mut our_paths: Vec<String> = our
+        .content_entries()
+        .filter_map(|e| e.ok().map(|e| e.path().to_string()))
+        .collect();
+    let mut up_paths: Vec<String> = up
+        .content_entries()
+        .filter_map(|e| e.ok().map(|e| e.path().to_string()))
+        .collect();
     our_paths.sort();
     up_paths.sort();
     assert_eq!(

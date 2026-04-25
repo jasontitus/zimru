@@ -69,7 +69,9 @@ impl Cluster {
         let body = &raw[1..];
 
         let (payload, compression): (Arc<[u8]>, Compression) = match compression_id {
-            COMPRESSION_NONE_LEGACY | COMPRESSION_NONE => (Arc::from(body.to_vec()), Compression::None),
+            COMPRESSION_NONE_LEGACY | COMPRESSION_NONE => {
+                (Arc::from(body.to_vec()), Compression::None)
+            }
             COMPRESSION_XZ => (Arc::from(decode_xz(body)?), Compression::Xz),
             COMPRESSION_ZSTD => (Arc::from(decode_zstd(body)?), Compression::Zstd),
             COMPRESSION_ZLIB | COMPRESSION_BZIP2 => {

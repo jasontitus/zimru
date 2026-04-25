@@ -148,18 +148,28 @@ size_t           zimru_blob_size(const zimru_blob_t*);
 /* … iterators, search, writer, etc. */
 ```
 
-### P2. Decide on Xapian (architecturally blocking for libkiwix)
+### P2. Xapian — DECIDED: out of scope for zimru
 
-libkiwix's value-add is Xapian-backed multi-archive search /
-suggestions. Three paths, decide before P3 is meaningful:
+**Decision:** zimru deliberately does not implement Xapian fulltext or
+suggestion search. Xapian is GPL v2; linking it into zimru would force
+every binary that embeds zimru to be GPL, defeating the MIT licence.
 
-| path | pros | cons |
-|---|---|---|
-| **A. zimru implements Xapian-equivalent search** | fully MIT, single dep | substantial work; pulling Xapian C++ into a Rust crate has friction |
-| **B. shim links real libzim *only* for search; reader/writer go to zimru** | smaller zimru scope, fastest path to libkiwix-on-zimru | linker complexity, symbol-name collisions need namespacing, awkward operationally |
-| **C. ship without search, gate libkiwix usage to no-search profiles** | smallest code | breaks `kiwix-serve`'s search/suggestion endpoints |
+Search is therefore pushed to the layer above zimru:
 
-This decision drives whether libzim-shim gains a `searcher.cpp` etc.
+- **GPL consumers** (kiwix-tools, kiwix-serve, kiwix-desktop,
+  kiwix-android, kiwix-apple) get Xapian via `libzim-shim`. The shim
+  is already GPL v2, so it can link Xapian freely and implement
+  `zim::Searcher` / `zim::SuggestionSearcher` natively.
+- **Non-GPL consumers** build their own search stack on top of zimru
+  — Tantivy, a custom index, server-side search, or no search at all.
+  zimru exposes everything needed to harvest fulltext for indexing
+  (parallel cluster decompression, zero-copy blobs, MIME filtering).
+
+Implications for the shim repo: it grows a `searcher.cpp` etc. that
+links Xapian directly. zimru's surface area stays tight.
+
+This decision is also documented in zimru's
+[`README.md` → Licensing & clean-room policy](../blob/main/README.md#why-xapian-fulltext-search-is-out-of-scope-rather-than-todo).
 
 ### P3. (Optional, but desirable) Stable Rust API
 
@@ -234,8 +244,8 @@ Beyond that, work proceeds per the sequencing list above.
 
 Before committing to specific designs, decide:
 
-1. **Xapian path** — A, B, or C from P2 above. Drives whether zimru
-   grows a `search` feature or whether the shim has a hybrid linkage.
+1. ~~**Xapian path**~~ — **decided**: out of scope for zimru, lives in
+   the shim. See P2 above.
 2. **Stable C ABI vs. evolving** — do we commit to ABI stability from
    zimru 0.2.0, or version it (`zimru-cffi-0.2.so`) and let the shim
    target a specific minor?

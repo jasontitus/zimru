@@ -292,14 +292,17 @@ fn round_trips_articles_and_redirects_uncompressed() {
     assert_eq!(arc.cluster_count(), 1);
     assert!(arc.has_main_entry());
     assert!(arc.has_checksum());
-    assert_eq!(arc.check().unwrap(), true, "checksum should verify");
+    assert!(arc.check().unwrap(), "checksum should verify");
 
     // Path lookup
     let apple = arc.get_entry_by_path("apple").unwrap();
     assert_eq!(apple.title(), "Apple");
     assert!(!apple.is_redirect());
     assert_eq!(apple.get_item(false).unwrap().mimetype(), "text/html");
-    assert_eq!(apple.get_item(false).unwrap().get_data().unwrap().data(), body_apple);
+    assert_eq!(
+        apple.get_item(false).unwrap().get_data().unwrap().data(),
+        body_apple
+    );
 
     // Redirect resolution
     let fruit = arc.get_entry_by_path("fruit").unwrap();
@@ -374,13 +377,29 @@ fn round_trips_zstd_compressed_cluster() {
         }),
     ];
     let title_order = vec![0u32, 1];
-    let zim = build_zim(true, None, &dirents, &title_order, &[cluster], &["text/plain"], true);
+    let zim = build_zim(
+        true,
+        None,
+        &dirents,
+        &title_order,
+        &[cluster],
+        &["text/plain"],
+        true,
+    );
     let path = write_temp("zstd", &zim);
     let arc = Archive::open(&path).unwrap();
     assert!(arc.check().unwrap());
-    let big = arc.get_entry_by_path("big").unwrap().get_item(false).unwrap();
+    let big = arc
+        .get_entry_by_path("big")
+        .unwrap()
+        .get_item(false)
+        .unwrap();
     assert_eq!(big.get_data().unwrap().data(), body.as_slice());
-    let small = arc.get_entry_by_path("small").unwrap().get_item(false).unwrap();
+    let small = arc
+        .get_entry_by_path("small")
+        .unwrap()
+        .get_item(false)
+        .unwrap();
     assert_eq!(small.get_data().unwrap().data(), b"small");
     let _ = std::fs::remove_file(&path);
 }
@@ -396,11 +415,25 @@ fn lookup_returns_not_found() {
         cluster: 0,
         blob: 0,
     })];
-    let zim = build_zim(true, None, &dirents, &[0], &[cluster], &["text/plain"], false);
+    let zim = build_zim(
+        true,
+        None,
+        &dirents,
+        &[0],
+        &[cluster],
+        &["text/plain"],
+        false,
+    );
     let path = write_temp("notfound", &zim);
     let arc = Archive::open(&path).unwrap();
-    assert!(matches!(arc.get_entry_by_path("missing"), Err(Error::EntryNotFound)));
-    assert!(matches!(arc.get_entry_by_title("Missing"), Err(Error::EntryNotFound)));
+    assert!(matches!(
+        arc.get_entry_by_path("missing"),
+        Err(Error::EntryNotFound)
+    ));
+    assert!(matches!(
+        arc.get_entry_by_title("Missing"),
+        Err(Error::EntryNotFound)
+    ));
     assert!(!arc.has_checksum());
     assert!(matches!(arc.check(), Err(Error::NoChecksum)));
     let _ = std::fs::remove_file(&path);
@@ -417,13 +450,21 @@ fn detects_corrupted_checksum() {
         cluster: 0,
         blob: 0,
     })];
-    let mut zim = build_zim(true, None, &dirents, &[0], &[cluster], &["text/plain"], true);
+    let mut zim = build_zim(
+        true,
+        None,
+        &dirents,
+        &[0],
+        &[cluster],
+        &["text/plain"],
+        true,
+    );
     // Flip the very first byte of the trailing checksum.
     let cs_pos = zim.len() - 16;
     zim[cs_pos] ^= 0xFF;
     let path = write_temp("badcrc", &zim);
     let arc = Archive::open(&path).unwrap();
     assert!(arc.has_checksum());
-    assert_eq!(arc.check().unwrap(), false);
+    assert!(!arc.check().unwrap());
     let _ = std::fs::remove_file(&path);
 }

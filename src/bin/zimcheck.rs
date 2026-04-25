@@ -34,8 +34,12 @@ const VERSION: &str = "0.1.0";
 
 #[cfg(unix)]
 fn restore_sigpipe() {
-    extern "C" { fn signal(signum: i32, handler: usize) -> usize; }
-    unsafe { let _ = signal(13, 0); }
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    unsafe {
+        let _ = signal(13, 0);
+    }
 }
 #[cfg(not(unix))]
 fn restore_sigpipe() {}
@@ -115,16 +119,36 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "-A" | "--all" => o.all = true,
-            "-C" | "--checksum" => { o.checks.insert(Check::Checksum); }
-            "-I" | "--integrity" => { o.checks.insert(Check::Integrity); }
-            "-0" | "--empty" => { o.checks.insert(Check::Empty); }
-            "-M" | "--metadata" => { o.checks.insert(Check::Metadata); }
-            "-F" | "--favicon" => { o.checks.insert(Check::Favicon); }
-            "-P" | "--main" => { o.checks.insert(Check::MainPage); }
-            "-R" | "--redundant" => { o.checks.insert(Check::Redundant); }
-            "-U" | "--url_internal" => { o.checks.insert(Check::UrlInternal); }
-            "-X" | "--url_external" => { o.checks.insert(Check::UrlExternal); }
-            "-L" | "--redirect_loop" => { o.checks.insert(Check::Redirect); }
+            "-C" | "--checksum" => {
+                o.checks.insert(Check::Checksum);
+            }
+            "-I" | "--integrity" => {
+                o.checks.insert(Check::Integrity);
+            }
+            "-0" | "--empty" => {
+                o.checks.insert(Check::Empty);
+            }
+            "-M" | "--metadata" => {
+                o.checks.insert(Check::Metadata);
+            }
+            "-F" | "--favicon" => {
+                o.checks.insert(Check::Favicon);
+            }
+            "-P" | "--main" => {
+                o.checks.insert(Check::MainPage);
+            }
+            "-R" | "--redundant" => {
+                o.checks.insert(Check::Redundant);
+            }
+            "-U" | "--url_internal" => {
+                o.checks.insert(Check::UrlInternal);
+            }
+            "-X" | "--url_external" => {
+                o.checks.insert(Check::UrlExternal);
+            }
+            "-L" | "--redirect_loop" => {
+                o.checks.insert(Check::Redirect);
+            }
             "-D" | "--details" => o.details = true,
             "-B" | "--progress" => o.progress = true,
             "-J" | "--json" => o.json = true,
@@ -170,7 +194,11 @@ fn main() -> ExitCode {
     } else {
         report.print_text();
     }
-    if pass { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn print_help() {
@@ -197,9 +225,19 @@ struct LogLine {
 /// Structured payload attached to each log entry, so the JSON output can
 /// reproduce the per-check field shapes upstream emits.
 enum JsonExtra {
-    Redundant { path1: String, path2: String },
-    UrlInternal { article: String, link: String, normalized_link: String },
-    UrlExternal { article: String, url: String },
+    Redundant {
+        path1: String,
+        path2: String,
+    },
+    UrlInternal {
+        article: String,
+        link: String,
+        normalized_link: String,
+    },
+    UrlExternal {
+        article: String,
+        url: String,
+    },
 }
 
 struct JsonLog {
@@ -234,22 +272,46 @@ impl Report {
         self.preamble_warns.push(s.into());
     }
     fn add_info<S: Into<String>>(&mut self, s: S) {
-        self.infos.push(LogLine { bucket: Bucket::Info, is_header: true, text: s.into() });
+        self.infos.push(LogLine {
+            bucket: Bucket::Info,
+            is_header: true,
+            text: s.into(),
+        });
     }
     fn add_info_body<S: Into<String>>(&mut self, s: S) {
-        self.infos.push(LogLine { bucket: Bucket::Info, is_header: false, text: s.into() });
+        self.infos.push(LogLine {
+            bucket: Bucket::Info,
+            is_header: false,
+            text: s.into(),
+        });
     }
     fn add_warn<S: Into<String>>(&mut self, s: S) {
-        self.warns.push(LogLine { bucket: Bucket::Warning, is_header: true, text: s.into() });
+        self.warns.push(LogLine {
+            bucket: Bucket::Warning,
+            is_header: true,
+            text: s.into(),
+        });
     }
     fn add_warn_body<S: Into<String>>(&mut self, s: S) {
-        self.warns.push(LogLine { bucket: Bucket::Warning, is_header: false, text: s.into() });
+        self.warns.push(LogLine {
+            bucket: Bucket::Warning,
+            is_header: false,
+            text: s.into(),
+        });
     }
     fn add_error<S: Into<String>>(&mut self, _c: Check, s: S) {
-        self.errs.push(LogLine { bucket: Bucket::Error, is_header: true, text: s.into() });
+        self.errs.push(LogLine {
+            bucket: Bucket::Error,
+            is_header: true,
+            text: s.into(),
+        });
     }
     fn add_error_body<S: Into<String>>(&mut self, _c: Check, s: S) {
-        self.errs.push(LogLine { bucket: Bucket::Error, is_header: false, text: s.into() });
+        self.errs.push(LogLine {
+            bucket: Bucket::Error,
+            is_header: false,
+            text: s.into(),
+        });
     }
     fn errors(&self) -> impl Iterator<Item = &LogLine> {
         self.errs.iter().filter(|l| l.is_header)
@@ -280,7 +342,10 @@ impl Report {
         if self.elapsed_secs < 3 {
             println!("[INFO] Total time taken by zimcheck: <3 seconds.");
         } else {
-            println!("[INFO] Total time taken by zimcheck: {} seconds.", self.elapsed_secs);
+            println!(
+                "[INFO] Total time taken by zimcheck: {} seconds.",
+                self.elapsed_secs
+            );
         }
     }
 
@@ -307,20 +372,27 @@ impl Report {
         println!("  \"zimcheck_version\" : \"{VERSION}\",");
         print!("  \"checks\" : [");
         for (i, c) in self.checks.iter().enumerate() {
-            if i > 0 { print!(","); }
+            if i > 0 {
+                print!(",");
+            }
             print!("\n    \"{}\"", c.name());
         }
         println!("\n  ],");
         println!("  \"file_name\" : \"{}\",", esc(&self.file_name));
         println!("  \"file_uuid\" : \"{}\",", esc(&self.file_uuid));
-        println!("  \"status\" : {},", if self.pass { "true" } else { "false" });
+        println!(
+            "  \"status\" : {},",
+            if self.pass { "true" } else { "false" }
+        );
         if self.entries.is_empty() {
             println!("  \"logs\" : [");
             println!("  ]");
         } else {
             println!("  \"logs\" : [");
             for (i, e) in self.entries.iter().enumerate() {
-                if i > 0 { println!(","); }
+                if i > 0 {
+                    println!(",");
+                }
                 println!("    {{");
                 println!("      \"check\" : \"{}\",", e.check.name());
                 println!("      \"level\" : \"{}\",", e.level);
@@ -330,7 +402,11 @@ impl Report {
                         println!("      \"path1\" : \"{}\",", esc(path1));
                         println!("      \"path2\" : \"{}\"", esc(path2));
                     }
-                    JsonExtra::UrlInternal { article, link, normalized_link } => {
+                    JsonExtra::UrlInternal {
+                        article,
+                        link,
+                        normalized_link,
+                    } => {
                         println!("      \"message\" : \"{}\",", esc(&e.message));
                         println!("      \"links\" : [");
                         println!("        \"{}\"", esc(link));
@@ -357,7 +433,10 @@ fn run_checks(file: &str, arc: &Archive, o: &Opts) -> Report {
     let mut report = Report {
         file_name: file.to_string(),
         file_uuid: format_uuid(&arc.header().uuid),
-        checks: Check::all().into_iter().filter(|c| o.checks.contains(c)).collect(),
+        checks: Check::all()
+            .into_iter()
+            .filter(|c| o.checks.contains(c))
+            .collect(),
         ..Default::default()
     };
 
@@ -374,11 +453,17 @@ fn run_checks(file: &str, arc: &Archive, o: &Opts) -> Report {
     if o.checks.contains(&Check::Integrity) {
         report.add_info("Verifying ZIM-archive structure integrity...".to_string());
         if let Err(e) = check_integrity(arc) {
-            report.add_error(Check::Integrity, format!("ZIM file's low level structure is invalid: {e}"));
+            report.add_error(
+                Check::Integrity,
+                format!("ZIM file's low level structure is invalid: {e}"),
+            );
         }
         // libzim runs checksum as part of integrity, skipping a separate step.
         if o.checks.contains(&Check::Checksum) {
-            report.add_info("Avoiding redundant checksum test (already performed by the integrity check).".to_string());
+            report.add_info(
+                "Avoiding redundant checksum test (already performed by the integrity check)."
+                    .to_string(),
+            );
         }
     } else if o.checks.contains(&Check::Checksum) {
         report.add_info("Verifying Internal Checksum...".to_string());
@@ -423,7 +508,14 @@ fn run_checks(file: &str, arc: &Archive, o: &Opts) -> Report {
         check_redirect_loops(arc, &mut report);
     }
     if need_any_content {
-        scan_content(arc, &mut report, need_empty, need_redundant, need_url_int, need_url_ext);
+        scan_content(
+            arc,
+            &mut report,
+            need_empty,
+            need_redundant,
+            need_url_int,
+            need_url_ext,
+        );
     }
 
     let elapsed = started.elapsed();
@@ -443,16 +535,14 @@ fn check_integrity(arc: &Archive) -> Result<(), Error> {
     }
     // Validate every cluster parses and yields valid blob ranges.
     for c in 0..h.cluster_count {
-        let _ = touch_cluster(arc, c)?;
+        touch_cluster(arc, c)?;
     }
     // MD5 trailer
-    if h.has_checksum() {
-        if !arc.check()? {
-            return Err(Error::ChecksumMismatch {
-                expected: "stored".into(),
-                computed: "computed".into(),
-            });
-        }
+    if h.has_checksum() && !arc.check()? {
+        return Err(Error::ChecksumMismatch {
+            expected: "stored".into(),
+            computed: "computed".into(),
+        });
     }
     Ok(())
 }
@@ -466,17 +556,20 @@ fn touch_cluster(arc: &Archive, _c: u32) -> Result<(), Error> {
 }
 
 const REQUIRED_METADATA: &[&str] = &[
-    "Title", "Description", "Language", "Creator", "Publisher", "Date", "Name",
+    "Title",
+    "Description",
+    "Language",
+    "Creator",
+    "Publisher",
+    "Date",
+    "Name",
 ];
 
 fn check_metadata(arc: &Archive, report: &mut Report) {
     let keys: HashSet<String> = arc.get_metadata_keys().into_iter().collect();
     for k in REQUIRED_METADATA {
         if !keys.contains(*k) {
-            report.add_error(
-                Check::Metadata,
-                format!("Missing mandatory metadata: {k}"),
-            );
+            report.add_error(Check::Metadata, format!("Missing mandatory metadata: {k}"));
         }
     }
 }
@@ -503,7 +596,10 @@ fn check_main_page(arc: &Archive, report: &mut Report) {
         }
     };
     if let Err(e) = main.get_item(true) {
-        report.add_error(Check::MainPage, format!("Main page resolves to no item: {e}"));
+        report.add_error(
+            Check::MainPage,
+            format!("Main page resolves to no item: {e}"),
+        );
     }
 }
 
@@ -533,9 +629,16 @@ fn scan_content(
     let mut by_cluster: HashMap<u32, Vec<BlobRef>> = HashMap::new();
     for entry in arc.iter_by_path() {
         let Ok(e) = entry else { continue };
-        if e.is_redirect() || e.namespace() != b'C' { continue; }
-        let Dirent::Article(a) = e.dirent().clone() else { continue };
-        let mt = mime_list.get(a.mimetype).unwrap_or("application/octet-stream").to_string();
+        if e.is_redirect() || e.namespace() != b'C' {
+            continue;
+        }
+        let Dirent::Article(a) = e.dirent().clone() else {
+            continue;
+        };
+        let mt = mime_list
+            .get(a.mimetype)
+            .unwrap_or("application/octet-stream")
+            .to_string();
         by_cluster.entry(a.cluster).or_default().push(BlobRef {
             url_index: e.index(),
             path: a.url,
@@ -597,14 +700,26 @@ fn scan_content(
                 if (do_internal || do_external) && b.mimetype.starts_with("text/html") {
                     if let Ok(text) = std::str::from_utf8(bytes) {
                         for (kind, target) in extract_link_targets(text) {
-                            if !looks_like_url(target) { continue; }
-                            if do_external && kind == "src" && (target.starts_with("http://") || target.starts_with("https://")) && !b.path.starts_with('_') {
+                            if !looks_like_url(target) {
+                                continue;
+                            }
+                            if do_external
+                                && kind == "src"
+                                && (target.starts_with("http://") || target.starts_with("https://"))
+                                && !b.path.starts_with('_')
+                            {
                                 f.external.push(target.to_string());
                             }
                             if do_internal {
                                 let stripped = target.strip_prefix("./").unwrap_or(target);
-                                if !(stripped.contains("://") || has_scheme(stripped) || stripped.starts_with("//") || stripped.starts_with('#') || stripped.is_empty()) {
-                                    let no_frag = stripped.split(['#', '?']).next().unwrap_or(stripped);
+                                if !(stripped.contains("://")
+                                    || has_scheme(stripped)
+                                    || stripped.starts_with("//")
+                                    || stripped.starts_with('#')
+                                    || stripped.is_empty())
+                                {
+                                    let no_frag =
+                                        stripped.split(['#', '?']).next().unwrap_or(stripped);
                                     let decoded = percent_decode(no_frag);
                                     let resolved = resolve_relative(&b.path, &decoded);
                                     if arc.entry_by_ns_path(b'C', &resolved).is_err() {
@@ -619,7 +734,10 @@ fn scan_content(
             }
             out
         })
-        .reduce(Vec::new, |mut acc, mut v| { acc.append(&mut v); acc });
+        .reduce(Vec::new, |mut acc, mut v| {
+            acc.append(&mut v);
+            acc
+        });
 
     // Aggregate in url-pointer order so the report is deterministic.
     let mut findings = findings;
@@ -649,7 +767,9 @@ fn scan_content(
         }
         let mut emitted_header = false;
         for (paths, _) in &groups {
-            if paths.len() < 2 { continue; }
+            if paths.len() < 2 {
+                continue;
+            }
             if !emitted_header {
                 report.add_warn("Redundant data found:".to_string());
                 emitted_header = true;
@@ -660,7 +780,10 @@ fn scan_content(
                     check: Check::Redundant,
                     level: "WARNING",
                     message: format!("{} and {}", w[0], w[1]),
-                    extra: JsonExtra::Redundant { path1: w[0].clone(), path2: w[1].clone() },
+                    extra: JsonExtra::Redundant {
+                        path1: w[0].clone(),
+                        path2: w[1].clone(),
+                    },
                 });
             }
         }
@@ -670,7 +793,10 @@ fn scan_content(
     if do_internal {
         let any = findings.iter().any(|f| !f.dangling.is_empty());
         if any {
-            report.add_error(Check::UrlInternal, "Invalid internal links found:".to_string());
+            report.add_error(
+                Check::UrlInternal,
+                "Invalid internal links found:".to_string(),
+            );
             for f in &findings {
                 for (raw, resolved) in &f.dangling {
                     report.add_error_body(Check::UrlInternal, "  The following links:".to_string());
@@ -699,7 +825,10 @@ fn scan_content(
     if do_external {
         let any = findings.iter().any(|f| !f.external.is_empty());
         if any {
-            report.add_error(Check::UrlExternal, "Invalid external links found:".to_string());
+            report.add_error(
+                Check::UrlExternal,
+                "Invalid external links found:".to_string(),
+            );
             for f in &findings {
                 for url in &f.external {
                     let msg = format!("{url} is an external dependence in article {}", f.path);
@@ -708,7 +837,10 @@ fn scan_content(
                         check: Check::UrlExternal,
                         level: "ERROR",
                         message: msg,
-                        extra: JsonExtra::UrlExternal { article: f.path.clone(), url: url.clone() },
+                        extra: JsonExtra::UrlExternal {
+                            article: f.path.clone(),
+                            url: url.clone(),
+                        },
                     });
                 }
             }
@@ -719,7 +851,9 @@ fn scan_content(
 fn check_redirect_loops(arc: &Archive, report: &mut Report) {
     for entry in arc.iter_by_path() {
         let Ok(e) = entry else { continue };
-        if !e.is_redirect() { continue; }
+        if !e.is_redirect() {
+            continue;
+        }
         if let Err(Error::RedirectLoop) = follow_loop(&e) {
             report.add_error(Check::Redirect, format!("Redirect loop at: {}", e.path()));
         }
@@ -742,13 +876,23 @@ fn follow_loop(e: &Entry) -> Result<Entry, Error> {
 /// garbage extracted from broken HTML attribute syntax (curly-quoted values,
 /// strings containing `<`/`>`/`&`, etc.).
 fn looks_like_url(s: &str) -> bool {
-    if s.is_empty() { return false; }
-    if s.len() > 2048 { return false; }
-    let first = s.as_bytes()[0];
-    if !(first.is_ascii_alphanumeric() || first == b'/' || first == b'.' || first == b'_' || first == b'#') {
+    if s.is_empty() {
         return false;
     }
-    !s.bytes().any(|b| matches!(b, b'<' | b'>' | b'\n' | b'\r' | b'\t' | b'"' | b'\''))
+    if s.len() > 2048 {
+        return false;
+    }
+    let first = s.as_bytes()[0];
+    if !(first.is_ascii_alphanumeric()
+        || first == b'/'
+        || first == b'.'
+        || first == b'_'
+        || first == b'#')
+    {
+        return false;
+    }
+    !s.bytes()
+        .any(|b| matches!(b, b'<' | b'>' | b'\n' | b'\r' | b'\t' | b'"' | b'\''))
 }
 
 /// True when the URL begins with a `scheme:` prefix (RFC 3986 ALPHA *( ALPHA
@@ -788,7 +932,12 @@ fn extract_link_targets(html: &str) -> Vec<(&'static str, &str)> {
                 continue;
             }
             let prev = bytes[pos - 1];
-            if !(prev.is_ascii_whitespace() || prev == b'<' || prev == b'/' || prev == b'"' || prev == b'\'') {
+            if !(prev.is_ascii_whitespace()
+                || prev == b'<'
+                || prev == b'/'
+                || prev == b'"'
+                || prev == b'\'')
+            {
                 continue;
             }
             let rest = &html[pos + attr.len()..];
@@ -797,10 +946,16 @@ fn extract_link_targets(html: &str) -> Vec<(&'static str, &str)> {
                 Some('"') | Some('\'') => {
                     let q = quote.unwrap();
                     let after_q = &rest[1..];
-                    if let Some(end) = after_q.find(q) { &after_q[..end] } else { continue }
+                    if let Some(end) = after_q.find(q) {
+                        &after_q[..end]
+                    } else {
+                        continue;
+                    }
                 }
                 _ => {
-                    let end = rest.find(|c: char| c.is_whitespace() || c == '>').unwrap_or(rest.len());
+                    let end = rest
+                        .find(|c: char| c.is_whitespace() || c == '>')
+                        .unwrap_or(rest.len());
                     &rest[..end]
                 }
             };
@@ -839,7 +994,9 @@ fn resolve_relative(base: &str, target: &str) -> String {
     for seg in target.split('/') {
         match seg {
             "" | "." => {}
-            ".." => { parts.pop(); }
+            ".." => {
+                parts.pop();
+            }
             other => parts.push(other),
         }
     }
