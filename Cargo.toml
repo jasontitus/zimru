@@ -33,6 +33,10 @@ path = "src/bin/zimbench.rs"
 name = "zimsplit"
 path = "src/bin/zimsplit.rs"
 
+[[bin]]
+name = "zimrecreate"
+path = "src/bin/zimrecreate.rs"
+
 [dependencies]
 memmap2 = "0.9"
 zstd = { version = "0.13", default-features = false }

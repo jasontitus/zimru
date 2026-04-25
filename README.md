@@ -311,15 +311,71 @@ Tools we don't yet reach byte-for-byte parity on:
 
 | tool          | status                                                            |
 |---------------|-------------------------------------------------------------------|
-| `zimrecreate` | needs ZIM **writer** — TODO                                       |
-| `zimwriterfs` | needs ZIM **writer** — TODO                                       |
-| `zimpatch`    | needs ZIM **writer** + libzim diff format — TODO                  |
+| `zimrecreate` | **Implemented** — reads source, writes new archive. Output passes upstream `zimcheck -A`. |
+| `zimwriterfs` | needs filesystem walker built on top of writer — TODO             |
+| `zimpatch`    | needs libzim diff format — TODO                                   |
 | `zimdiff`     | needs libzim diff format — TODO                                   |
 | `zimsearch`   | needs Xapian fulltext index — TODO                                |
 | `zimsplit`    | parts produced; output uses byte-aligned splits (upstream splits  |
 |               | on cluster boundaries). Both reconstruct the original via concat. |
 | `zimbench`    | runs end-to-end; upstream's random-URL phase crashes on our test  |
 |               | files ("Cannot find entry"), ours doesn't.                        |
+
+## Writing ZIM files
+
+The `zimru::writer::Creator` API mirrors libzim's `Creator` in idiomatic
+Rust:
+
+```rust
+use zimru::writer::{Creator, Item};
+use zimru::Compression;
+
+let mut c = Creator::new();
+c.set_main_path("home")
+ .set_compression(Compression::Zstd)
+ .add_item(Item::html("home", "Home", "<h1>Welcome</h1>"))
+ .add_item(Item::html("about", "About", "<p>About page.</p>"))
+ .add_item(Item::png("favicon.png", "favicon", std::fs::read("icon.png")?))
+ .add_redirection("start", "Start", "home")       // alias for C/home
+ .add_metadata("Title", "Demo")
+ .add_metadata("Language", "eng")
+ .add_metadata("Creator", "zimru")
+ .add_illustration(48, std::fs::read("icon48.png")?);
+c.write_to("demo.zim")?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Writer features:
+
+- **Bin-packed clusters** — items are greedily grouped until the running
+  payload hits `cluster_size_target` bytes (default 2 MiB, same as
+  upstream `zimwriterfs`).
+- **Compression**: `Compression::None`, `Compression::Zstd` (default),
+  `Compression::Xz`.
+- **Namespaces**: content in `C`, metadata and illustrations in `M`, the
+  main-page redirect in `W`. Output uses version 5.1 (new namespaces,
+  in-header title pointer list, MD5 trailer) — readable by libzim 8+.
+- **MD5 checksum** is appended automatically.
+- **Redirect resolution** happens at finalize time — a dangling redirect
+  target returns an error instead of silently corrupting the file.
+- **UUID preservation** — `set_uuid(uuid)` lets `zimrecreate` carry the
+  source archive's UUID into the recreated output.
+
+### `zimrecreate` binary
+
+Reads any zimru/libzim-compatible archive and rewrites it using the
+`Creator` API. Matches upstream's CLI signature:
+
+```sh
+./target/release/zimrecreate source.zim recreated.zim \
+    --compression zstd          # none | zstd | xz  (default zstd)
+    --cluster-size 2097152      # target cluster size in bytes
+```
+
+Validated end-to-end: rewriting the 4.5 MB `wikipedia_en_100_mini.zim`
+through our `Creator` produces a 3.4 MB archive that passes upstream
+`zimcheck -A` (integrity, checksum, metadata, favicon, main page,
+redundancy, redirect-loop, URL checks — all green).
 
 ## Head-to-head benchmark vs upstream
 

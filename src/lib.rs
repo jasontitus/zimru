@@ -66,6 +66,7 @@ pub mod error;
 pub mod header;
 pub mod mime;
 mod raw;
+pub mod writer;
 
 pub use archive::{
     Archive, Blob, Entry, EntryIter, Item, PrefixIter, Summary, NS_ARTICLES_LEGACY,
