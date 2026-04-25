@@ -86,6 +86,166 @@ println!("{}", String::from_utf8_lossy(item.get_data()?.data()));
 # Ok::<(), zimru::Error>(())
 ```
 
+## Idiomatic convenience API
+
+On top of the libzim one-for-one surface, `zimru` ships an ergonomic layer
+designed around common read-only workflows. Every method below exists
+specifically because the Rust rewrite enabled it — zero-copy `&str` from
+mmap, rayon-aware parallelism, iterator composition, `Result` everywhere,
+`Deref` for `&[u8]`. Pick the one that matches your use case:
+
+### One-liners for the common case
+
+```rust
+use zimru::Archive;
+let a = Archive::open("wiki.zim")?;
+
+// "Give me the article body as a string."
+let html: String = a.get_text("Albert_Einstein")?;
+
+// "Give me the bytes." (follows redirects automatically)
+let bytes: Vec<u8> = a.get_bytes("images/logo.png")?;
+
+// "Give me the full Item object, redirect already followed."
+let item = a.get_item("home")?;
+
+// "What's the main page actually, after redirect chasing?"
+let main_path: String = a.main_path()?;          // e.g. "index"
+let main_item  = a.main_item()?;                 // Item of the resolved target
+
+// "Read this metadata as a string."
+let title: String = a.metadata_str("Title")?;    // "Wikipedia 100"
+let lang:  String = a.metadata_str("Language")?; // "eng"
+
+// "Does this key exist?"
+if a.has_metadata("Illustration_48x48@1") { ... }
+# Ok::<(), zimru::Error>(())
+```
+
+### Filtered iteration
+
+```rust
+use zimru::Archive;
+let a = Archive::open("wiki.zim")?;
+
+// Only real articles (skip redirects) in path order.
+for e in a.articles()       { let e = e?; println!("{}", e.path()); }
+
+// Only redirects.
+for e in a.redirects()      { let e = e?; println!("{} -> ?", e.path()); }
+
+// Only C-namespace entries (user content), exact URL-pointer range.
+for e in a.content_entries() { let e = e?; /* … */ }
+
+// Every entry whose (namespace, url) starts with a prefix.
+// Binary-search for the start, then walks forward in O(log n + k).
+for e in a.by_prefix(b'C', "images/") {
+    let e = e?;
+    println!("{}", e.path());   // images/header.png, images/logo.png, ...
+}
+
+// O(log n) namespace count — no full scan.
+let (content_start, content_end) = {
+    let r = a.namespace_range(b'C')?;
+    (r.start, r.end)
+};
+# Ok::<(), zimru::Error>(())
+```
+
+### Rayon-aware parallelism
+
+```rust
+use rayon::prelude::*;
+use zimru::Archive;
+let a = Archive::open("wiki.zim")?;
+
+// Parallel dirent-only scan (no cluster decompression).
+let redirect_count: u32 = a.par_iter_by_path()
+    .filter_map(|r| r.ok())
+    .filter(|e| e.is_redirect())
+    .count() as u32;
+
+// Parallel foreach across every decompressed cluster. Each worker
+// decompresses one cluster exactly once, drops it when done. This is
+// how zimcheck -A hits 8× upstream throughput; use it to build your
+// own parallel content scanners.
+let total_decompressed_bytes: u64 = a.par_clusters(|_idx, c| {
+    (0..c.blob_count())
+        .filter_map(|i| c.blob(i).ok())
+        .map(|b| b.len() as u64)
+        .sum::<u64>()
+})?.into_iter().sum();
+# Ok::<(), zimru::Error>(())
+```
+
+### Zero-copy content access
+
+```rust
+use std::io::Read;
+use zimru::Archive;
+let a = Archive::open("wiki.zim")?;
+let item = a.get_item("home")?;
+
+// Most efficient: borrow &str directly from the decompressed cluster.
+let blob = item.get_data()?;
+let text: &str = blob.as_str()?;                 // zero-copy UTF-8 validation
+
+// Or stream it without materializing a Vec<u8>.
+let mut sink = Vec::new();
+blob.reader().read_to_end(&mut sink)?;
+
+// Blob derefs to &[u8] and AsRef<[u8]>, so it drops into any API
+// that expects byte slices:
+let len = blob.len();         // via Deref
+sink.extend_from_slice(&blob); // via Deref -> &[u8]
+# Ok::<(), zimru::Error>(())
+```
+
+### Item mime-type helpers
+
+```rust
+use zimru::Archive;
+let a = Archive::open("wiki.zim")?;
+let item = a.get_item("home")?;
+
+if item.is_html()  { /* decode HTML */ }
+if item.is_text()  { /* treat as text/* */ }
+if item.is_image() { /* save to disk */ }
+let text = item.text()?;         // shortcut for utf-8 bytes -> String
+let bytes = item.bytes()?;       // shortcut for blob -> Vec<u8>
+# Ok::<(), zimru::Error>(())
+```
+
+### Snapshot for logging & `--info` commands
+
+```rust
+use zimru::Archive;
+let a = Archive::open("wiki.zim")?;
+let s = a.summary();
+// {:?} / {:#?} for Debug, {} for a pre-formatted multi-line dump.
+println!("{s}");
+// uuid            529b7e6e-3e90-9b9b-3d24-eac14f2f1f00
+// version         6.3 (new namespaces)
+// entries         5172 total (5155 content)
+// clusters        4
+// mime types      10
+// main page       index
+// checksum        yes
+# Ok::<(), zimru::Error>(())
+```
+
+### `Entry` as `Display`
+
+```rust
+# use zimru::Archive;
+# let a = Archive::open("wiki.zim")?;
+let e = a.get_entry_by_path("apple")?;
+println!("{e}");         // C/apple "Apple"
+let r = a.get_entry_by_path("fruit")?;
+println!("{r}");         // ↪ C/fruit "Fruit"   (unicode arrow marks a redirect)
+# Ok::<(), zimru::Error>(())
+```
+
 ## CLI
 
 The crate ships five binaries — one Rust-native explorer plus four drop-in

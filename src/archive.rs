@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::cluster::Cluster;
 use crate::dirent::{ArticleEntry, Dirent};
@@ -409,6 +410,243 @@ impl Archive {
         out
     }
 
+    // ============================================================
+    // ---- Ergonomic convenience API (idiomatic Rust extras) ----
+    // ============================================================
+    //
+    // Everything below is layered on top of the libzim-mirror methods and
+    // designed around common read-only workflows: read one article as text,
+    // enumerate all non-redirect content, iterate a path-prefix range,
+    // process every blob in parallel, or get a one-shot snapshot of the
+    // archive's header/counts. These shapes weren't possible (or were
+    // much more verbose) in the original C++ libzim.
+
+    /// One-liner: fetch the decompressed bytes of the entry at `path`,
+    /// following any redirects. Equivalent to
+    /// `archive.get_entry_by_path(path)?.get_item(true)?.get_data()?.to_vec()`.
+    ///
+    /// ```no_run
+    /// # use zimru::Archive;
+    /// let archive = Archive::open("wiki.zim")?;
+    /// let bytes = archive.get_bytes("Albert_Einstein")?;
+    /// # Ok::<(), zimru::Error>(())
+    /// ```
+    pub fn get_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let entry = self.get_entry_by_path(path)?;
+        let item = entry.get_item(true)?;
+        Ok(item.get_data()?.to_vec())
+    }
+
+    /// One-liner: fetch the entry at `path` as a UTF-8 [`String`]. Fails
+    /// with [`Error::BadUtf8`] if the content isn't valid UTF-8.
+    pub fn get_text(&self, path: &str) -> Result<String> {
+        let blob = self.get_bytes(path)?;
+        String::from_utf8(blob).map_err(|_| Error::BadUtf8(0))
+    }
+
+    /// One-liner: fetch the [`Item`] for the entry at `path`, following
+    /// any redirects.
+    pub fn get_item(&self, path: &str) -> Result<Item> {
+        self.get_entry_by_path(path)?.get_item(true)
+    }
+
+    /// Resolve the archive's main entry directly to an [`Item`], following
+    /// the `W/mainPage` redirect if present.
+    pub fn main_item(&self) -> Result<Item> {
+        self.main_entry()?.get_item(true)
+    }
+
+    /// Just the path of the resolved main page (e.g. `"index"`), skipping
+    /// the redirect chain. Useful for logging / info output.
+    pub fn main_path(&self) -> Result<String> {
+        let mut cur = self.main_entry()?;
+        let mut depth = 0;
+        while cur.is_redirect() {
+            depth += 1;
+            if depth > 16 {
+                return Err(Error::RedirectLoop);
+            }
+            cur = cur.get_redirect_entry()?;
+        }
+        Ok(cur.path().to_string())
+    }
+
+    /// Read a metadata entry as a UTF-8 string. Shorthand for
+    /// `String::from_utf8(archive.get_metadata(name)?)`.
+    pub fn metadata_str(&self, name: &str) -> Result<String> {
+        let bytes = self.get_metadata(name)?;
+        String::from_utf8(bytes).map_err(|_| Error::BadUtf8(0))
+    }
+
+    /// Check whether a metadata key exists without reading its value.
+    pub fn has_metadata(&self, name: &str) -> bool {
+        self.entry_by_ns_path(NS_METADATA, name).is_ok()
+    }
+
+    /// The `(start, end)` URL-pointer range occupied by `namespace`. Entries
+    /// `start..end` in URL-pointer order are exactly the ones in `namespace`.
+    /// Runs in O(log n) via binary search on the namespace byte.
+    pub fn namespace_range(&self, ns: u8) -> Result<std::ops::Range<u32>> {
+        let n = self.core.header.entry_count;
+        let start = self.lower_bound_ns(ns, n)?;
+        let end = self.lower_bound_ns(ns.saturating_add(1), n)?;
+        Ok(start..end)
+    }
+
+    /// Iterate only the non-redirect entries in path order.
+    pub fn articles(&self) -> impl Iterator<Item = Result<Entry>> + '_ {
+        self.iter_by_path().filter(|r| match r {
+            Ok(e) => !e.is_redirect(),
+            Err(_) => true, // surface errors up
+        })
+    }
+
+    /// Iterate only the redirect entries in path order.
+    pub fn redirects(&self) -> impl Iterator<Item = Result<Entry>> + '_ {
+        self.iter_by_path().filter(|r| match r {
+            Ok(e) => e.is_redirect(),
+            Err(_) => true,
+        })
+    }
+
+    /// Iterate only the content-namespace (`C`) entries in path order,
+    /// skipping redirects. The canonical "every article" loop.
+    ///
+    /// ```no_run
+    /// # use zimru::Archive;
+    /// let archive = Archive::open("wiki.zim")?;
+    /// for entry in archive.content_entries() {
+    ///     let e = entry?;
+    ///     println!("{}", e.path());
+    /// }
+    /// # Ok::<(), zimru::Error>(())
+    /// ```
+    pub fn content_entries(&self) -> EntryIter {
+        let ns = if self.core.header.uses_new_namespaces() {
+            NS_CONTENT_NEW
+        } else {
+            NS_ARTICLES_LEGACY
+        };
+        let range = self.namespace_range(ns).unwrap_or(0..0);
+        EntryIter {
+            archive: self.clone(),
+            kind: IterKind::ByPath,
+            i: range.start,
+            n: range.end,
+        }
+    }
+
+    /// Iterate every entry whose (namespace, url) starts with a given
+    /// prefix. Binary-searches for the start, then walks forward while the
+    /// prefix still matches — O(log n + k) where k is the number of matches.
+    ///
+    /// Common use: "all pages under `images/`" or "every X/listing/* entry".
+    ///
+    /// ```no_run
+    /// # use zimru::Archive;
+    /// let archive = Archive::open("wiki.zim")?;
+    /// for entry in archive.by_prefix(b'X', "listing/") {
+    ///     let e = entry?;
+    ///     println!("{} → {}", e.path(), e.title());
+    /// }
+    /// # Ok::<(), zimru::Error>(())
+    /// ```
+    pub fn by_prefix<'a>(
+        &'a self,
+        ns: u8,
+        prefix: &'a str,
+    ) -> impl Iterator<Item = Result<Entry>> + 'a {
+        let n = self.core.header.entry_count;
+        // First index whose (ns, url) is >= (ns, prefix).
+        let start = {
+            let mut lo = 0u32;
+            let mut hi = n;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let off = self.url_pointer(mid).unwrap_or(0);
+                let d = Dirent::parse(&self.core.mmap, off as usize)
+                    .ok()
+                    .map(|d| (d.namespace(), d.url().to_string()));
+                let cmp = match d {
+                    Some((dns, durl)) => dns.cmp(&ns).then_with(|| durl.as_str().cmp(prefix)),
+                    None => Ordering::Greater,
+                };
+                match cmp {
+                    Ordering::Less => lo = mid + 1,
+                    _ => hi = mid,
+                }
+            }
+            lo
+        };
+        PrefixIter {
+            archive: self.clone(),
+            ns,
+            prefix: prefix.to_string(),
+            i: start,
+            n,
+        }
+    }
+
+    /// Rayon-aware parallel iterator over every entry in URL-pointer order.
+    ///
+    /// Useful for embarrassingly-parallel scans that touch dirents only
+    /// (e.g. counting redirects by namespace). When the inner closure needs
+    /// blob content, prefer [`Archive::par_clusters`] instead — it
+    /// decompresses each cluster exactly once, which is usually much faster.
+    pub fn par_iter_by_path(&self) -> impl ParallelIterator<Item = Result<Entry>> + '_ {
+        let n = self.core.header.entry_count;
+        (0..n).into_par_iter().map(move |i| self.entry_by_url_index(i))
+    }
+
+    /// Run a closure over every decompressed cluster in parallel. Workers
+    /// bypass the shared cluster cache, so memory usage stays bounded at
+    /// roughly `num_threads × largest_cluster_size`. Used internally by
+    /// `zimcheck -A` to hit 8× upstream throughput; exposed here so library
+    /// users can build their own parallel content scans (e.g. full-text
+    /// indexers, dedup scanners, stats collectors).
+    ///
+    /// The closure receives `(cluster_index, cluster)` and returns a `T`
+    /// per cluster. Results come back in cluster-index order.
+    pub fn par_clusters<T, F>(&self, f: F) -> Result<Vec<T>>
+    where
+        T: Send,
+        F: Fn(u32, &Cluster) -> T + Sync + Send,
+    {
+        let n = self.core.header.cluster_count;
+        let results: Vec<Result<T>> = (0..n)
+            .into_par_iter()
+            .map(|idx| {
+                let c = self.cluster_uncached(idx)?;
+                Ok(f(idx, &c))
+            })
+            .collect();
+        results.into_iter().collect()
+    }
+
+    /// Compact summary of the archive's header + aggregate counts, handy
+    /// for `--info` style commands and logging. Single allocation + one
+    /// optional main-entry lookup.
+    pub fn summary(&self) -> Summary {
+        let h = &self.core.header;
+        Summary {
+            uuid: h.uuid,
+            uuid_hyphenated: format_uuid_hyphenated(&h.uuid),
+            major_version: h.major_version,
+            minor_version: h.minor_version,
+            uses_new_namespaces: h.uses_new_namespaces(),
+            entry_count: h.entry_count,
+            content_entry_count: self
+                .namespace_range(if h.uses_new_namespaces() { NS_CONTENT_NEW } else { NS_ARTICLES_LEGACY })
+                .map(|r| r.end - r.start)
+                .unwrap_or(0),
+            cluster_count: h.cluster_count,
+            mime_type_count: self.core.mimes.len(),
+            has_main_entry: h.has_main_page(),
+            main_path: self.main_path().ok(),
+            has_checksum: h.has_checksum(),
+        }
+    }
+
     // ---- internal helpers ----
 
     fn url_pointer(&self, idx: u32) -> Result<u64> {
@@ -531,6 +769,26 @@ impl Entry {
         &self.dirent
     }
 
+    /// Shortcut: `get_item(true)`, matching the most common workflow where
+    /// users want the item and don't care about redirects.
+    pub fn item(&self) -> Result<Item> {
+        self.get_item(true)
+    }
+
+    /// Walk redirects to the final content entry (no-op if non-redirect).
+    pub fn resolve(&self) -> Result<Entry> {
+        let mut cur = self.clone();
+        let mut hops = 0;
+        while cur.is_redirect() {
+            hops += 1;
+            if hops > MAX_REDIRECTS {
+                return Err(Error::RedirectLoop);
+            }
+            cur = cur.get_redirect_entry()?;
+        }
+        Ok(cur)
+    }
+
     /// libzim parity: returns the [`Item`] for this entry. If `follow` is
     /// true, redirect chains are resolved transparently; otherwise calling
     /// this on a redirect returns [`Error::NotAnItem`].
@@ -565,6 +823,19 @@ impl Entry {
         } else {
             Ok(self.clone())
         }
+    }
+}
+
+impl std::fmt::Display for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}{}/{} \"{}\"",
+            if self.is_redirect() { "↪ " } else { "" },
+            char::from(self.namespace()),
+            self.path(),
+            self.title()
+        )
     }
 }
 
@@ -610,6 +881,39 @@ impl Item {
         Ok(blob.size() as u64)
     }
 
+    // ---- ergonomic content accessors ----
+
+    /// Fetch the item's decompressed bytes. Shortcut for
+    /// `item.get_data()?.to_vec()`.
+    pub fn bytes(&self) -> Result<Vec<u8>> {
+        Ok(self.get_data()?.to_vec())
+    }
+
+    /// Fetch the item's content as a UTF-8 [`String`]. Returns
+    /// [`Error::BadUtf8`] if the content is not valid UTF-8.
+    pub fn text(&self) -> Result<String> {
+        let bytes = self.get_data()?;
+        std::str::from_utf8(bytes.data())
+            .map(str::to_owned)
+            .map_err(|_| Error::BadUtf8(0))
+    }
+
+    /// True if the mimetype is `text/html` (with any charset parameter).
+    pub fn is_html(&self) -> bool {
+        let m = self.mimetype();
+        m.starts_with("text/html") || m.starts_with("application/xhtml")
+    }
+
+    /// True if the mimetype starts with `text/`.
+    pub fn is_text(&self) -> bool {
+        self.mimetype().starts_with("text/")
+    }
+
+    /// True if the mimetype starts with `image/`.
+    pub fn is_image(&self) -> bool {
+        self.mimetype().starts_with("image/")
+    }
+
     /// Fetch the blob bytes (decompressing the cluster if needed).
     pub fn get_data(&self) -> Result<Blob> {
         let cluster = self.archive.load_cluster(self.article.cluster)?;
@@ -643,8 +947,31 @@ impl Blob {
         self.range.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.range.is_empty()
+    }
+
     pub fn to_vec(&self) -> Vec<u8> {
         self.data().to_vec()
+    }
+
+    /// Borrow the blob's bytes as `&str` if they're valid UTF-8. Zero-copy.
+    pub fn as_str(&self) -> Result<&str> {
+        std::str::from_utf8(self.data()).map_err(|_| Error::BadUtf8(0))
+    }
+
+    /// A `std::io::Read` cursor over the blob that starts at byte 0.
+    /// Useful for passing blob content to streaming parsers (e.g. gzip
+    /// inflaters, serde_json readers) without materializing a `Vec<u8>`.
+    pub fn reader(&self) -> std::io::Cursor<&[u8]> {
+        std::io::Cursor::new(self.data())
+    }
+}
+
+impl std::ops::Deref for Blob {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.data()
     }
 }
 
@@ -682,4 +1009,89 @@ impl Iterator for EntryIter {
         };
         Some(res)
     }
+}
+
+impl ExactSizeIterator for EntryIter {
+    fn len(&self) -> usize {
+        (self.n - self.i) as usize
+    }
+}
+
+/// Iterator returned by [`Archive::by_prefix`] — yields every dirent whose
+/// `(namespace, url)` starts with the given prefix, in URL-pointer order.
+pub struct PrefixIter {
+    archive: Archive,
+    ns: u8,
+    prefix: String,
+    i: u32,
+    n: u32,
+}
+
+impl Iterator for PrefixIter {
+    type Item = Result<Entry>;
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.i < self.n {
+            let idx = self.i;
+            self.i += 1;
+            let entry = match self.archive.entry_by_url_index(idx) {
+                Ok(e) => e,
+                Err(e) => return Some(Err(e)),
+            };
+            if entry.namespace() != self.ns {
+                self.i = self.n;
+                return None;
+            }
+            if !entry.path().starts_with(&self.prefix) {
+                self.i = self.n;
+                return None;
+            }
+            return Some(Ok(entry));
+        }
+        None
+    }
+}
+
+/// Snapshot of an archive's header + aggregate counts, returned by
+/// [`Archive::summary`].
+#[derive(Debug, Clone)]
+pub struct Summary {
+    pub uuid: [u8; 16],
+    pub uuid_hyphenated: String,
+    pub major_version: u16,
+    pub minor_version: u16,
+    pub uses_new_namespaces: bool,
+    pub entry_count: u32,
+    pub content_entry_count: u32,
+    pub cluster_count: u32,
+    pub mime_type_count: usize,
+    pub has_main_entry: bool,
+    pub main_path: Option<String>,
+    pub has_checksum: bool,
+}
+
+impl std::fmt::Display for Summary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "uuid            {}", self.uuid_hyphenated)?;
+        writeln!(f, "version         {}.{}{}",
+            self.major_version,
+            self.minor_version,
+            if self.uses_new_namespaces { " (new namespaces)" } else { " (legacy)" })?;
+        writeln!(f, "entries         {} total ({} content)",
+            self.entry_count, self.content_entry_count)?;
+        writeln!(f, "clusters        {}", self.cluster_count)?;
+        writeln!(f, "mime types      {}", self.mime_type_count)?;
+        if let Some(p) = &self.main_path {
+            writeln!(f, "main page       {}", p)?;
+        }
+        writeln!(f, "checksum        {}", if self.has_checksum { "yes" } else { "no" })?;
+        Ok(())
+    }
+}
+
+fn format_uuid_hyphenated(u: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+        u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15],
+    )
 }

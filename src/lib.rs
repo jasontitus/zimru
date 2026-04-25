@@ -25,6 +25,38 @@
 //! # Ok::<(), zimru::Error>(())
 //! ```
 //!
+//! ## Idiomatic one-liners
+//!
+//! On top of the libzim-mirror surface the crate provides an ergonomic
+//! layer for common use cases:
+//!
+//! ```no_run
+//! use zimru::Archive;
+//! let a = Archive::open("wiki.zim")?;
+//!
+//! // Read an article as text in one call (follows redirects):
+//! let html: String = a.get_text("home")?;
+//!
+//! // Metadata as UTF-8:
+//! let title = a.metadata_str("Title")?;
+//!
+//! // Walk only the article (non-redirect) entries:
+//! for e in a.articles() { let e = e?; println!("{}", e.path()); }
+//!
+//! // Prefix range iteration via binary search:
+//! for e in a.by_prefix(b'C', "images/") { let e = e?; /* … */ }
+//!
+//! // Parallel cluster scan (rayon):
+//! let per_cluster: Vec<u64> = a.par_clusters(|_i, c| -> u64 {
+//!     (0..c.blob_count()).filter_map(|i| c.blob(i).ok())
+//!         .map(|b| b.len() as u64).sum()
+//! })?;
+//! let total: u64 = per_cluster.into_iter().sum();
+//! # Ok::<(), zimru::Error>(())
+//! ```
+//!
+//! See [`Archive`] for the full list of ergonomic methods.
+//!
 //! [ZIM file format]: https://wiki.openzim.org/wiki/ZIM_file_format
 
 pub mod archive;
@@ -36,8 +68,8 @@ pub mod mime;
 mod raw;
 
 pub use archive::{
-    Archive, Blob, Entry, EntryIter, Item, NS_ARTICLES_LEGACY, NS_CONTENT_NEW, NS_INDEX,
-    NS_METADATA, NS_WELLKNOWN,
+    Archive, Blob, Entry, EntryIter, Item, PrefixIter, Summary, NS_ARTICLES_LEGACY,
+    NS_CONTENT_NEW, NS_INDEX, NS_METADATA, NS_WELLKNOWN,
 };
 pub use cluster::{Cluster, Compression};
 pub use dirent::{ArticleEntry, Dirent, RedirectEntry};
