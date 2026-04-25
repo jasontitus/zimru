@@ -74,8 +74,8 @@ pub mod writer;
 pub mod cffi;
 
 pub use archive::{
-    Archive, Blob, Entry, EntryIter, Item, PrefixIter, Summary, NS_ARTICLES_LEGACY, NS_CONTENT_NEW,
-    NS_INDEX, NS_METADATA, NS_WELLKNOWN,
+    Archive, Blob, DirectAccess, Entry, EntryIter, Item, PrefixIter, Summary, NS_ARTICLES_LEGACY,
+    NS_CONTENT_NEW, NS_INDEX, NS_METADATA, NS_WELLKNOWN,
 };
 pub use cluster::{Cluster, Compression};
 pub use dirent::{ArticleEntry, Dirent, RedirectEntry};

@@ -203,6 +203,21 @@ int main(int argc, char** argv) {
         }
     }
 
+    // 12. Direct-access info. The smoke ZIM uses zstd compression so
+    //     the direct path is unreachable here — we just assert the
+    //     C ABI returns is_direct=false cleanly. The pread round-trip
+    //     for an uncompressed cluster lives in tests/direct_access.rs.
+    {
+        zimru_direct_access_t da{};
+        zimru_item_direct_access(it.get(), &da);
+        if (da.is_direct) {
+            die("expected zstd-cluster item to report is_direct=false");
+        }
+        if (da.file_offset != 0 || da.size != 0) {
+            die("non-direct entries must zero offset/size");
+        }
+    }
+
     // 12a. Phase 2 additions: filesize, article/media counts, random entry,
     //      deterministic seed → UUID.
     {

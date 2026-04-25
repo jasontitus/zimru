@@ -789,6 +789,37 @@ impl Archive {
         self.load_cluster(idx)
     }
 
+    /// Direct-access info for a single blob: where its bytes physically
+    /// live in the on-disk ZIM file, when the surrounding cluster is
+    /// stored uncompressed (compression-id 0 or 1). For compressed
+    /// clusters, returns `is_direct = false` and zeroes for offset/size.
+    ///
+    /// Useful for handing fulltext/Xapian indexes (always stored
+    /// uncompressed by convention) to libxapian via `Database(int fd)`
+    /// + `lseek` without copying any bytes.
+    pub fn blob_direct_access(&self, cluster_idx: u32, blob_idx: u32) -> Result<DirectAccess> {
+        let cluster_range = self.cluster_byte_range(cluster_idx)?;
+        let cluster = self.cluster(cluster_idx)?;
+        match cluster.compression() {
+            crate::Compression::None => {
+                let r = cluster.blob_range(blob_idx)?;
+                let len = r.end - r.start;
+                // The cluster's payload starts immediately after the
+                // 1-byte info byte at the start of the on-disk cluster.
+                Ok(DirectAccess {
+                    is_direct: true,
+                    file_offset: cluster_range.start + 1 + r.start as u64,
+                    size: len as u64,
+                })
+            }
+            _ => Ok(DirectAccess {
+                is_direct: false,
+                file_offset: 0,
+                size: 0,
+            }),
+        }
+    }
+
     /// On-disk byte range occupied by cluster `idx`, including its info
     /// byte. The returned range's length is the compressed size the cluster
     /// takes up in the file.
@@ -961,6 +992,24 @@ impl std::fmt::Display for Entry {
     }
 }
 
+/// Where an item's bytes physically live in the on-disk ZIM file,
+/// returned by [`Archive::blob_direct_access`]. When `is_direct` is
+/// `false` the item is stored in a compressed cluster and must be
+/// fetched via the normal `get_data` path; offset/size are zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectAccess {
+    /// `true` iff the item is in an uncompressed cluster and its
+    /// bytes can be `pread`/`mmap`'d straight from the ZIM file.
+    pub is_direct: bool,
+    /// Absolute byte offset in the ZIM file at which the item's bytes
+    /// begin. Only meaningful if `is_direct` is `true`.
+    pub file_offset: u64,
+    /// Length of the item's bytes on disk. Equals the decompressed
+    /// size for uncompressed clusters. Only meaningful if `is_direct`
+    /// is `true`.
+    pub size: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Item {
     archive: Archive,
@@ -995,6 +1044,13 @@ impl Item {
 
     pub fn blob_index(&self) -> u32 {
         self.article.blob
+    }
+
+    /// Borrow the archive this item came from. Useful for callers that
+    /// want to call archive-level helpers (e.g. `blob_direct_access`)
+    /// without having to thread the archive through separately.
+    pub fn archive(&self) -> &Archive {
+        &self.archive
     }
 
     /// Total decompressed size of the underlying blob in bytes.

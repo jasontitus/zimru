@@ -113,6 +113,27 @@ typedef struct zimru_error_t zimru_error_t;
  */
 typedef struct zimru_item_t zimru_item_t;
 
+/**
+ * Direct-access info for an item. POD struct populated by
+ * [`zimru_item_direct_access`]; mirrors [`crate::DirectAccess`].
+ *
+ * When `is_direct` is `true`, callers can `pread()` or `mmap()` the
+ * item's bytes directly from the on-disk ZIM file at `file_offset`
+ * for `size` bytes — no decompression, no copy. The standard ZIM
+ * convention is to store fulltext / suggestion / Xapian indexes in
+ * uncompressed clusters precisely so consumers can hand `libxapian`
+ * an `int fd` + `lseek` instead of materialising the database in
+ * memory or in a temp file.
+ *
+ * When `is_direct` is `false`, the item lives in a compressed
+ * cluster; fall back to [`zimru_item_get_data`] for normal access.
+ */
+typedef struct zimru_direct_access_t {
+  bool is_direct;
+  uint64_t file_offset;
+  uint64_t size;
+} zimru_direct_access_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -430,6 +451,12 @@ struct zimru_entry_t *zimru_entry_get_redirect_entry(const struct zimru_entry_t 
  * the cluster cannot be decoded.
  */
  uint64_t zimru_item_size(const struct zimru_item_t *it, struct zimru_error_t **err);
+
+/**
+ * Populate `out` with direct-access info for the item. Safe on a
+ * NULL `it` or `out` (no-op).
+ */
+ void zimru_item_direct_access(const struct zimru_item_t *it, struct zimru_direct_access_t *out);
 
 /**
  * Read the item's data as a heap-allocated blob handle. Caller frees

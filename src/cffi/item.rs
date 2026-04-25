@@ -73,6 +73,56 @@ pub unsafe extern "C" fn zimru_item_size(
     }
 }
 
+/// Direct-access info for an item. POD struct populated by
+/// [`zimru_item_direct_access`]; mirrors [`crate::DirectAccess`].
+///
+/// When `is_direct` is `true`, callers can `pread()` or `mmap()` the
+/// item's bytes directly from the on-disk ZIM file at `file_offset`
+/// for `size` bytes — no decompression, no copy. The standard ZIM
+/// convention is to store fulltext / suggestion / Xapian indexes in
+/// uncompressed clusters precisely so consumers can hand `libxapian`
+/// an `int fd` + `lseek` instead of materialising the database in
+/// memory or in a temp file.
+///
+/// When `is_direct` is `false`, the item lives in a compressed
+/// cluster; fall back to [`zimru_item_get_data`] for normal access.
+#[repr(C)]
+pub struct zimru_direct_access_t {
+    pub is_direct: bool,
+    pub file_offset: u64,
+    pub size: u64,
+}
+
+/// Populate `out` with direct-access info for the item. Safe on a
+/// NULL `it` or `out` (no-op).
+#[no_mangle]
+pub unsafe extern "C" fn zimru_item_direct_access(
+    it: *const zimru_item_t,
+    out: *mut zimru_direct_access_t,
+) {
+    if it.is_null() || out.is_null() {
+        return;
+    }
+    let cluster = (*it).inner.cluster_index();
+    let blob = (*it).inner.blob_index();
+    // Errors here mean the cluster index is bogus — treat as "not
+    // direct" rather than surfacing through an out-pointer, since this
+    // function's contract is "best-effort hint" and the caller has the
+    // full get_data fallback anyway.
+    let info = (*it)
+        .inner
+        .archive()
+        .blob_direct_access(cluster, blob)
+        .unwrap_or(crate::DirectAccess {
+            is_direct: false,
+            file_offset: 0,
+            size: 0,
+        });
+    (*out).is_direct = info.is_direct;
+    (*out).file_offset = info.file_offset;
+    (*out).size = info.size;
+}
+
 /// Read the item's data as a heap-allocated blob handle. Caller frees
 /// with `zimru_blob_free`.
 #[no_mangle]
