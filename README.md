@@ -177,6 +177,113 @@ content). Hardware: shared linux container; results are warm-cache means of
 | `zimru readall` (decompress only)         | n/a               | 4.20 s         | —            |
 | `zimbench` (n=1000)                       | ~~n/a~~ (crashes) | 1.95 s (full)  | —            |
 
+## Why zimru is faster
+
+Four independent optimizations, each measurable on its own. The numbers
+below are from the 1.1 GB Bashkir Wikipedia test file, warm-cache, reported
+by `hyperfine` (mean of 3–5 runs).
+
+### 1. `md-5` with the `asm` feature (beats OpenSSL + `md5sum`)
+
+`zimcheck -C` is the pure "hash every byte of the file" workload. Both
+tools are bottlenecked on MD5 throughput. Upstream libzim uses
+OpenSSL-accelerated MD5 (~510 MB/s on this machine); enabling the `md-5`
+crate's `asm` feature pulls in `md5-asm`'s hand-written x86-64 block
+transform and bumps zimru's throughput to **~556 MB/s**, matching the
+system `md5sum`.
+
+| build                      | `-C` on 1.1 GB | throughput |
+|----------------------------|----------------|------------|
+| pure-Rust `md-5` (default) | 2.52 s         | 450 MB/s   |
+| **`md-5` + `asm`**         | **2.05 s**     | **556 MB/s** |
+| `md5sum` (system)          | 2.09 s         | 545 MB/s   |
+| upstream `zimcheck -C`     | 2.29 s         | 498 MB/s   |
+
+Cost: one Cargo feature flag. Wall-clock saved on `-C`: **470 ms per run**
+(≈19% faster than before, and 10% faster than upstream).
+
+### 2. Single-pass content scan (4× fewer iterations)
+
+Upstream and our previous code both ran every content check as its own
+pass over the entire C-namespace: once for `empty`, once for `redundant`,
+once for `url_internal`, once for `url_external`. That means four cluster
+decompressions (with a cache; without the cache it'd be 4× the zstd/xz
+work), four HTML UTF-8 decodes per article, four dirent parses, and four
+passes of allocating intermediate `String`s.
+
+zimcheck now folds all four checks into one per-blob loop. Each blob is
+fetched once; we MD5 it for redundancy, check its size for empty,
+UTF-8-decode once if it's HTML, and scan `href=`/`src=` attributes a
+single time for both internal and external URL classification.
+
+Isolated gain (single-threaded, before rayon): `-R` went from 11.3 s to
+roughly 8.0 s — **~30% wall-clock reduction** from deduplicated work
+alone.
+
+### 3. Parallel cluster scan with rayon (near-linear with core count)
+
+The dominant cost on `-A` is decompressing every cluster (1 502 of them
+for the Bashkir file, totalling 3.2 GB of output) plus MD5-ing every
+blob. That's embarrassingly parallel at cluster granularity:
+
+- Each cluster is self-contained (its decompression doesn't need any
+  other cluster).
+- Per-blob work (MD5, HTML scan, internal-URL binary-search) only
+  reads the mmap'd archive, which is lock-free.
+
+zimcheck builds a `HashMap<cluster_idx, Vec<BlobRef>>` once, then uses
+`rayon::par_iter` across the clusters. Each worker calls the new
+`Archive::cluster_uncached(idx)` which bypasses the shared cluster cache
+(no lock contention — we know each cluster is touched exactly once in
+this pass). Per-cluster findings come back as `Vec<PerEntryFinding>`;
+the main thread merges them in URL-pointer order so the report text
+stays **deterministic** and still matches upstream byte-for-byte on all
+12 parity cases.
+
+| build                            | `-A` on 1.1 GB   | speedup vs upstream |
+|----------------------------------|------------------|---------------------|
+| single-pass, single-thread       | ~12 s (estimate) | ~4.8×               |
+| **single-pass, rayon (8 cores)** | **6.93 s**       | **8.27×**           |
+| upstream                         | 57.27 s          | 1.00×               |
+
+The rayon pass saturates user CPU time (20 s of user time across
+wall-clock 6.9 s on this container). Memory stays bounded because
+`cluster_uncached` drops the decompressed buffer as soon as the worker
+finishes that cluster — we never hold all 3.2 GB at once.
+
+### 4. O(log n) namespace counting (zimdump info)
+
+`zimdump info` prints `count-entries: N` for the main content namespace.
+The old implementation iterated every dirent (175 404 on Bashkir) and
+counted matches — 35 ms just to answer that one number because every
+dirent read allocates `String`s for the URL and title.
+
+The new `Archive::entry_count_in_namespace(ns)` binary-searches the URL
+pointer list for the namespace boundary, reading only the single
+namespace byte at offset 3 of each dirent (no string allocation). That
+makes it **O(log n)**: on a 175 k-entry archive it does ≈18 dirent peeks
+instead of 175 404 full parses.
+
+| build                  | `zimdump info` on 1.1 GB |
+|------------------------|--------------------------|
+| iterate all dirents    | 35 ms                    |
+| **binary search (log n)** | **1.6 ms**            |
+| upstream `zimdump info`| 4.3 ms                   |
+
+## What the benefits look like in practice
+
+- **CI integrity checks**: `zimcheck -A` runs 50 seconds faster per
+  1 GB archive. A nightly pipeline that validates a dozen ZIMs saves
+  ~10 minutes of wall-clock per run.
+- **`zimcheck -R` dedup scans**: now fast enough (~2 s/GB) to run on
+  every upload instead of post-facto.
+- **Header/metadata inspection** (`zimdump info`) drops below the 5 ms
+  shell-command floor, so scripting across hundreds of archives no
+  longer stalls on the inspect step.
+- **Streaming decompression** (`zimru readall`) hits 760 MB/s
+  single-threaded — enough headroom that a full zimrecreate
+  read-side doesn't become the bottleneck once the writer lands.
+
 `zimcheck -C` now edges out upstream (which is using OpenSSL-accelerated MD5)
 by enabling the `md-5` crate's `asm` feature — we hit ~556 MB/s, matching
 `md5sum` itself.
