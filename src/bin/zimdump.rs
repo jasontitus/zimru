@@ -5,9 +5,15 @@
 //!   zimdump list    [--details] [--idx=I|(--url=U [--ns=N])] <file>
 //!   zimdump show    (--idx=I|(--url=U [--ns=N]))   <file>
 //!   zimdump dump    --dir=DIR [--ns=N] [--redirect] <file>
+//!   zimdump analyze [--by-item]                    <file>   (zimru extension)
 //!   zimdump --help | --version
 //!
 //! Exit codes match upstream: 0 = ok, 1 = no/multiple matches, 2 = dump error.
+//!
+//! `analyze` is a zimru-only subcommand that has no upstream counterpart
+//! (see issue #5). It prints either a per-cluster table (default) or a
+//! per-item table (`--by-item`) showing where storage is going inside the
+//! archive: compressed cluster size, decompressed payload, and ratio.
 
 use std::collections::HashMap;
 use std::fs;
@@ -15,7 +21,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use zimru::{Archive, Entry, Error};
+use zimru::{Archive, Dirent, Entry, Error};
 
 const VERSION: &str = "zimdump (zimru) 0.1.0\n+ libzim equivalent: zimru 0.1.0";
 
@@ -40,6 +46,7 @@ fn main() -> ExitCode {
         Some("list") => cmd_list(&args[2..]),
         Some("show") => cmd_show(&args[2..]),
         Some("dump") => cmd_dump(&args[2..]),
+        Some("analyze") => cmd_analyze(&args[2..]),
         Some("-h") | Some("--help") | None => {
             print_usage();
             return ExitCode::SUCCESS;
@@ -65,7 +72,7 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     println!(
-        "\nzimdump tool is used to inspect a zim file and also to dump its contents into the filesystem.\n\nUsage:\n  zimdump list [--details] [--idx=INDEX|([--url=URL] [--ns=N])] [--] <file>\n  zimdump dump --dir=DIR [--ns=N] [--redirect] [--] <file>\n  zimdump show (--idx=INDEX|(--url=URL [--ns=N])) [--] <file>\n  zimdump info [--ns=N] [--] <file>\n  zimdump -h | --help\n  zimdump --version\n"
+        "\nzimdump tool is used to inspect a zim file and also to dump its contents into the filesystem.\n\nUsage:\n  zimdump list [--details] [--idx=INDEX|([--url=URL] [--ns=N])] [--] <file>\n  zimdump dump --dir=DIR [--ns=N] [--redirect] [--] <file>\n  zimdump show (--idx=INDEX|(--url=URL [--ns=N])) [--] <file>\n  zimdump info [--ns=N] [--] <file>\n  zimdump analyze [--by-item] [--] <file>   (zimru extension)\n  zimdump -h | --help\n  zimdump --version\n"
     );
 }
 
@@ -78,6 +85,7 @@ struct Opts {
     details: bool,
     dir: Option<PathBuf>,
     redirect: bool,
+    by_item: bool,
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, Error> {
@@ -110,6 +118,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, Error> {
             o.details = true;
         } else if a == "--redirect" {
             o.redirect = true;
+        } else if a == "--by-item" {
+            o.by_item = true;
         } else if a == "--" {
             // rest are positional
             i += 1;
@@ -296,6 +306,112 @@ fn cmd_show(args: &[String]) -> Result<ExitCode, Error> {
     }
     let item = entry.get_item(false)?;
     io::stdout().write_all(item.get_data()?.data())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------- subcommand: analyze ----------------
+
+fn cmd_analyze(args: &[String]) -> Result<ExitCode, Error> {
+    let opts = parse_opts(args)?;
+    let arc = open_archive(&opts)?;
+    let n_clusters = arc.cluster_count();
+
+    // First pass: per-cluster compressed size (cheap — pointer arithmetic)
+    // and decompressed total (needs decoding each cluster once).
+    struct ClusterInfo {
+        compressed: u64,
+        decompressed: u64,
+        blob_count: u32,
+        compression: zimru::Compression,
+    }
+    let mut clusters: Vec<ClusterInfo> = Vec::with_capacity(n_clusters as usize);
+    for idx in 0..n_clusters {
+        let range = arc.cluster_byte_range(idx)?;
+        let compressed = range.end - range.start;
+        let c = arc.cluster_uncached(idx)?;
+        let decompressed: u64 = (0..c.blob_count())
+            .filter_map(|b| c.blob(b).ok())
+            .map(|b| b.len() as u64)
+            .sum();
+        clusters.push(ClusterInfo {
+            compressed,
+            decompressed,
+            blob_count: c.blob_count(),
+            compression: c.compression(),
+        });
+    }
+
+    if opts.by_item {
+        println!("{:<6} {:<6} {:<10} {:<8} {:<14} {:<6} {:<14} path",
+            "clstr", "blob", "compress", "blobs", "decomp(B)", "share", "est_comp(B)");
+        for entry in arc.iter_by_path() {
+            let e = entry?;
+            let (cluster_idx, blob_idx) = match e.dirent() {
+                Dirent::Article(a) => (a.cluster, a.blob),
+                Dirent::Redirect(_) => continue,
+            };
+            let info = &clusters[cluster_idx as usize];
+            let item = match e.get_item(false) {
+                Ok(it) => it,
+                Err(_) => continue,
+            };
+            let blob_size = item.size().unwrap_or(0);
+            let share = if info.decompressed == 0 {
+                0.0
+            } else {
+                blob_size as f64 / info.decompressed as f64
+            };
+            let est_compressed = (share * info.compressed as f64).round() as u64;
+            println!(
+                "{:<6} {:<6} {:<10} {:<8} {:<14} {:<6.3} {:<14} {}{}",
+                cluster_idx,
+                blob_idx,
+                format!("{:?}", info.compression).to_lowercase(),
+                info.blob_count,
+                blob_size,
+                share,
+                est_compressed,
+                char::from(e.namespace()),
+                format!("/{}", e.path()),
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Per-cluster summary table.
+    println!(
+        "{:<6} {:<10} {:<8} {:<14} {:<14} {}",
+        "clstr", "compress", "blobs", "compressed(B)", "decompressed(B)", "ratio"
+    );
+    let mut total_compressed: u64 = 0;
+    let mut total_decompressed: u64 = 0;
+    for (idx, info) in clusters.iter().enumerate() {
+        let ratio = if info.decompressed == 0 {
+            0.0
+        } else {
+            info.compressed as f64 / info.decompressed as f64
+        };
+        println!(
+            "{:<6} {:<10} {:<8} {:<14} {:<14} {:.3}",
+            idx,
+            format!("{:?}", info.compression).to_lowercase(),
+            info.blob_count,
+            info.compressed,
+            info.decompressed,
+            ratio,
+        );
+        total_compressed += info.compressed;
+        total_decompressed += info.decompressed;
+    }
+    let total_ratio = if total_decompressed == 0 {
+        0.0
+    } else {
+        total_compressed as f64 / total_decompressed as f64
+    };
+    println!(
+        "{:<6} {:<10} {:<8} {:<14} {:<14} {:.3}",
+        "TOTAL", "-", "-", total_compressed, total_decompressed, total_ratio,
+    );
     Ok(ExitCode::SUCCESS)
 }
 

@@ -13,6 +13,7 @@
 //!                            zimru — we don't have a fulltext indexer yet)
 //!   -J, --threads <number>   ignored (single-threaded writer for now)
 //!   --compression none|zstd|xz   choose cluster compression (default zstd)
+//!   --compression-level N    compression level (zstd: 1..=22, xz: 0..=9)
 //!   --cluster-size BYTES     cluster size target (default 2MiB)
 
 use std::process::ExitCode;
@@ -27,6 +28,7 @@ fn main() -> ExitCode {
     let mut src: Option<String> = None;
     let mut dst: Option<String> = None;
     let mut compression = Compression::Zstd;
+    let mut compression_level: Option<i32> = None;
     let mut cluster_target: Option<usize> = None;
 
     let mut i = 1;
@@ -53,6 +55,16 @@ fn main() -> ExitCode {
                     Some("xz") => compression = Compression::Xz,
                     other => {
                         eprintln!("zimrecreate: unknown --compression `{other:?}`");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--compression-level" => {
+                i += 1;
+                match args.get(i).and_then(|s| s.parse::<i32>().ok()) {
+                    Some(n) => compression_level = Some(n),
+                    None => {
+                        eprintln!("zimrecreate: --compression-level requires an integer");
                         return ExitCode::from(2);
                     }
                 }
@@ -84,7 +96,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match run(&src, &dst, compression, cluster_target) {
+    match run(&src, &dst, compression, compression_level, cluster_target) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("zimrecreate: {e}");
@@ -95,7 +107,7 @@ fn main() -> ExitCode {
 
 fn print_help() {
     println!(
-        "\nzimrecreate recreates a ZIM file from an existing ZIM.\n\nUsage: zimrecreate ORIGIN_FILE OUTPUT_FILE [Options]\nOptions:\n\t-v, --version           print software version\n\t-j, --withoutFTIndex    don't create a fulltext index (always)\n\t-J, --threads <number>  ignored\n\t--compression C         one of: none | zstd | xz  (default zstd)\n\t--cluster-size BYTES    cluster size target (default 2097152)\n"
+        "\nzimrecreate recreates a ZIM file from an existing ZIM.\n\nUsage: zimrecreate ORIGIN_FILE OUTPUT_FILE [Options]\nOptions:\n\t-v, --version              print software version\n\t-j, --withoutFTIndex       don't create a fulltext index (always)\n\t-J, --threads <number>     ignored\n\t--compression C            one of: none | zstd | xz  (default zstd)\n\t--compression-level N      compression level (zstd: 1..=22, xz: 0..=9)\n\t--cluster-size BYTES       cluster size target (default 2097152)\n"
     );
 }
 
@@ -103,11 +115,15 @@ fn run(
     src: &str,
     dst: &str,
     compression: Compression,
+    compression_level: Option<i32>,
     cluster_target: Option<usize>,
 ) -> Result<(), zimru::Error> {
     let source = Archive::open(src)?;
     let mut creator = Creator::new();
     creator.set_compression(compression);
+    if let Some(level) = compression_level {
+        creator.set_compression_level(level);
+    }
     creator.set_uuid(source.uuid()); // preserve UUID so tooling can spot the relationship
     if let Some(n) = cluster_target {
         creator.set_cluster_size_target(n);

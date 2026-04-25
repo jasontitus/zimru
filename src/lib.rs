@@ -66,6 +66,8 @@ pub mod error;
 pub mod header;
 pub mod mime;
 mod raw;
+pub mod uuid;
+#[cfg(feature = "writer")]
 pub mod writer;
 
 pub use archive::{
@@ -77,3 +79,4 @@ pub use dirent::{ArticleEntry, Dirent, RedirectEntry};
 pub use error::{Error, Result};
 pub use header::Header;
 pub use mime::MimeList;
+pub use uuid::{Uuid, UuidParseError};

@@ -9,6 +9,13 @@ readme = "README.md"
 keywords = ["zim", "openzim", "wikipedia", "kiwix"]
 categories = ["filesystem", "compression", "parser-implementations"]
 
+[features]
+default = ["writer"]
+# Enable the ZIM file writer (`zimru::writer::Creator`) and the
+# `zimrecreate` / `zimwriterfs` binaries. With default features disabled
+# the crate is reader-only.
+writer = []
+
 [lib]
 name = "zimru"
 path = "src/lib.rs"
@@ -36,10 +43,12 @@ path = "src/bin/zimsplit.rs"
 [[bin]]
 name = "zimrecreate"
 path = "src/bin/zimrecreate.rs"
+required-features = ["writer"]
 
 [[bin]]
 name = "zimwriterfs"
 path = "src/bin/zimwriterfs.rs"
+required-features = ["writer"]
 
 [dependencies]
 memmap2 = "0.9"

@@ -1,3 +1,4 @@
+#![cfg(feature = "writer")]
 //! End-to-end test for the `zimwriterfs` CLI:
 //!   1. Build a tiny HTML site under a temp dir.
 //!   2. Run our `zimwriterfs` binary on it.

@@ -87,6 +87,7 @@ pub struct Creator {
     illustrations: Vec<(u32, Vec<u8>)>,
     main_path: Option<String>,
     compression: Compression,
+    compression_level: Option<i32>,
     cluster_size_target: usize,
     uuid: [u8; 16],
 }
@@ -104,6 +105,7 @@ impl Creator {
             illustrations: Vec::new(),
             main_path: None,
             compression: Compression::Zstd,
+            compression_level: None,
             cluster_size_target: DEFAULT_CLUSTER_SIZE_TARGET,
             uuid: default_uuid(),
         }
@@ -158,13 +160,27 @@ impl Creator {
         self
     }
 
+    /// Set the compression level for the active algorithm.
+    ///
+    /// Range and meaning depend on the algorithm:
+    /// * `Compression::Zstd` — accepts `1..=22` (libzstd's normal range, plus
+    ///   negative "fast" levels). The default is `3`.
+    /// * `Compression::Xz`   — accepts `0..=9`. The default is `3`.
+    /// * `Compression::None` — ignored.
+    ///
+    /// Pass `None` (or never call this) to use the default for the algorithm.
+    pub fn set_compression_level(&mut self, level: i32) -> &mut Self {
+        self.compression_level = Some(level);
+        self
+    }
+
     pub fn set_cluster_size_target(&mut self, bytes: usize) -> &mut Self {
         self.cluster_size_target = bytes.max(1);
         self
     }
 
-    pub fn set_uuid(&mut self, uuid: [u8; 16]) -> &mut Self {
-        self.uuid = uuid;
+    pub fn set_uuid(&mut self, uuid: impl Into<crate::Uuid>) -> &mut Self {
+        self.uuid = uuid.into().into_bytes();
         self
     }
 
@@ -243,6 +259,7 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
         illustrations,
         main_path,
         compression,
+        compression_level,
         cluster_size_target,
         uuid,
     } = builder;
@@ -346,7 +363,7 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
             });
             blobs_for_cluster.push(p.content);
         }
-        cluster_bytes.push(encode_cluster(&blobs_for_cluster, compression)?);
+        cluster_bytes.push(encode_cluster(&blobs_for_cluster, compression, compression_level)?);
     }
 
     // 5. Append pending redirects.
@@ -558,7 +575,11 @@ fn encode_dirent(d: &RawDirent) -> Vec<u8> {
     out
 }
 
-fn encode_cluster(blobs: &[Vec<u8>], compression: Compression) -> Result<Vec<u8>> {
+fn encode_cluster(
+    blobs: &[Vec<u8>],
+    compression: Compression,
+    level: Option<i32>,
+) -> Result<Vec<u8>> {
     let n = blobs.len();
     let payload_bytes_sum: usize = blobs.iter().map(|b| b.len()).sum();
     // 4-byte offsets unless the total would overflow u32.
@@ -581,19 +602,25 @@ fn encode_cluster(blobs: &[Vec<u8>], compression: Compression) -> Result<Vec<u8>
 
     let (compression_id, body) = match compression {
         Compression::None => (1u8, payload),
-        Compression::Zstd => (
-            5u8,
-            zstd::stream::encode_all(&payload[..], 3)
-                .map_err(|e| Error::Decompression(format!("zstd encode: {e}")))?,
-        ),
-        Compression::Xz => (
-            4u8,
-            {
-                let mut enc = xz2::write::XzEncoder::new(Vec::new(), 3);
-                enc.write_all(&payload).map_err(|e| Error::Decompression(format!("xz encode: {e}")))?;
-                enc.finish().map_err(|e| Error::Decompression(format!("xz finish: {e}")))?
-            },
-        ),
+        Compression::Zstd => {
+            let lvl = level.unwrap_or(3);
+            (
+                5u8,
+                zstd::stream::encode_all(&payload[..], lvl)
+                    .map_err(|e| Error::Decompression(format!("zstd encode: {e}")))?,
+            )
+        }
+        Compression::Xz => {
+            let lvl = level.unwrap_or(3).clamp(0, 9) as u32;
+            (
+                4u8,
+                {
+                    let mut enc = xz2::write::XzEncoder::new(Vec::new(), lvl);
+                    enc.write_all(&payload).map_err(|e| Error::Decompression(format!("xz encode: {e}")))?;
+                    enc.finish().map_err(|e| Error::Decompression(format!("xz finish: {e}")))?
+                },
+            )
+        }
     };
 
     let info_byte = compression_id | (if extended { 0x10 } else { 0 });

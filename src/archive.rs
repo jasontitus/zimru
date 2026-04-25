@@ -85,8 +85,8 @@ impl Archive {
         &self.core.header
     }
 
-    pub fn uuid(&self) -> [u8; 16] {
-        self.core.header.uuid
+    pub fn uuid(&self) -> crate::Uuid {
+        crate::Uuid::from_bytes(self.core.header.uuid)
     }
 
     /// Total number of dirents (articles + redirects + reserved).
@@ -629,8 +629,7 @@ impl Archive {
     pub fn summary(&self) -> Summary {
         let h = &self.core.header;
         Summary {
-            uuid: h.uuid,
-            uuid_hyphenated: format_uuid_hyphenated(&h.uuid),
+            uuid: crate::Uuid::from_bytes(h.uuid),
             major_version: h.major_version,
             minor_version: h.minor_version,
             uses_new_namespaces: h.uses_new_namespaces(),
@@ -681,6 +680,22 @@ impl Archive {
     /// inside the archive so repeat calls for the same index are free.
     pub fn cluster(&self, idx: u32) -> Result<Arc<Cluster>> {
         self.load_cluster(idx)
+    }
+
+    /// On-disk byte range occupied by cluster `idx`, including its info
+    /// byte. The returned range's length is the compressed size the cluster
+    /// takes up in the file.
+    pub fn cluster_byte_range(&self, idx: u32) -> Result<std::ops::Range<u64>> {
+        let start = self.cluster_pointer(idx)?;
+        let end = if idx + 1 < self.core.header.cluster_count {
+            self.cluster_pointer(idx + 1)?
+        } else {
+            self.cluster_region_end()
+        };
+        if end < start {
+            return Err(Error::Truncated(end));
+        }
+        Ok(start..end)
     }
 
     /// Decompress a cluster *without* touching the cache. Useful for parallel
@@ -1055,8 +1070,7 @@ impl Iterator for PrefixIter {
 /// [`Archive::summary`].
 #[derive(Debug, Clone)]
 pub struct Summary {
-    pub uuid: [u8; 16],
-    pub uuid_hyphenated: String,
+    pub uuid: crate::Uuid,
     pub major_version: u16,
     pub minor_version: u16,
     pub uses_new_namespaces: bool,
@@ -1071,7 +1085,7 @@ pub struct Summary {
 
 impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "uuid            {}", self.uuid_hyphenated)?;
+        writeln!(f, "uuid            {}", self.uuid)?;
         writeln!(f, "version         {}.{}{}",
             self.major_version,
             self.minor_version,
@@ -1088,10 +1102,3 @@ impl std::fmt::Display for Summary {
     }
 }
 
-fn format_uuid_hyphenated(u: &[u8; 16]) -> String {
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
-        u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15],
-    )
-}
