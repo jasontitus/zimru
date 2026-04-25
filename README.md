@@ -248,16 +248,18 @@ println!("{r}");         // ↪ C/fruit "Fruit"   (unicode arrow marks a redirec
 
 ## CLI
 
-The crate ships five binaries — one Rust-native explorer plus four drop-in
-replacements for the upstream `zim-tools` family:
+The crate ships **seven binaries** — one Rust-native explorer plus six
+drop-in replacements for the upstream `zim-tools` family:
 
-| binary       | upstream counterpart   | status                                              |
-|--------------|------------------------|-----------------------------------------------------|
-| `zimru`      | (native, no upstream)  | Inspection / extraction / read-every-blob benchmark |
-| `zimcheck`   | `zim-tools/zimcheck`   | Full CLI parity (all flags) + JSON output           |
-| `zimdump`    | `zim-tools/zimdump`    | `info` / `list` / `list --details` / `show` / `dump`|
-| `zimbench`   | `zim-tools/zimbench`   | `-n` / `-r` / `-d` flags (linear + random access)   |
-| `zimsplit`   | `zim-tools/zimsplit`   | byte-aligned split (concat reproduces original)     |
+| binary        | upstream counterpart      | status                                                                |
+|---------------|---------------------------|-----------------------------------------------------------------------|
+| `zimru`       | (native, no upstream)     | Inspection / extraction / read-every-blob benchmark                   |
+| `zimcheck`    | `zim-tools/zimcheck`      | Full CLI parity (all flags) + JSON output. **8.27× faster than upstream on `-A`.** |
+| `zimdump`     | `zim-tools/zimdump`       | `info` / `list` / `list --details` / `show` / `dump`. **2.73× faster on `info`.** |
+| `zimbench`    | `zim-tools/zimbench`      | `-n` / `-r` / `-d` flags. Upstream's random-URL phase crashes; ours runs to completion. |
+| `zimsplit`    | `zim-tools/zimsplit`      | byte-aligned split (concat reproduces original)                       |
+| `zimrecreate` | `zim-tools/zimrecreate`   | reads source, writes new archive. Output passes upstream `zimcheck -A`. **19–59× faster than upstream.** |
+| `zimwriterfs` | `zim-tools/zimwriterfs`   | packs an HTML directory tree into a ZIM. Side-by-side parity with upstream output. |
 
 ```sh
 cargo build --release
@@ -270,11 +272,17 @@ cargo build --release
 
 # zim-tools drop-in replacements
 ./target/release/zimcheck -A wikipedia_en_100_mini.zim
-./target/release/zimcheck -A -J wikipedia_en_100_mini.zim   # JSON
+./target/release/zimcheck -A -J wikipedia_en_100_mini.zim     # JSON
 ./target/release/zimdump  info wikipedia_en_100_mini.zim
 ./target/release/zimdump  list --details wikipedia_en_100_mini.zim
 ./target/release/zimbench -n 1000 wikipedia_en_100_mini.zim
 ./target/release/zimsplit --prefix=part- --size=2G --force wikipedia_en_100_mini.zim
+
+# Writer tools (zimrecreate also accepts every upstream flag + extras)
+./target/release/zimrecreate source.zim out.zim --compression zstd
+./target/release/zimwriterfs --welcome=index.html --illustration=icon48.png \
+    --language=eng --name=demo --title="Demo" --description=d \
+    --creator=me --publisher=zimru ./html_dir out.zim
 ```
 
 ## CLI parity vs upstream `zim-tools` 3.6.0 / `libzim` 9.3.0
@@ -629,43 +637,58 @@ Run the full suite:
 cargo test --release
 ```
 
-Test breakdown:
+Test breakdown (**48 tests + 6 doctests pass**):
 
-- **Unit tests** (`src/*.rs`) — synthetic byte-level round-trips for the
-  header, MIME list, dirent, and cluster (uncompressed / zstd / xz / extended
-  offsets / unsupported-compression rejection) parsers.
-- **Synthetic ZIM end-to-end** (`tests/synthetic_zim.rs`) — builds spec-
-  compliant ZIM files in memory (header → mime list → URL/title/cluster
+- **Unit tests** (`src/*.rs`, 12 tests) — synthetic byte-level round-trips
+  for the header, MIME list, dirent, and cluster (uncompressed / zstd / xz
+  / extended offsets / unsupported-compression rejection) parsers.
+- **Synthetic ZIM end-to-end** (`tests/synthetic_zim.rs`, 4 tests) — builds
+  spec-compliant ZIM files in memory (header → mime list → URL/title/cluster
   pointer lists → dirents → cluster → MD5 trailer) and exercises the public
-  `Archive` API against them. Includes redirect following, loop guard,
-  zstd-compressed clusters, missing entries, and corrupted-checksum
-  detection.
-- **Real-file integration** (`tests/real_files.rs`) — runs against actual
-  Wikipedia ZIM files placed under `zim-cache/`. The files are NOT in this
-  repo. Each test:
-    1. Verifies the trailing MD5 checksum.
-    2. Walks every entry in path order; round-trips a sample via binary
-       search on `(namespace, url)`.
-    3. Walks every entry in title order; verifies monotonic ordering;
-       round-trips a sample via title binary search.
-    4. Decompresses every cluster by reading every article's blob.
-    5. Follows the main-page redirect and asserts non-empty content.
-    6. Reads the canonical metadata keys (Title, Language, Description) —
-       UTF-8, including non-Latin scripts.
+  `Archive` API against them. Covers redirect following, loop guard,
+  zstd-compressed clusters, missing entries, corrupted-checksum detection.
+- **Ergonomic API** (`tests/ergonomic_api.rs`, 13 tests) — covers every
+  Rust-idiomatic helper added on top of the libzim-mirror surface
+  (`get_text` / `get_bytes` / `metadata_str` / `articles` / `redirects`
+  / `content_entries` / `by_prefix` / `namespace_range` / `summary` /
+  `par_iter_by_path` / `par_clusters` / `Item::text/bytes/is_html` /
+  `Blob::as_str/reader/Deref` / `Entry::item/resolve/Display`).
+- **Writer round-trip** (`tests/writer_roundtrip.rs`, 7 tests) — builds
+  ZIMs through `Creator`, reopens them with our reader, and (when
+  upstream zim-tools is installed) cross-validates each output with
+  `upstream zimcheck -A`/`-C`/`-M`/`-P` and `upstream zimdump info/list`.
+  Covers single-article round-trip, full archive (items + metadata +
+  illustration + main-page redirect + custom redirection),
+  multi-cluster bin-packing, every compression (None / Zstd / Xz),
+  dangling-redirect rejection.
+- **`zimwriterfs` end-to-end** (`tests/zimwriterfs_e2e.rs`, 3 tests) —
+  builds an HTML site under a temp dir, runs the `zimwriterfs` binary,
+  reopens the produced ZIM, validates content + metadata, runs upstream
+  `zimcheck -A`. Includes a side-by-side parity check that builds the
+  same site with both `zimru zimwriterfs` and `upstream zimwriterfs`
+  and verifies the same C-namespace path set.
+- **Real-file integration** (`tests/real_files.rs`, 3 tests) — runs
+  against actual Wikipedia ZIM files placed under `zim-cache/`. The
+  files are NOT in this repo. Each test verifies the trailing MD5
+  checksum, walks every entry in path order (round-trips a sample via
+  binary search), walks title order (verifies monotonic order;
+  round-trips a sample), decompresses every cluster, follows the
+  main-page redirect, and reads the canonical metadata keys (UTF-8
+  including non-Latin scripts). Skip silently if cache files absent.
+- **Doc tests** (6 tests) — every code-block example in `lib.rs` and
+  `archive.rs` is compile-verified.
 
-  Tests skip silently if the cache files aren't present.
+To populate the real-file cache:
 
-  To populate the cache:
-
-  ```sh
-  mkdir -p zim-cache && cd zim-cache
-  curl -fLO https://download.kiwix.org/zim/wikipedia/wikipedia_en_100_mini_2026-04.zim
-  mv wikipedia_en_100_mini_2026-04.zim wikipedia_en_100_mini.zim
-  curl -fLO https://download.kiwix.org/zim/wikipedia/wikipedia_en_100_nopic_2026-04.zim
-  mv wikipedia_en_100_nopic_2026-04.zim wikipedia_en_100_nopic.zim
-  curl -fLO https://download.kiwix.org/zim/wikipedia/wikipedia_zh_chemistry_mini_2026-03.zim
-  mv wikipedia_zh_chemistry_mini_2026-03.zim wikipedia_zh_chemistry_mini.zim
-  ```
+```sh
+mkdir -p zim-cache && cd zim-cache
+curl -fLO https://download.kiwix.org/zim/wikipedia/wikipedia_en_100_mini_2026-04.zim
+mv wikipedia_en_100_mini_2026-04.zim wikipedia_en_100_mini.zim
+curl -fLO https://download.kiwix.org/zim/wikipedia/wikipedia_en_100_nopic_2026-04.zim
+mv wikipedia_en_100_nopic_2026-04.zim wikipedia_en_100_nopic.zim
+curl -fLO https://download.kiwix.org/zim/wikipedia/wikipedia_zh_chemistry_mini_2026-03.zim
+mv wikipedia_zh_chemistry_mini_2026-03.zim wikipedia_zh_chemistry_mini.zim
+```
 
   (No `wikipedia_zh_100` ZIM is published; `wikipedia_zh_chemistry_mini` is
   the smallest available Chinese Wikipedia ZIM and exercises the same code
