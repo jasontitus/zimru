@@ -27,7 +27,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use md5::Digest as _;
-use zimru::{Archive, Entry, Error};
+use rayon::prelude::*;
+use zimru::{Archive, Dirent, Entry, Error};
 
 const VERSION: &str = "0.1.0";
 
@@ -405,25 +406,29 @@ fn run_checks(file: &str, arc: &Archive, o: &Opts) -> Report {
         report.add_info("Searching for main page...".to_string());
         check_main_page(arc, &mut report);
     }
-    if o.checks.contains(&Check::Empty) || o.checks.contains(&Check::UrlEmpty) {
+    // -------- combined per-blob scan --------
+    // empty / redundant / internal-url / external-url all need to read every
+    // C-namespace blob; doing them in a single per-cluster parallel pass
+    // (rather than four sequential iterations) is the biggest win on -A.
+    let need_empty = o.checks.contains(&Check::Empty) || o.checks.contains(&Check::UrlEmpty);
+    let need_redundant = o.checks.contains(&Check::Redundant);
+    let need_url_int = o.checks.contains(&Check::UrlInternal);
+    let need_url_ext = o.checks.contains(&Check::UrlExternal);
+    let need_any_content = need_empty || need_redundant || need_url_int || need_url_ext;
+
+    if need_empty {
         report.add_info("Verifying Articles' content...".to_string());
-        check_empty(arc, &mut report);
     }
-    if o.checks.contains(&Check::Redundant) {
+    if need_redundant {
         report.add_info("Searching for redundant articles...".to_string());
         report.add_info_body("  Verifying Similar Articles for redundancies...".to_string());
-        check_redundant(arc, &mut report);
     }
     if o.checks.contains(&Check::Redirect) {
         report.add_info("Checking for redirect loops...".to_string());
         check_redirect_loops(arc, &mut report);
     }
-    if o.checks.contains(&Check::UrlInternal) {
-        // Best-effort scan; reports broken in-archive references in HTML hrefs.
-        check_internal_urls(arc, &mut report);
-    }
-    if o.checks.contains(&Check::UrlExternal) {
-        check_external_urls(arc, &mut report);
+    if need_any_content {
+        scan_content(arc, &mut report, need_empty, need_redundant, need_url_int, need_url_ext);
     }
 
     let elapsed = started.elapsed();
@@ -507,58 +512,211 @@ fn check_main_page(arc: &Archive, report: &mut Report) {
     }
 }
 
-fn check_empty(arc: &Archive, report: &mut Report) {
+/// One pass over every C-namespace article that runs all of empty / redundant
+/// / internal-URL / external-URL checks together, parallelizing by cluster.
+///
+/// Each worker decompresses one cluster (without going through the archive's
+/// shared cache), then iterates its blobs. Per-cluster results are returned
+/// to the main thread, which aggregates them deterministically (URL-pointer
+/// order) so the output stays stable.
+fn scan_content(
+    arc: &Archive,
+    report: &mut Report,
+    do_empty: bool,
+    do_redundant: bool,
+    do_internal: bool,
+    do_external: bool,
+) {
+    // (cluster_index, blob_index, dirent metadata, mimetype, url-pointer index)
+    struct BlobRef {
+        url_index: u32,
+        path: String,
+        mimetype: String,
+        blob: u32,
+    }
+    let mime_list = arc.mime_list();
+    let mut by_cluster: HashMap<u32, Vec<BlobRef>> = HashMap::new();
     for entry in arc.iter_by_path() {
         let Ok(e) = entry else { continue };
-        if e.is_redirect() || e.namespace() != b'C' {
-            continue;
-        }
-        let Ok(item) = e.get_item(false) else { continue };
-        let Ok(blob) = item.get_data() else { continue };
-        if blob.size() == 0 {
-            report.add_error(Check::Empty, format!("Empty article: {}", e.path()));
-        }
+        if e.is_redirect() || e.namespace() != b'C' { continue; }
+        let Dirent::Article(a) = e.dirent().clone() else { continue };
+        let mt = mime_list.get(a.mimetype).unwrap_or("application/octet-stream").to_string();
+        by_cluster.entry(a.cluster).or_default().push(BlobRef {
+            url_index: e.index(),
+            path: a.url,
+            mimetype: mt,
+            blob: a.blob,
+        });
     }
-}
+    // Sort each per-cluster slice by url_index so the final aggregation walks
+    // entries in URL-pointer order (matching upstream output for the empty
+    // and url-internal checks).
+    for v in by_cluster.values_mut() {
+        v.sort_by_key(|b| b.url_index);
+    }
+    let cluster_keys: Vec<u32> = {
+        let mut k: Vec<u32> = by_cluster.keys().copied().collect();
+        k.sort();
+        k
+    };
 
-fn check_redundant(arc: &Archive, report: &mut Report) {
-    // Insertion-ordered grouping keeps the report deterministic and matches
-    // the URL-pointer traversal order upstream uses.
-    let mut groups: Vec<(Vec<String>, [u8; 16])> = Vec::new();
-    let mut by_hash: HashMap<[u8; 16], usize> = HashMap::new();
-    for entry in arc.iter_by_path() {
-        let Ok(e) = entry else { continue };
-        if e.is_redirect() || e.namespace() != b'C' {
-            continue;
-        }
-        let Ok(item) = e.get_item(false) else { continue };
-        let Ok(blob) = item.get_data() else { continue };
-        if blob.size() == 0 { continue; }
-        let mut h = md5::Md5::new();
-        h.update(blob.data());
-        let d: [u8; 16] = h.finalize().into();
-        if let Some(&idx) = by_hash.get(&d) {
-            groups[idx].0.push(e.path().to_string());
-        } else {
-            by_hash.insert(d, groups.len());
-            groups.push((vec![e.path().to_string()], d));
+    #[derive(Default)]
+    struct PerEntryFinding {
+        url_index: u32,
+        path: String,
+        is_empty: bool,
+        md5: Option<[u8; 16]>,
+        dangling: Vec<(String, String)>, // (raw target, resolved target)
+        external: Vec<String>,           // absolute http(s) src= URLs
+    }
+
+    // Parallel work across clusters. Each cluster's findings come back as a
+    // Vec<PerEntryFinding> in url-pointer order.
+    let findings: Vec<PerEntryFinding> = cluster_keys
+        .par_iter()
+        .map(|&cidx| {
+            let cluster = match arc.cluster_uncached(cidx) {
+                Ok(c) => c,
+                Err(_) => return Vec::<PerEntryFinding>::new(),
+            };
+            let blobs = by_cluster.get(&cidx).expect("cluster present");
+            let mut out = Vec::with_capacity(blobs.len());
+            for b in blobs {
+                let mut f = PerEntryFinding {
+                    url_index: b.url_index,
+                    path: b.path.clone(),
+                    ..Default::default()
+                };
+                let Ok(bytes) = cluster.blob(b.blob) else {
+                    out.push(f);
+                    continue;
+                };
+                if do_empty && bytes.is_empty() {
+                    f.is_empty = true;
+                }
+                if do_redundant && !bytes.is_empty() {
+                    let mut h = md5::Md5::new();
+                    h.update(bytes);
+                    f.md5 = Some(h.finalize().into());
+                }
+                if (do_internal || do_external) && b.mimetype.starts_with("text/html") {
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        for (kind, target) in extract_link_targets(text) {
+                            if !looks_like_url(target) { continue; }
+                            if do_external && kind == "src" && (target.starts_with("http://") || target.starts_with("https://")) && !b.path.starts_with('_') {
+                                f.external.push(target.to_string());
+                            }
+                            if do_internal {
+                                let stripped = target.strip_prefix("./").unwrap_or(target);
+                                if !(stripped.contains("://") || has_scheme(stripped) || stripped.starts_with("//") || stripped.starts_with('#') || stripped.is_empty()) {
+                                    let no_frag = stripped.split(['#', '?']).next().unwrap_or(stripped);
+                                    let decoded = percent_decode(no_frag);
+                                    let resolved = resolve_relative(&b.path, &decoded);
+                                    if arc.entry_by_ns_path(b'C', &resolved).is_err() {
+                                        f.dangling.push((no_frag.to_string(), resolved));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                out.push(f);
+            }
+            out
+        })
+        .reduce(Vec::new, |mut acc, mut v| { acc.append(&mut v); acc });
+
+    // Aggregate in url-pointer order so the report is deterministic.
+    let mut findings = findings;
+    findings.sort_by_key(|f| f.url_index);
+
+    // ---- Empty ----
+    if do_empty {
+        for f in &findings {
+            if f.is_empty {
+                report.add_error(Check::Empty, format!("Empty article: {}", f.path));
+            }
         }
     }
-    let mut emitted_header = false;
-    for (paths, _) in &groups {
-        if paths.len() < 2 { continue; }
-        if !emitted_header {
-            report.add_warn("Redundant data found:".to_string());
-            emitted_header = true;
+
+    // ---- Redundant ----
+    if do_redundant {
+        let mut groups: Vec<(Vec<String>, [u8; 16])> = Vec::new();
+        let mut by_hash: HashMap<[u8; 16], usize> = HashMap::new();
+        for f in &findings {
+            let Some(d) = f.md5 else { continue };
+            if let Some(&idx) = by_hash.get(&d) {
+                groups[idx].0.push(f.path.clone());
+            } else {
+                by_hash.insert(d, groups.len());
+                groups.push((vec![f.path.clone()], d));
+            }
         }
-        for w in paths.windows(2) {
-            report.add_warn_body(format!("  {} and {}", w[0], w[1]));
-            report.entries.push(JsonLog {
-                check: Check::Redundant,
-                level: "WARNING",
-                message: format!("{} and {}", w[0], w[1]),
-                extra: JsonExtra::Redundant { path1: w[0].clone(), path2: w[1].clone() },
-            });
+        let mut emitted_header = false;
+        for (paths, _) in &groups {
+            if paths.len() < 2 { continue; }
+            if !emitted_header {
+                report.add_warn("Redundant data found:".to_string());
+                emitted_header = true;
+            }
+            for w in paths.windows(2) {
+                report.add_warn_body(format!("  {} and {}", w[0], w[1]));
+                report.entries.push(JsonLog {
+                    check: Check::Redundant,
+                    level: "WARNING",
+                    message: format!("{} and {}", w[0], w[1]),
+                    extra: JsonExtra::Redundant { path1: w[0].clone(), path2: w[1].clone() },
+                });
+            }
+        }
+    }
+
+    // ---- Internal URLs ----
+    if do_internal {
+        let any = findings.iter().any(|f| !f.dangling.is_empty());
+        if any {
+            report.add_error(Check::UrlInternal, "Invalid internal links found:".to_string());
+            for f in &findings {
+                for (raw, resolved) in &f.dangling {
+                    report.add_error_body(Check::UrlInternal, "  The following links:".to_string());
+                    report.add_error_body(Check::UrlInternal, format!("- ./{raw}"));
+                    report.add_error_body(
+                        Check::UrlInternal,
+                        format!("({resolved}) were not found in article {}", f.path),
+                    );
+                    let msg = format!("The following links:\n- ./{raw}\n({resolved}) were not found in article {}", f.path);
+                    report.entries.push(JsonLog {
+                        check: Check::UrlInternal,
+                        level: "ERROR",
+                        message: msg,
+                        extra: JsonExtra::UrlInternal {
+                            article: f.path.clone(),
+                            link: format!("./{raw}"),
+                            normalized_link: resolved.clone(),
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    // ---- External URLs ----
+    if do_external {
+        let any = findings.iter().any(|f| !f.external.is_empty());
+        if any {
+            report.add_error(Check::UrlExternal, "Invalid external links found:".to_string());
+            for f in &findings {
+                for url in &f.external {
+                    let msg = format!("{url} is an external dependence in article {}", f.path);
+                    report.add_error_body(Check::UrlExternal, format!("  {msg}"));
+                    report.entries.push(JsonLog {
+                        check: Check::UrlExternal,
+                        level: "ERROR",
+                        message: msg,
+                        extra: JsonExtra::UrlExternal { article: f.path.clone(), url: url.clone() },
+                    });
+                }
+            }
         }
     }
 }
@@ -583,121 +741,6 @@ fn follow_loop(e: &Entry) -> Result<Entry, Error> {
         cur = cur.get_redirect_entry()?;
     }
     Ok(cur)
-}
-
-fn check_internal_urls(arc: &Archive, report: &mut Report) {
-    // Group dangling internal references by source article and emit them in
-    // the same multi-line format upstream uses:
-    //   [ERROR] Invalid internal links found:
-    //     The following links:
-    //   - ./<raw target>
-    //   (<resolved target>) were not found in article <article path>
-    let mut dangling: Vec<(String, Vec<(String, String)>)> = Vec::new();
-    for entry in arc.iter_by_path() {
-        let Ok(e) = entry else { continue };
-        if e.is_redirect() || e.namespace() != b'C' { continue; }
-        let Ok(item) = e.get_item(false) else { continue };
-        if !item.mimetype().starts_with("text/html") { continue; }
-        let Ok(blob) = item.get_data() else { continue };
-        let bytes = blob.data();
-        let text = match std::str::from_utf8(bytes) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let mut per_article: Vec<(String, String)> = Vec::new();
-        for (_kind, target) in extract_link_targets(text) {
-            if !looks_like_url(target) {
-                continue;
-            }
-            // Strip a single leading `./` so the displayed raw target matches
-            // upstream's normalization. Also reject anything that still looks
-            // absolute (contains `://` or has a real scheme prefix).
-            let stripped = target.strip_prefix("./").unwrap_or(target);
-            if stripped.contains("://") || has_scheme(stripped) || stripped.starts_with("//") || stripped.starts_with('#') || stripped.is_empty() {
-                continue;
-            }
-            let target_no_frag = stripped.split(['#', '?']).next().unwrap_or(stripped);
-            let decoded = percent_decode(target_no_frag);
-            let resolved = resolve_relative(e.path(), &decoded);
-            if arc.entry_by_ns_path(b'C', &resolved).is_err() {
-                per_article.push((target_no_frag.to_string(), resolved));
-            }
-        }
-        if !per_article.is_empty() {
-            dangling.push((e.path().to_string(), per_article));
-        }
-    }
-    if dangling.is_empty() { return; }
-    report.add_error(Check::UrlInternal, "Invalid internal links found:".to_string());
-    for (article, links) in &dangling {
-        for (raw, resolved) in links {
-            report.add_error_body(Check::UrlInternal, "  The following links:".to_string());
-            report.add_error_body(Check::UrlInternal, format!("- ./{raw}"));
-            report.add_error_body(
-                Check::UrlInternal,
-                format!("({resolved}) were not found in article {article}"),
-            );
-            let msg = format!(
-                "The following links:\n- ./{raw}\n({resolved}) were not found in article {article}"
-            );
-            report.entries.push(JsonLog {
-                check: Check::UrlInternal,
-                level: "ERROR",
-                message: msg,
-                extra: JsonExtra::UrlInternal {
-                    article: article.clone(),
-                    link: format!("./{raw}"),
-                    normalized_link: resolved.clone(),
-                },
-            });
-        }
-    }
-}
-
-fn check_external_urls(arc: &Archive, report: &mut Report) {
-    // Mirror upstream's "Invalid external links found:" block. Reports any
-    // src/href attribute that points off the archive (http:// or https://
-    // scheme). One body line per (url, article) pair in encounter order.
-    let mut found: Vec<(String, String)> = Vec::new();
-    for entry in arc.iter_by_path() {
-        let Ok(e) = entry else { continue };
-        if e.is_redirect() || e.namespace() != b'C' { continue; }
-        let Ok(item) = e.get_item(false) else { continue };
-        if !item.mimetype().starts_with("text/html") { continue; }
-        // Skip ZIM auxiliary content (`_assets_/...`, `_mw_/...`, ...). Upstream
-        // doesn't flag external references inside these paths — they typically
-        // contain MediaWiki internals or third-party assets where http(s) URLs
-        // are intentional.
-        if e.path().starts_with('_') { continue; }
-        let Ok(blob) = item.get_data() else { continue };
-        let bytes = blob.data();
-        let text = match std::str::from_utf8(bytes) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        for (kind, target) in extract_link_targets(text) {
-            if !looks_like_url(target) { continue; }
-            // Only `src=` represents an *external dependence* — a resource the
-            // page tries to load. Regular `href=` hyperlinks pointing off-archive
-            // are normal and not flagged (matches upstream behavior).
-            if kind != "src" { continue; }
-            if target.starts_with("http://") || target.starts_with("https://") {
-                found.push((target.to_string(), e.path().to_string()));
-            }
-        }
-    }
-    if found.is_empty() { return; }
-    report.add_error(Check::UrlExternal, "Invalid external links found:".to_string());
-    for (url, article) in &found {
-        let msg = format!("{url} is an external dependence in article {article}");
-        report.add_error_body(Check::UrlExternal, format!("  {msg}"));
-        report.entries.push(JsonLog {
-            check: Check::UrlExternal,
-            level: "ERROR",
-            message: msg,
-            extra: JsonExtra::UrlExternal { article: article.clone(), url: url.clone() },
-        });
-    }
 }
 
 /// True if the candidate string looks like a sane URL/path. Filters out the

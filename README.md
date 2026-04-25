@@ -170,11 +170,28 @@ content). Hardware: shared linux container; results are warm-cache means of
 
 | workload                                  | upstream (3.6.0)  | zimru          | speedup      |
 |-------------------------------------------|-------------------|----------------|--------------|
-| `zimcheck -C` (MD5 trailer only)          | 2.23 s            | 2.52 s         | 0.88×        |
-| `zimcheck -R` vs `zimru readall --md5`    | 18.28 s           | 11.33 s        | **1.61×**    |
-| `zimcheck -A` (full sweep)                | 57.35 s           | 30.03 s        | **1.91×**    |
+| `zimcheck -C` (MD5 trailer only)          | 2.29 s            | 2.05 s         | **1.12×**    |
+| `zimcheck -R` (decompress + MD5 every blob) | 18.28 s         | 2.19 s         | **8.44×**    |
+| `zimcheck -A` (full sweep)                | 57.27 s           | 6.93 s         | **8.27×**    |
 | `zimdump info` (cold-style header parse)  | 4.3 ms            | 1.6 ms         | **2.73×**    |
 | `zimru readall` (decompress only)         | n/a               | 4.20 s         | —            |
+| `zimbench` (n=1000)                       | ~~n/a~~ (crashes) | 1.95 s (full)  | —            |
+
+`zimcheck -C` now edges out upstream (which is using OpenSSL-accelerated MD5)
+by enabling the `md-5` crate's `asm` feature — we hit ~556 MB/s, matching
+`md5sum` itself.
+
+`zimcheck -R` and `-A` get an 8× speedup from two changes stacked together:
+(1) the four content-checks (`empty` / `redundant` / `url_internal` /
+`url_external`) are now a **single pass** instead of four separate iterations,
+and (2) the pass is **parallelized by cluster** with rayon — each cluster
+decompresses once on a worker thread, and per-blob work (MD5 + HTML scan +
+internal-URL lookup) runs in parallel. Aggregation stays deterministic (URL
+pointer order) so the report text still matches upstream byte-for-byte.
+
+Upstream's `zimbench` crashes with `Cannot find entry` during the random-
+access phase on every one of our test ZIMs (a known libzim bug), which
+stops it from completing. Ours runs through all three phases.
 
 `zimru readall --md5` decompresses every cluster (3.2 GB output) AND
 MD5-hashes every blob in 11.3 s. The pure decompression alone is 4.2 s —

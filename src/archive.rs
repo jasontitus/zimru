@@ -439,6 +439,28 @@ impl Archive {
         }
     }
 
+    /// Public access to a decoded cluster by its index. The cluster is cached
+    /// inside the archive so repeat calls for the same index are free.
+    pub fn cluster(&self, idx: u32) -> Result<Arc<Cluster>> {
+        self.load_cluster(idx)
+    }
+
+    /// Decompress a cluster *without* touching the cache. Useful for parallel
+    /// scans where each cluster is read exactly once and caching would only
+    /// waste memory + add Mutex contention.
+    pub fn cluster_uncached(&self, idx: u32) -> Result<Cluster> {
+        let start = self.cluster_pointer(idx)? as usize;
+        let end = if idx + 1 < self.core.header.cluster_count {
+            self.cluster_pointer(idx + 1)? as usize
+        } else {
+            self.cluster_region_end() as usize
+        };
+        if end < start || end > self.core.mmap.len() {
+            return Err(Error::Truncated(end as u64));
+        }
+        Cluster::parse(&self.core.mmap[start..end])
+    }
+
     fn load_cluster(&self, idx: u32) -> Result<Arc<Cluster>> {
         if let Some(c) = self.core.cluster_cache.lock().unwrap().get(&idx).cloned() {
             return Ok(c);
@@ -500,6 +522,13 @@ impl Entry {
 
     pub fn index(&self) -> u32 {
         self.url_index
+    }
+
+    /// Borrow the raw [`Dirent`] backing this entry. Useful for callers that
+    /// want to inspect the article's cluster/blob/mimetype without paying
+    /// for the [`Item`] resolution path.
+    pub fn dirent(&self) -> &Dirent {
+        &self.dirent
     }
 
     /// libzim parity: returns the [`Item`] for this entry. If `follow` is
