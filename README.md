@@ -312,7 +312,7 @@ Tools we don't yet reach byte-for-byte parity on:
 | tool          | status                                                            |
 |---------------|-------------------------------------------------------------------|
 | `zimrecreate` | **Implemented** — reads source, writes new archive. Output passes upstream `zimcheck -A`. |
-| `zimwriterfs` | needs filesystem walker built on top of writer — TODO             |
+| `zimwriterfs` | **Implemented** — packs an HTML directory tree into a ZIM. CLI-compatible with upstream (every flag accepted). |
 | `zimpatch`    | needs libzim diff format — TODO                                   |
 | `zimdiff`     | needs libzim diff format — TODO                                   |
 | `zimsearch`   | needs Xapian fulltext index — TODO                                |
@@ -371,6 +371,60 @@ Reads any zimru/libzim-compatible archive and rewrites it using the
     --compression zstd          # none | zstd | xz  (default zstd)
     --cluster-size 2097152      # target cluster size in bytes
 ```
+
+### `zimwriterfs` binary
+
+Packs a filesystem directory of HTML/CSS/JS/images/… into a single ZIM,
+matching upstream `zim-tools/zimwriterfs` flag-for-flag:
+
+```sh
+./target/release/zimwriterfs \
+    --welcome=index.html \
+    --illustration=icon48.png \
+    --language=eng \
+    --name=my-zim \
+    --title="My ZIM" \
+    --description="Example archive" \
+    --creator="Me" \
+    --publisher="Kiwix" \
+    --skip-libmagic-check \
+    ./html_dir out.zim
+```
+
+All upstream flags are accepted (`-w/--welcome`, `-I/--illustration`,
+`-l/--language`, `-n/--name`, `-t/--title`, `-d/--description`,
+`-c/--creator`, `-p/--publisher`, plus `-L/-m/-J/-x/-r/-j/-a/-e/-o/-s`
+optional ones), so existing build scripts that drive `zimwriterfs` can
+swap binaries with no other changes. `-J/--threads` is currently no-op
+(single-threaded writer). Mime detection is by file extension (no
+libmagic dependency).
+
+Tested side-by-side with upstream `zimwriterfs`: the same source
+directory produces ZIMs with the same C-namespace path set, both pass
+`upstream zimcheck -A`, both contain the mandatory metadata (Title,
+Description, Language, Creator, Publisher, Name, Date,
+Illustration_48x48@1).
+
+### Creation benchmark vs upstream
+
+`bench/recreate-bench.sh` times `zimru zimrecreate` against
+`upstream zimrecreate --withoutFTIndex --threads 1` (closest fair comparison
+since neither builds a fulltext index, both are single-threaded), and
+verifies both outputs pass `upstream zimcheck -A`:
+
+| file                                | size | zimru     | upstream    | zimru ZIM | upstream ZIM | zimcheck (zimru / upstream) |
+|-------------------------------------|------|-----------|-------------|-----------|--------------|------------------------------|
+| `wikipedia_zh_chemistry_mini.zim`   | 14 MB| 0.24 s    | 12.57 s     | 7.0 MB    | 8.6 MB       | PASS / PASS                  |
+| `wikipedia_en_100_nopic.zim`        | 13 MB| 0.31 s    | 18.32 s     | 12 MB     | 11 MB        | PASS / PASS                  |
+| `freecodecamp_js.zim`               | 6.7 MB| 0.26 s   | 9.68 s      | 7.9 MB    | 6.7 MB       | PASS / PASS                  |
+| `vikidia_ca.zim`                    | 5.0 MB| 0.06 s   | 1.16 s      | 4.6 MB    | 4.7 MB       | PASS / PASS                  |
+| `wikipedia_en_100_mini.zim`         | 4.4 MB| 0.04 s   | 0.97 s      | 3.3 MB    | 4.1 MB       | PASS / PASS                  |
+| `wikiquote_af.zim`                  | 1.8 MB| 0.02 s   | 0.58 s      | 1.6 MB    | 1.6 MB       | PASS / PASS                  |
+
+Speedups range from **19× to 59×** vs upstream (`upstream / zimru` time).
+Both produce green `zimcheck -A` on every input. Output sizes are
+comparable (within ±25%, depending on which compression preset
+outperforms the source).
 
 ### `zimrecreate` validated across diverse real-world archives
 

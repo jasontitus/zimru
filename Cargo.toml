@@ -37,6 +37,10 @@ path = "src/bin/zimsplit.rs"
 name = "zimrecreate"
 path = "src/bin/zimrecreate.rs"
 
+[[bin]]
+name = "zimwriterfs"
+path = "src/bin/zimwriterfs.rs"
+
 [dependencies]
 memmap2 = "0.9"
 zstd = { version = "0.13", default-features = false }
