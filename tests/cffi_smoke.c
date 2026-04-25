@@ -111,10 +111,40 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "Title: %.*s\n", (int)mlen, (const char *)title);
 
-    /* cleanup in reverse order */
+    /* free the per-entry handles; archive stays open for the next
+     * exercises below. */
     zimru_blob_free(b);
     zimru_item_free(it);
     zimru_entry_free(e);
+
+    /* New-scheme archives must let us reach the M/ namespace via the
+     * new ns-path lookup. (zimru's writer always emits new-scheme.) */
+    if (zimru_archive_uses_new_namespaces(a)) {
+        zimru_error_t *ns_err = NULL;
+        zimru_entry_t *m = zimru_archive_get_entry_by_ns_path(a, 'M', "Title", &ns_err);
+        if (!m) {
+            DIE("ns-path lookup M/Title: %s", ns_err ? zimru_error_message(ns_err) : "?");
+        }
+        zimru_entry_free(m);
+    }
+
+    /* By-index lookup. */
+    zimru_error_t *idx_err = NULL;
+    zimru_entry_t *first = zimru_archive_entry_by_url_index(a, 0, &idx_err);
+    if (!first) {
+        DIE("entry_by_url_index(0): %s", idx_err ? zimru_error_message(idx_err) : "?");
+    }
+    fprintf(stderr, "url[0] path: %s\n", zimru_entry_path(first));
+    zimru_entry_free(first);
+
+    /* Checksum as hex. */
+    char hex[33] = {0};
+    zimru_error_t *cks_err = NULL;
+    if (!zimru_archive_checksum_hex(a, hex, &cks_err)) {
+        DIE("checksum_hex: %s", cks_err ? zimru_error_message(cks_err) : "?");
+    }
+    fprintf(stderr, "md5: %.32s\n", hex);
+
     zimru_archive_close(a);
 
     /* error path: open a nonexistent file */

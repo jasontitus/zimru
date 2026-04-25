@@ -184,6 +184,73 @@ struct zimru_entry_t *zimru_archive_get_entry_by_path(const struct zimru_archive
  bool zimru_archive_has_entry_by_path(const struct zimru_archive_t *arc, const char *path);
 
 /**
+ * Look up an entry by namespace + URL within that namespace
+ * (e.g. ns=`'X'`, url=`"fulltext/xapian"`). This is the primitive
+ * downstream callers need to reach the X / M / W namespaces on
+ * new-scheme archives — `zimru_archive_get_entry_by_path` only looks
+ * in the content namespace by design.
+ *
+ * Returns NULL with `*err` set if not found.
+ */
+
+struct zimru_entry_t *zimru_archive_get_entry_by_ns_path(const struct zimru_archive_t *arc,
+                                                         uint8_t ns,
+                                                         const char *url,
+                                                         struct zimru_error_t **err);
+
+/**
+ * Look up an entry by its URL-pointer index (path order). Index range
+ * is `[0, all_entry_count)`.
+ */
+
+struct zimru_entry_t *zimru_archive_entry_by_url_index(const struct zimru_archive_t *arc,
+                                                       uint32_t idx,
+                                                       struct zimru_error_t **err);
+
+/**
+ * Look up an entry by its title-pointer index (title order). On modern
+ * archives this only covers the content namespace; index range is
+ * `[0, zimru_archive_title_count)`.
+ */
+
+struct zimru_entry_t *zimru_archive_entry_by_title_index(const struct zimru_archive_t *arc,
+                                                         uint32_t idx,
+                                                         struct zimru_error_t **err);
+
+/**
+ * Number of entries in the title-order listing. On modern archives
+ * this is the count of content-namespace entries only.
+ */
+ uint32_t zimru_archive_title_count(const struct zimru_archive_t *arc, struct zimru_error_t **err);
+
+/**
+ * Look up an entry by title in the content namespace. Returns NULL
+ * with `*err` set if not found.
+ */
+
+struct zimru_entry_t *zimru_archive_get_entry_by_title(const struct zimru_archive_t *arc,
+                                                       const char *title,
+                                                       struct zimru_error_t **err);
+
+/**
+ * True iff this archive uses the modern single-character namespace
+ * scheme (content under `C/`, metadata under `M/`, indexes under
+ * `X/`, well-known under `W/`). Old archives put articles in `A/`.
+ */
+ bool zimru_archive_uses_new_namespaces(const struct zimru_archive_t *arc);
+
+/**
+ * Write the archive's trailing-MD5 checksum into `out` as a 32-byte
+ * lowercase hex string (no NUL terminator, no hyphens). Returns
+ * `false` with `*err` set if the archive has no checksum or the read
+ * fails. `out` must point to at least 32 writable bytes.
+ */
+
+bool zimru_archive_checksum_hex(const struct zimru_archive_t *arc,
+                                char *out,
+                                struct zimru_error_t **err);
+
+/**
  * Look up the archive's main entry. Returns NULL with `*err` set if the
  * archive has no main page.
  */
