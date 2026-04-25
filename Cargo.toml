@@ -17,6 +17,22 @@ path = "src/lib.rs"
 name = "zimru"
 path = "src/bin/zimru.rs"
 
+[[bin]]
+name = "zimcheck"
+path = "src/bin/zimcheck.rs"
+
+[[bin]]
+name = "zimdump"
+path = "src/bin/zimdump.rs"
+
+[[bin]]
+name = "zimbench"
+path = "src/bin/zimbench.rs"
+
+[[bin]]
+name = "zimsplit"
+path = "src/bin/zimsplit.rs"
+
 [dependencies]
 memmap2 = "0.9"
 zstd = { version = "0.13", default-features = false }

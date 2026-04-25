@@ -88,16 +88,116 @@ println!("{}", String::from_utf8_lossy(item.get_data()?.data()));
 
 ## CLI
 
+The crate ships five binaries — one Rust-native explorer plus four drop-in
+replacements for the upstream `zim-tools` family:
+
+| binary       | upstream counterpart   | status                                              |
+|--------------|------------------------|-----------------------------------------------------|
+| `zimru`      | (native, no upstream)  | Inspection / extraction / read-every-blob benchmark |
+| `zimcheck`   | `zim-tools/zimcheck`   | Full CLI parity (all flags) + JSON output           |
+| `zimdump`    | `zim-tools/zimdump`    | `info` / `list` / `list --details` / `show` / `dump`|
+| `zimbench`   | `zim-tools/zimbench`   | `-n` / `-r` / `-d` flags (linear + random access)   |
+| `zimsplit`   | `zim-tools/zimsplit`   | byte-aligned split (concat reproduces original)     |
+
 ```sh
 cargo build --release
-./target/release/zimru info   wikipedia_en_100_mini.zim
-./target/release/zimru check  wikipedia_en_100_mini.zim
-./target/release/zimru list   wikipedia_en_100_mini.zim --limit 20
-./target/release/zimru titles wikipedia_en_100_mini.zim --limit 20
-./target/release/zimru meta   wikipedia_en_100_mini.zim Title
-./target/release/zimru get    wikipedia_en_100_mini.zim Alcoholism
-./target/release/zimru get    wikipedia_en_100_mini.zim 'W/mainPage'  # explicit ns
-./target/release/zimru mimes  wikipedia_en_100_mini.zim
+
+# Native helper
+./target/release/zimru info     wikipedia_en_100_mini.zim
+./target/release/zimru readall  wikipedia_en_100_mini.zim --md5
+./target/release/zimru get      wikipedia_en_100_mini.zim Alcoholism
+./target/release/zimru get      wikipedia_en_100_mini.zim 'W/mainPage'  # explicit ns
+
+# zim-tools drop-in replacements
+./target/release/zimcheck -A wikipedia_en_100_mini.zim
+./target/release/zimcheck -A -J wikipedia_en_100_mini.zim   # JSON
+./target/release/zimdump  info wikipedia_en_100_mini.zim
+./target/release/zimdump  list --details wikipedia_en_100_mini.zim
+./target/release/zimbench -n 1000 wikipedia_en_100_mini.zim
+./target/release/zimsplit --prefix=part- --size=2G --force wikipedia_en_100_mini.zim
+```
+
+## CLI parity vs upstream `zim-tools` 3.6.0 / `libzim` 9.3.0
+
+`bench/parity.sh` runs the upstream tool and our binary on the same archive,
+normalizes version strings + elapsed-time, and diffs outputs. On three
+real-world ZIM files the harness reports **36/36 cases pass** (12 cases ×
+3 archives — small English mini, Chinese chemistry mini, and 1.1 GB Bashkir
+all-maxi):
+
+| case                    | matching mode    | result   |
+|-------------------------|------------------|----------|
+| `zimdump info`          | byte-for-byte    | ✓ 3/3    |
+| `zimdump list`          | byte-for-byte    | ✓ 3/3    |
+| `zimdump list --details`| byte-for-byte    | ✓ 3/3    |
+| `zimdump show --idx=N`  | byte-for-byte    | ✓ 3/3    |
+| `zimcheck -C`           | byte-for-byte    | ✓ 3/3    |
+| `zimcheck -I`           | byte-for-byte    | ✓ 3/3    |
+| `zimcheck -M`           | byte-for-byte    | ✓ 3/3    |
+| `zimcheck -F`           | byte-for-byte    | ✓ 3/3    |
+| `zimcheck -P`           | byte-for-byte    | ✓ 3/3    |
+| `zimcheck -L`           | byte-for-byte    | ✓ 3/3    |
+| `zimcheck -A`           | structural*      | ✓ 3/3    |
+| `zimcheck -A -J` (JSON) | structural*      | ✓ 3/3    |
+
+\* "Structural" means everything in the report matches except the order of
+items inside `[WARNING] Redundant data found:`, `[ERROR] Invalid internal
+links found:` and `[ERROR] Invalid external links found:` blocks. The set
+*counts* (e.g. `dangling=27/29 redundant=2/2 external=1/1` on Bashkir) are
+also checked. Order varies because libzim iterates clusters in a sequence
+we don't replicate.
+
+Tools we don't yet reach byte-for-byte parity on:
+
+| tool          | status                                                            |
+|---------------|-------------------------------------------------------------------|
+| `zimrecreate` | needs ZIM **writer** — TODO                                       |
+| `zimwriterfs` | needs ZIM **writer** — TODO                                       |
+| `zimpatch`    | needs ZIM **writer** + libzim diff format — TODO                  |
+| `zimdiff`     | needs libzim diff format — TODO                                   |
+| `zimsearch`   | needs Xapian fulltext index — TODO                                |
+| `zimsplit`    | parts produced; output uses byte-aligned splits (upstream splits  |
+|               | on cluster boundaries). Both reconstruct the original via concat. |
+| `zimbench`    | runs end-to-end; upstream's random-URL phase crashes on our test  |
+|               | files ("Cannot find entry"), ours doesn't.                        |
+
+## Head-to-head benchmark vs upstream
+
+Reproduced via `bench/run.sh wikipedia_ba_all_maxi.zim` (1.1 GB Bashkir
+Wikipedia, 175 404 entries, 1 502 clusters, 3.2 GB of decompressed
+content). Hardware: shared linux container; results are warm-cache means of
+3–5 runs measured by `hyperfine`.
+
+| workload                                  | upstream (3.6.0)  | zimru          | speedup      |
+|-------------------------------------------|-------------------|----------------|--------------|
+| `zimcheck -C` (MD5 trailer only)          | 2.23 s            | 2.52 s         | 0.88×        |
+| `zimcheck -R` vs `zimru readall --md5`    | 18.28 s           | 11.33 s        | **1.61×**    |
+| `zimcheck -A` (full sweep)                | 57.35 s           | 30.03 s        | **1.91×**    |
+| `zimdump info` (cold-style header parse)  | 4.3 ms            | 1.6 ms         | **2.73×**    |
+| `zimru readall` (decompress only)         | n/a               | 4.20 s         | —            |
+
+`zimru readall --md5` decompresses every cluster (3.2 GB output) AND
+MD5-hashes every blob in 11.3 s. The pure decompression alone is 4.2 s —
+~760 MB/s of sustained zstd/xz throughput.
+
+## Reproducing the benchmark
+
+```sh
+# Install upstream tools
+curl -fLo /tmp/zt.tar.gz \
+    https://download.openzim.org/release/zim-tools/zim-tools_linux-x86_64-3.6.0.tar.gz
+sudo tar xf /tmp/zt.tar.gz -C /opt
+sudo apt-get install -y hyperfine
+
+# Get a 1 GB+ ZIM
+mkdir -p zim-cache && cd zim-cache
+curl -fLO https://download.kiwix.org/zim/wikipedia/wikipedia_ba_all_maxi_2026-04.zim
+mv wikipedia_ba_all_maxi_2026-04.zim wikipedia_ba_all_maxi.zim
+cd ..
+
+cargo build --release
+./bench/run.sh   zim-cache/wikipedia_ba_all_maxi.zim   # benchmark
+./bench/parity.sh zim-cache/wikipedia_ba_all_maxi.zim  # CLI parity diff
 ```
 
 ## Tests

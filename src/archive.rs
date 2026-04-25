@@ -252,6 +252,36 @@ impl Archive {
         self.get_entry_by_title(title).is_ok()
     }
 
+    /// Count entries in a single namespace by binary-searching for the
+    /// namespace boundary in the URL pointer list. O(log n) — much faster
+    /// than iterating every dirent when the caller only wants a count.
+    pub fn entry_count_in_namespace(&self, ns: u8) -> Result<u32> {
+        let n = self.core.header.entry_count;
+        // Find first index where namespace >= ns.
+        let lo_idx = self.lower_bound_ns(ns, n)?;
+        // Find first index where namespace > ns (i.e. >= ns+1).
+        let hi_idx = self.lower_bound_ns(ns.saturating_add(1), n)?;
+        Ok(hi_idx.saturating_sub(lo_idx))
+    }
+
+    fn lower_bound_ns(&self, ns: u8, n: u32) -> Result<u32> {
+        let mut lo = 0u32;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let off = self.url_pointer(mid)?;
+            // Read the namespace byte directly without parsing the rest of
+            // the dirent — it's at a fixed offset (3) inside every dirent.
+            let dirent_ns = raw::u8_at(&self.core.mmap, off as usize + 3)?;
+            if dirent_ns < ns {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
     /// Look up `(namespace, url)` directly via binary search of the URL ptr list.
     pub fn entry_by_ns_path(&self, ns: u8, url: &str) -> Result<Entry> {
         let n = self.core.header.entry_count;
