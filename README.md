@@ -1,12 +1,30 @@
 # zimru
 
 A clean-room, MIT-licensed Rust re-implementation of the [ZIM] file format
-reader. No code is shared with the GPL-licensed C++ `libzim`; the format
-parsing is written from the publicly documented [ZIM file format spec] and
-validated against real-world ZIM files (English & Chinese Wikipedia).
+reader and writer. No code is shared with the GPL-licensed C++ `libzim`;
+the format handling is written from the publicly documented [ZIM file
+format spec] and validated against real-world ZIM files.
 
 [ZIM]: https://wiki.openzim.org/wiki/OpenZIM
 [ZIM file format spec]: https://wiki.openzim.org/wiki/ZIM_file_format
+
+## At a glance
+
+- **48 tests + 6 doctests pass** (unit + synthetic-zim + ergonomic-API +
+  writer round-trip + zimwriterfs e2e + real-file integration + doc tests).
+- **7 binaries**: `zimru`, plus drop-in replacements for `zimcheck`,
+  `zimdump`, `zimbench`, `zimsplit`, `zimrecreate`, `zimwriterfs`. All
+  accept upstream `zim-tools` 3.6.0 flags.
+- **CLI byte-for-byte parity** with upstream on 12/12 cases per file
+  across 3 different ZIM archives (English mini, Chinese chemistry mini,
+  1.1 GB Bashkir).
+- **Faster than upstream on every comparable workload** measured on the
+  1.1 GB Bashkir Wikipedia: `zimcheck -A` 8.27×, `zimcheck -R` 8.44×,
+  `zimcheck -C` 1.12×, `zimdump info` 2.73×, `zimrecreate` 19–59×.
+- **Writer validated end-to-end on 8 diverse real ZIMs** (1.8 MB → 1.1 GB,
+  6 languages, 6 source projects). 8/8 round-trip with byte-perfect blob
+  content; on the 6 that are clean to begin with, both source and our
+  recreated output pass `upstream zimcheck -A`.
 
 ## Goals
 
