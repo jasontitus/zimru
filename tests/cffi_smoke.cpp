@@ -203,6 +203,34 @@ int main(int argc, char** argv) {
         }
     }
 
+    // 12a. Phase 2 additions: filesize, article/media counts, random entry,
+    //      deterministic seed → UUID.
+    {
+        std::uint64_t fsz = zimru_archive_filesize(a.get());
+        if (fsz == 0) die("filesize == 0");
+        std::cerr << "filesize: " << fsz << '\n';
+
+        zimru_error_t* err_ptr = nullptr;
+        std::uint64_t arts = zimru_archive_article_count(a.get(), &err_ptr);
+        std::uint64_t med = zimru_archive_media_count(a.get(), &err_ptr);
+        std::cerr << "articles: " << arts << ", media: " << med << '\n';
+        if (arts == 0) die("expected at least one article");
+
+        Entry rnd(zimru_archive_random_entry(a.get(), &err_ptr));
+        if (!rnd) {
+            Err er(err_ptr);
+            die("random_entry: " + err_msg(er.get()));
+        }
+        std::cerr << "random entry path: " << zimru_entry_path(rnd.get()) << '\n';
+
+        std::uint8_t u1[16] = {0}, u2[16] = {0};
+        zimru_uuid_generate(reinterpret_cast<const std::uint8_t*>("seed"), 4, u1);
+        zimru_uuid_generate(reinterpret_cast<const std::uint8_t*>("seed"), 4, u2);
+        if (std::memcmp(u1, u2, 16) != 0) die("uuid_generate non-deterministic");
+        if ((u1[6] & 0xf0) != 0x40) die("uuid v-nibble wrong");
+        if ((u1[8] & 0xc0) != 0x80) die("uuid variant wrong");
+    }
+
     // 13. Error path: open a missing file. Confirm the error pointer is set
     //     and that wrapping it in unique_ptr cleans it up automatically.
     {

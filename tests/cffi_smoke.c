@@ -145,6 +145,36 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "md5: %.32s\n", hex);
 
+    /* Phase 2: filesize, article/media counts, random entry. */
+    uint64_t fsz = zimru_archive_filesize(a);
+    if (fsz == 0) DIE("filesize == 0");
+    fprintf(stderr, "filesize: %llu\n", (unsigned long long)fsz);
+
+    zimru_error_t *cnt_err = NULL;
+    uint64_t articles = zimru_archive_article_count(a, &cnt_err);
+    uint64_t media    = zimru_archive_media_count(a, &cnt_err);
+    fprintf(stderr, "articles: %llu, media: %llu\n",
+            (unsigned long long)articles, (unsigned long long)media);
+    if (articles == 0) {
+        DIE("expected at least one article (the test ZIM has 'home')");
+    }
+
+    zimru_error_t *r_err = NULL;
+    zimru_entry_t *rnd = zimru_archive_random_entry(a, &r_err);
+    if (!rnd) {
+        DIE("random_entry: %s", r_err ? zimru_error_message(r_err) : "?");
+    }
+    fprintf(stderr, "random entry path: %s\n", zimru_entry_path(rnd));
+    zimru_entry_free(rnd);
+
+    /* Stable seed → UUID. Same seed twice == identical bytes. */
+    uint8_t u1[16] = {0}, u2[16] = {0};
+    zimru_uuid_generate((const uint8_t *)"seed", 4, u1);
+    zimru_uuid_generate((const uint8_t *)"seed", 4, u2);
+    if (memcmp(u1, u2, 16) != 0) DIE("uuid_generate is not deterministic");
+    if ((u1[6] & 0xf0) != 0x40) DIE("uuid version nibble != 4");
+    if ((u1[8] & 0xc0) != 0x80) DIE("uuid variant nibbles != 10xx");
+
     zimru_archive_close(a);
 
     /* error path: open a nonexistent file */

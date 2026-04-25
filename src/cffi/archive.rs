@@ -419,6 +419,76 @@ pub unsafe extern "C" fn zimru_archive_metadata(
     }
 }
 
+/// On-disk byte length of the archive (the mmapped extent).
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_filesize(arc: *const zimru_archive_t) -> u64 {
+    if arc.is_null() {
+        return 0;
+    }
+    (*arc).inner.file_len()
+}
+
+/// Number of "article" entries — non-redirect content-namespace items
+/// whose mimetype starts with `text/html`. Result is cached after the
+/// first call (one O(N) walk over the content namespace). Returns 0
+/// with `*err` set on read error.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_article_count(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> u64 {
+    if arc.is_null() {
+        return 0;
+    }
+    match (*arc).inner.article_count() {
+        Ok(n) => n,
+        Err(e) => {
+            set_err(err, e);
+            0
+        }
+    }
+}
+
+/// Number of "media" entries — non-redirect content-namespace items
+/// that are NOT articles. Result shares the cache with
+/// [`zimru_archive_article_count`].
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_media_count(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> u64 {
+    if arc.is_null() {
+        return 0;
+    }
+    match (*arc).inner.media_count() {
+        Ok(n) => n,
+        Err(e) => {
+            set_err(err, e);
+            0
+        }
+    }
+}
+
+/// Pick a pseudo-random entry from the content namespace. Suitable for
+/// "random article" UI links; not for cryptographic use.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_random_entry(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> *mut zimru_entry_t {
+    if arc.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return std::ptr::null_mut();
+    }
+    match (*arc).inner.random_content_entry() {
+        Ok(e) => ENTRY_VTABLE.box_entry(e),
+        Err(e) => {
+            set_err(err, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Number of metadata keys in the archive.
 #[no_mangle]
 pub unsafe extern "C" fn zimru_archive_metadata_keys_count(arc: *const zimru_archive_t) -> usize {

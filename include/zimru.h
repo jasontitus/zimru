@@ -271,6 +271,36 @@ const uint8_t *zimru_archive_metadata(const struct zimru_archive_t *arc,
                                       struct zimru_error_t **err);
 
 /**
+ * On-disk byte length of the archive (the mmapped extent).
+ */
+ uint64_t zimru_archive_filesize(const struct zimru_archive_t *arc);
+
+/**
+ * Number of "article" entries — non-redirect content-namespace items
+ * whose mimetype starts with `text/html`. Result is cached after the
+ * first call (one O(N) walk over the content namespace). Returns 0
+ * with `*err` set on read error.
+ */
+
+uint64_t zimru_archive_article_count(const struct zimru_archive_t *arc,
+                                     struct zimru_error_t **err);
+
+/**
+ * Number of "media" entries — non-redirect content-namespace items
+ * that are NOT articles. Result shares the cache with
+ * [`zimru_archive_article_count`].
+ */
+ uint64_t zimru_archive_media_count(const struct zimru_archive_t *arc, struct zimru_error_t **err);
+
+/**
+ * Pick a pseudo-random entry from the content namespace. Suitable for
+ * "random article" UI links; not for cryptographic use.
+ */
+
+struct zimru_entry_t *zimru_archive_random_entry(const struct zimru_archive_t *arc,
+                                                 struct zimru_error_t **err);
+
+/**
  * Number of metadata keys in the archive.
  */
  uintptr_t zimru_archive_metadata_keys_count(const struct zimru_archive_t *arc);
@@ -408,6 +438,16 @@ struct zimru_entry_t *zimru_entry_get_redirect_entry(const struct zimru_entry_t 
 
 struct zimru_blob_t *zimru_item_get_data(const struct zimru_item_t *it,
                                          struct zimru_error_t **err);
+
+/**
+ * Derive a deterministic 16-byte UUID from an arbitrary byte seed.
+ *
+ * `seed` may be NULL only if `seed_len` is 0. `out` must point to at
+ * least 16 writable bytes. The output has the high nibble of byte 6
+ * set to `4` and the high two bits of byte 8 set to `10` (RFC 4122
+ * v4 layout), so consumers that validate the variant won't reject it.
+ */
+ void zimru_uuid_generate(const uint8_t *seed, uintptr_t seed_len, uint8_t *out);
 
 #ifdef __cplusplus
 }  // extern "C"
