@@ -145,8 +145,109 @@ int main(int argc, char** argv) {
     std::string_view title(reinterpret_cast<const char*>(title_ptr), mlen);
     std::cerr << "Title: " << title << '\n';
 
-    // 9. Error path: open a missing file. Confirm the error pointer is set
-    //    and that wrapping it in unique_ptr cleans it up automatically.
+    // 9. Namespace-aware lookup. The new C ABI exposes
+    //    zimru_archive_get_entry_by_ns_path so consumers can reach the
+    //    M/ namespace (and X/ on full ZIMs) on new-scheme archives,
+    //    where get_entry_by_path is restricted to C/.
+    if (zimru_archive_uses_new_namespaces(a.get())) {
+        std::cerr << "new-scheme archive — exercising ns-path lookup\n";
+        zimru_error_t* err_ptr = nullptr;
+        Entry m_entry(zimru_archive_get_entry_by_ns_path(
+            a.get(), 'M', "Title", &err_ptr));
+        if (!m_entry) {
+            Err er(err_ptr);
+            die("ns-path lookup M/Title: " + err_msg(er.get()));
+        }
+        std::cerr << "M/Title entry path: " << zimru_entry_path(m_entry.get()) << '\n';
+    }
+
+    // 10. By-index entry lookup.
+    {
+        zimru_error_t* err_ptr = nullptr;
+        Entry first(zimru_archive_entry_by_url_index(a.get(), 0, &err_ptr));
+        if (!first) {
+            Err er(err_ptr);
+            die("entry_by_url_index(0): " + err_msg(er.get()));
+        }
+        std::cerr << "url[0] path: " << zimru_entry_path(first.get()) << '\n';
+    }
+
+    // 11. Title count + by-title-index lookup.
+    {
+        zimru_error_t* err_ptr = nullptr;
+        std::uint32_t tcount = zimru_archive_title_count(a.get(), &err_ptr);
+        if (tcount == 0) {
+            Err er(err_ptr);
+            die("title_count returned 0: " + err_msg(er.get()));
+        }
+        Entry t0(zimru_archive_entry_by_title_index(a.get(), 0, &err_ptr));
+        if (!t0) {
+            Err er(err_ptr);
+            die("entry_by_title_index(0): " + err_msg(er.get()));
+        }
+        std::cerr << "title[0] path: " << zimru_entry_path(t0.get())
+                  << " (of " << tcount << ")\n";
+    }
+
+    // 12. Checksum as hex string.
+    {
+        char hex[33] = {0};
+        zimru_error_t* err_ptr = nullptr;
+        if (!zimru_archive_checksum_hex(a.get(), hex, &err_ptr)) {
+            Err er(err_ptr);
+            die("checksum_hex: " + err_msg(er.get()));
+        }
+        std::cerr << "md5: " << std::string(hex, 32) << '\n';
+        if (std::string(hex, 32).find_first_not_of("0123456789abcdef") != std::string::npos) {
+            die("checksum_hex returned non-hex bytes");
+        }
+    }
+
+    // 12. Direct-access info. The smoke ZIM uses zstd compression so
+    //     the direct path is unreachable here — we just assert the
+    //     C ABI returns is_direct=false cleanly. The pread round-trip
+    //     for an uncompressed cluster lives in tests/direct_access.rs.
+    {
+        zimru_direct_access_t da{};
+        zimru_item_direct_access(it.get(), &da);
+        if (da.is_direct) {
+            die("expected zstd-cluster item to report is_direct=false");
+        }
+        if (da.file_offset != 0 || da.size != 0) {
+            die("non-direct entries must zero offset/size");
+        }
+    }
+
+    // 12a. Phase 2 additions: filesize, article/media counts, random entry,
+    //      deterministic seed → UUID.
+    {
+        std::uint64_t fsz = zimru_archive_filesize(a.get());
+        if (fsz == 0) die("filesize == 0");
+        std::cerr << "filesize: " << fsz << '\n';
+
+        zimru_error_t* err_ptr = nullptr;
+        std::uint64_t arts = zimru_archive_article_count(a.get(), &err_ptr);
+        std::uint64_t med = zimru_archive_media_count(a.get(), &err_ptr);
+        std::cerr << "articles: " << arts << ", media: " << med << '\n';
+        if (arts == 0) die("expected at least one article");
+
+        Entry rnd(zimru_archive_random_entry(a.get(), &err_ptr));
+        if (!rnd) {
+            Err er(err_ptr);
+            die("random_entry: " + err_msg(er.get()));
+        }
+        std::cerr << "random entry path: " << zimru_entry_path(rnd.get()) << '\n';
+
+        std::uint8_t u1[16] = {0}, u2[16] = {0};
+        zimru_uuid_generate(reinterpret_cast<const std::uint8_t*>("seed"), 4, u1);
+        zimru_uuid_generate(reinterpret_cast<const std::uint8_t*>("seed"), 4, u2);
+        if (std::memcmp(u1, u2, 16) != 0) die("uuid_generate non-deterministic");
+        if ((u1[6] & 0xf0) != 0x40) die("uuid v-nibble wrong");
+        if ((u1[8] & 0xc0) != 0x80) die("uuid variant wrong");
+    }
+
+    // 13. Error path: open a missing file. Confirm the error pointer is set
+    //     and that wrapping it in unique_ptr cleans it up automatically.
     {
         zimru_error_t* err_ptr = nullptr;
         Archive bad(zimru_archive_open("/this/does/not/exist.zim", &err_ptr));

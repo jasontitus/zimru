@@ -175,6 +175,170 @@ pub unsafe extern "C" fn zimru_archive_has_entry_by_path(
     (*arc).inner.has_entry_by_path(path_str)
 }
 
+/// Look up an entry by namespace + URL within that namespace
+/// (e.g. ns=`'X'`, url=`"fulltext/xapian"`). This is the primitive
+/// downstream callers need to reach the X / M / W namespaces on
+/// new-scheme archives — `zimru_archive_get_entry_by_path` only looks
+/// in the content namespace by design.
+///
+/// Returns NULL with `*err` set if not found.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_get_entry_by_ns_path(
+    arc: *const zimru_archive_t,
+    ns: u8,
+    url: *const c_char,
+    err: *mut *mut zimru_error_t,
+) -> *mut zimru_entry_t {
+    if arc.is_null() || url.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return std::ptr::null_mut();
+    }
+    let url_str = match CStr::from_ptr(url).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_err(err, crate::Error::BadUtf8(0));
+            return std::ptr::null_mut();
+        }
+    };
+    match (*arc).inner.entry_by_ns_path(ns, url_str) {
+        Ok(e) => ENTRY_VTABLE.box_entry(e),
+        Err(e) => {
+            set_err(err, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Look up an entry by its URL-pointer index (path order). Index range
+/// is `[0, all_entry_count)`.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_entry_by_url_index(
+    arc: *const zimru_archive_t,
+    idx: u32,
+    err: *mut *mut zimru_error_t,
+) -> *mut zimru_entry_t {
+    if arc.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return std::ptr::null_mut();
+    }
+    match (*arc).inner.entry_by_url_index(idx) {
+        Ok(e) => ENTRY_VTABLE.box_entry(e),
+        Err(e) => {
+            set_err(err, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Look up an entry by its title-pointer index (title order). On modern
+/// archives this only covers the content namespace; index range is
+/// `[0, zimru_archive_title_count)`.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_entry_by_title_index(
+    arc: *const zimru_archive_t,
+    idx: u32,
+    err: *mut *mut zimru_error_t,
+) -> *mut zimru_entry_t {
+    if arc.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return std::ptr::null_mut();
+    }
+    match (*arc).inner.entry_by_title_index(idx) {
+        Ok(e) => ENTRY_VTABLE.box_entry(e),
+        Err(e) => {
+            set_err(err, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Number of entries in the title-order listing. On modern archives
+/// this is the count of content-namespace entries only.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_title_count(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> u32 {
+    if arc.is_null() {
+        return 0;
+    }
+    match (*arc).inner.title_count() {
+        Ok(n) => n,
+        Err(e) => {
+            set_err(err, e);
+            0
+        }
+    }
+}
+
+/// Look up an entry by title in the content namespace. Returns NULL
+/// with `*err` set if not found.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_get_entry_by_title(
+    arc: *const zimru_archive_t,
+    title: *const c_char,
+    err: *mut *mut zimru_error_t,
+) -> *mut zimru_entry_t {
+    if arc.is_null() || title.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return std::ptr::null_mut();
+    }
+    let title_str = match CStr::from_ptr(title).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_err(err, crate::Error::BadUtf8(0));
+            return std::ptr::null_mut();
+        }
+    };
+    match (*arc).inner.get_entry_by_title(title_str) {
+        Ok(e) => ENTRY_VTABLE.box_entry(e),
+        Err(e) => {
+            set_err(err, e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// True iff this archive uses the modern single-character namespace
+/// scheme (content under `C/`, metadata under `M/`, indexes under
+/// `X/`, well-known under `W/`). Old archives put articles in `A/`.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_uses_new_namespaces(arc: *const zimru_archive_t) -> bool {
+    if arc.is_null() {
+        return false;
+    }
+    (*arc).inner.header().uses_new_namespaces()
+}
+
+/// Write the archive's trailing-MD5 checksum into `out` as a 32-byte
+/// lowercase hex string (no NUL terminator, no hyphens). Returns
+/// `false` with `*err` set if the archive has no checksum or the read
+/// fails. `out` must point to at least 32 writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_checksum_hex(
+    arc: *const zimru_archive_t,
+    out: *mut c_char,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if arc.is_null() || out.is_null() {
+        return false;
+    }
+    let bytes = match (*arc).inner.checksum() {
+        Ok(b) => b,
+        Err(e) => {
+            set_err(err, e);
+            return false;
+        }
+    };
+    static HEX: &[u8; 16] = b"0123456789abcdef";
+    let out_bytes = std::slice::from_raw_parts_mut(out as *mut u8, 32);
+    for (i, &b) in bytes.iter().enumerate() {
+        out_bytes[i * 2] = HEX[(b >> 4) as usize];
+        out_bytes[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+    }
+    true
+}
+
 /// Look up the archive's main entry. Returns NULL with `*err` set if the
 /// archive has no main page.
 #[no_mangle]
@@ -251,6 +415,76 @@ pub unsafe extern "C" fn zimru_archive_metadata(
         Err(e) => {
             set_err(err, e);
             std::ptr::null()
+        }
+    }
+}
+
+/// On-disk byte length of the archive (the mmapped extent).
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_filesize(arc: *const zimru_archive_t) -> u64 {
+    if arc.is_null() {
+        return 0;
+    }
+    (*arc).inner.file_len()
+}
+
+/// Number of "article" entries — non-redirect content-namespace items
+/// whose mimetype starts with `text/html`. Result is cached after the
+/// first call (one O(N) walk over the content namespace). Returns 0
+/// with `*err` set on read error.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_article_count(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> u64 {
+    if arc.is_null() {
+        return 0;
+    }
+    match (*arc).inner.article_count() {
+        Ok(n) => n,
+        Err(e) => {
+            set_err(err, e);
+            0
+        }
+    }
+}
+
+/// Number of "media" entries — non-redirect content-namespace items
+/// that are NOT articles. Result shares the cache with
+/// [`zimru_archive_article_count`].
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_media_count(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> u64 {
+    if arc.is_null() {
+        return 0;
+    }
+    match (*arc).inner.media_count() {
+        Ok(n) => n,
+        Err(e) => {
+            set_err(err, e);
+            0
+        }
+    }
+}
+
+/// Pick a pseudo-random entry from the content namespace. Suitable for
+/// "random article" UI links; not for cryptographic use.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_random_entry(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> *mut zimru_entry_t {
+    if arc.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return std::ptr::null_mut();
+    }
+    match (*arc).inner.random_content_entry() {
+        Ok(e) => ENTRY_VTABLE.box_entry(e),
+        Err(e) => {
+            set_err(err, e);
+            std::ptr::null_mut()
         }
     }
 }

@@ -48,6 +48,12 @@ struct ArchiveCore {
     /// archives (v6.2+) it's stored at `X/listing/titleOrdered/v1` and only
     /// covers C-namespace entries.
     title_listing: OnceLock<Arc<[u32]>>,
+    /// Cached `(article_count, media_count)` for the content namespace,
+    /// computed on first request via [`Archive::article_and_media_counts`].
+    /// "article" is any item whose mimetype starts with `text/html`;
+    /// "media" is any non-redirect, non-article entry. Redirects don't
+    /// count toward either total.
+    content_counts: OnceLock<(u64, u64)>,
 }
 
 /// A read-only ZIM archive.
@@ -77,6 +83,7 @@ impl Archive {
                 file_len,
                 cluster_cache: Mutex::new(HashMap::new()),
                 title_listing: OnceLock::new(),
+                content_counts: OnceLock::new(),
             }),
         })
     }
@@ -263,6 +270,99 @@ impl Archive {
         // Find first index where namespace > ns (i.e. >= ns+1).
         let hi_idx = self.lower_bound_ns(ns.saturating_add(1), n)?;
         Ok(hi_idx.saturating_sub(lo_idx))
+    }
+
+    /// On-disk byte length of the archive (the mmapped extent). For
+    /// multipart archives this is currently the size of the part we've
+    /// opened; multipart-aware sizing is a future TODO.
+    pub fn file_len(&self) -> u64 {
+        self.core.file_len
+    }
+
+    /// Walk the content namespace once, counting how many entries are
+    /// "articles" (mimetype starts with `text/html`) and how many are
+    /// "media" (any other non-redirect item). Redirects don't count
+    /// toward either total. Result is cached after the first call.
+    pub fn article_and_media_counts(&self) -> Result<(u64, u64)> {
+        if let Some(&cached) = self.core.content_counts.get() {
+            return Ok(cached);
+        }
+        let ns = if self.core.header.uses_new_namespaces() {
+            NS_CONTENT_NEW
+        } else {
+            NS_ARTICLES_LEGACY
+        };
+        let range = self.namespace_range(ns)?;
+        let mut articles: u64 = 0;
+        let mut media: u64 = 0;
+        for idx in range {
+            let entry = self.entry_by_url_index(idx)?;
+            if entry.is_redirect() {
+                continue;
+            }
+            // Get the mimetype without paying the full Item construction.
+            let mime_idx = match entry.dirent() {
+                crate::Dirent::Article(a) => a.mimetype,
+                crate::Dirent::Redirect(_) => continue,
+            };
+            let is_article = self
+                .core
+                .mimes
+                .get(mime_idx)
+                .map(|m| m.starts_with("text/html"))
+                .unwrap_or(false);
+            if is_article {
+                articles += 1;
+            } else {
+                media += 1;
+            }
+        }
+        let _ = self.core.content_counts.set((articles, media));
+        Ok((articles, media))
+    }
+
+    /// Number of "article" entries (text/html items) in the content
+    /// namespace. See [`Archive::article_and_media_counts`].
+    pub fn article_count(&self) -> Result<u64> {
+        Ok(self.article_and_media_counts()?.0)
+    }
+
+    /// Number of "media" entries (non-html, non-redirect items) in the
+    /// content namespace. See [`Archive::article_and_media_counts`].
+    pub fn media_count(&self) -> Result<u64> {
+        Ok(self.article_and_media_counts()?.1)
+    }
+
+    /// Pick a uniformly-random entry from the content namespace.
+    /// Pseudo-random, seeded from the system clock + process id; not
+    /// suitable for cryptographic use. Returns [`Error::EntryNotFound`]
+    /// if the content namespace is empty.
+    pub fn random_content_entry(&self) -> Result<Entry> {
+        let ns = if self.core.header.uses_new_namespaces() {
+            NS_CONTENT_NEW
+        } else {
+            NS_ARTICLES_LEGACY
+        };
+        let range = self.namespace_range(ns)?;
+        if range.is_empty() {
+            return Err(Error::EntryNotFound);
+        }
+        let span = range.end - range.start;
+        // Cheap PRNG seed: nanos + pid, hashed via xorshift mixer. Adequate
+        // for "give me a random article" — not for security.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let mut x = nanos.wrapping_mul(0x9E3779B97F4A7C15)
+            ^ (std::process::id() as u64).wrapping_mul(0xBF58476D1CE4E5B9);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D049BB133111EB);
+        x ^= x >> 31;
+        let pick = range.start + (x % span as u64) as u32;
+        self.entry_by_url_index(pick)
     }
 
     fn lower_bound_ns(&self, ns: u8, n: u32) -> Result<u32> {
@@ -689,6 +789,37 @@ impl Archive {
         self.load_cluster(idx)
     }
 
+    /// Direct-access info for a single blob: where its bytes physically
+    /// live in the on-disk ZIM file, when the surrounding cluster is
+    /// stored uncompressed (compression-id 0 or 1). For compressed
+    /// clusters, returns `is_direct = false` and zeroes for offset/size.
+    ///
+    /// Useful for handing fulltext/Xapian indexes (always stored
+    /// uncompressed by convention) to libxapian via `Database(int fd)`
+    /// + `lseek` without copying any bytes.
+    pub fn blob_direct_access(&self, cluster_idx: u32, blob_idx: u32) -> Result<DirectAccess> {
+        let cluster_range = self.cluster_byte_range(cluster_idx)?;
+        let cluster = self.cluster(cluster_idx)?;
+        match cluster.compression() {
+            crate::Compression::None => {
+                let r = cluster.blob_range(blob_idx)?;
+                let len = r.end - r.start;
+                // The cluster's payload starts immediately after the
+                // 1-byte info byte at the start of the on-disk cluster.
+                Ok(DirectAccess {
+                    is_direct: true,
+                    file_offset: cluster_range.start + 1 + r.start as u64,
+                    size: len as u64,
+                })
+            }
+            _ => Ok(DirectAccess {
+                is_direct: false,
+                file_offset: 0,
+                size: 0,
+            }),
+        }
+    }
+
     /// On-disk byte range occupied by cluster `idx`, including its info
     /// byte. The returned range's length is the compressed size the cluster
     /// takes up in the file.
@@ -861,6 +992,24 @@ impl std::fmt::Display for Entry {
     }
 }
 
+/// Where an item's bytes physically live in the on-disk ZIM file,
+/// returned by [`Archive::blob_direct_access`]. When `is_direct` is
+/// `false` the item is stored in a compressed cluster and must be
+/// fetched via the normal `get_data` path; offset/size are zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectAccess {
+    /// `true` iff the item is in an uncompressed cluster and its
+    /// bytes can be `pread`/`mmap`'d straight from the ZIM file.
+    pub is_direct: bool,
+    /// Absolute byte offset in the ZIM file at which the item's bytes
+    /// begin. Only meaningful if `is_direct` is `true`.
+    pub file_offset: u64,
+    /// Length of the item's bytes on disk. Equals the decompressed
+    /// size for uncompressed clusters. Only meaningful if `is_direct`
+    /// is `true`.
+    pub size: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Item {
     archive: Archive,
@@ -895,6 +1044,13 @@ impl Item {
 
     pub fn blob_index(&self) -> u32 {
         self.article.blob
+    }
+
+    /// Borrow the archive this item came from. Useful for callers that
+    /// want to call archive-level helpers (e.g. `blob_direct_access`)
+    /// without having to thread the archive through separately.
+    pub fn archive(&self) -> &Archive {
+        &self.archive
     }
 
     /// Total decompressed size of the underlying blob in bytes.

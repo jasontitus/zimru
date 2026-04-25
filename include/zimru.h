@@ -113,6 +113,27 @@ typedef struct zimru_error_t zimru_error_t;
  */
 typedef struct zimru_item_t zimru_item_t;
 
+/**
+ * Direct-access info for an item. POD struct populated by
+ * [`zimru_item_direct_access`]; mirrors [`crate::DirectAccess`].
+ *
+ * When `is_direct` is `true`, callers can `pread()` or `mmap()` the
+ * item's bytes directly from the on-disk ZIM file at `file_offset`
+ * for `size` bytes — no decompression, no copy. The standard ZIM
+ * convention is to store fulltext / suggestion / Xapian indexes in
+ * uncompressed clusters precisely so consumers can hand `libxapian`
+ * an `int fd` + `lseek` instead of materialising the database in
+ * memory or in a temp file.
+ *
+ * When `is_direct` is `false`, the item lives in a compressed
+ * cluster; fall back to [`zimru_item_get_data`] for normal access.
+ */
+typedef struct zimru_direct_access_t {
+  bool is_direct;
+  uint64_t file_offset;
+  uint64_t size;
+} zimru_direct_access_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -184,6 +205,73 @@ struct zimru_entry_t *zimru_archive_get_entry_by_path(const struct zimru_archive
  bool zimru_archive_has_entry_by_path(const struct zimru_archive_t *arc, const char *path);
 
 /**
+ * Look up an entry by namespace + URL within that namespace
+ * (e.g. ns=`'X'`, url=`"fulltext/xapian"`). This is the primitive
+ * downstream callers need to reach the X / M / W namespaces on
+ * new-scheme archives — `zimru_archive_get_entry_by_path` only looks
+ * in the content namespace by design.
+ *
+ * Returns NULL with `*err` set if not found.
+ */
+
+struct zimru_entry_t *zimru_archive_get_entry_by_ns_path(const struct zimru_archive_t *arc,
+                                                         uint8_t ns,
+                                                         const char *url,
+                                                         struct zimru_error_t **err);
+
+/**
+ * Look up an entry by its URL-pointer index (path order). Index range
+ * is `[0, all_entry_count)`.
+ */
+
+struct zimru_entry_t *zimru_archive_entry_by_url_index(const struct zimru_archive_t *arc,
+                                                       uint32_t idx,
+                                                       struct zimru_error_t **err);
+
+/**
+ * Look up an entry by its title-pointer index (title order). On modern
+ * archives this only covers the content namespace; index range is
+ * `[0, zimru_archive_title_count)`.
+ */
+
+struct zimru_entry_t *zimru_archive_entry_by_title_index(const struct zimru_archive_t *arc,
+                                                         uint32_t idx,
+                                                         struct zimru_error_t **err);
+
+/**
+ * Number of entries in the title-order listing. On modern archives
+ * this is the count of content-namespace entries only.
+ */
+ uint32_t zimru_archive_title_count(const struct zimru_archive_t *arc, struct zimru_error_t **err);
+
+/**
+ * Look up an entry by title in the content namespace. Returns NULL
+ * with `*err` set if not found.
+ */
+
+struct zimru_entry_t *zimru_archive_get_entry_by_title(const struct zimru_archive_t *arc,
+                                                       const char *title,
+                                                       struct zimru_error_t **err);
+
+/**
+ * True iff this archive uses the modern single-character namespace
+ * scheme (content under `C/`, metadata under `M/`, indexes under
+ * `X/`, well-known under `W/`). Old archives put articles in `A/`.
+ */
+ bool zimru_archive_uses_new_namespaces(const struct zimru_archive_t *arc);
+
+/**
+ * Write the archive's trailing-MD5 checksum into `out` as a 32-byte
+ * lowercase hex string (no NUL terminator, no hyphens). Returns
+ * `false` with `*err` set if the archive has no checksum or the read
+ * fails. `out` must point to at least 32 writable bytes.
+ */
+
+bool zimru_archive_checksum_hex(const struct zimru_archive_t *arc,
+                                char *out,
+                                struct zimru_error_t **err);
+
+/**
  * Look up the archive's main entry. Returns NULL with `*err` set if the
  * archive has no main page.
  */
@@ -202,6 +290,36 @@ const uint8_t *zimru_archive_metadata(const struct zimru_archive_t *arc,
                                       const char *name,
                                       uintptr_t *out_len,
                                       struct zimru_error_t **err);
+
+/**
+ * On-disk byte length of the archive (the mmapped extent).
+ */
+ uint64_t zimru_archive_filesize(const struct zimru_archive_t *arc);
+
+/**
+ * Number of "article" entries — non-redirect content-namespace items
+ * whose mimetype starts with `text/html`. Result is cached after the
+ * first call (one O(N) walk over the content namespace). Returns 0
+ * with `*err` set on read error.
+ */
+
+uint64_t zimru_archive_article_count(const struct zimru_archive_t *arc,
+                                     struct zimru_error_t **err);
+
+/**
+ * Number of "media" entries — non-redirect content-namespace items
+ * that are NOT articles. Result shares the cache with
+ * [`zimru_archive_article_count`].
+ */
+ uint64_t zimru_archive_media_count(const struct zimru_archive_t *arc, struct zimru_error_t **err);
+
+/**
+ * Pick a pseudo-random entry from the content namespace. Suitable for
+ * "random article" UI links; not for cryptographic use.
+ */
+
+struct zimru_entry_t *zimru_archive_random_entry(const struct zimru_archive_t *arc,
+                                                 struct zimru_error_t **err);
 
 /**
  * Number of metadata keys in the archive.
@@ -335,12 +453,28 @@ struct zimru_entry_t *zimru_entry_get_redirect_entry(const struct zimru_entry_t 
  uint64_t zimru_item_size(const struct zimru_item_t *it, struct zimru_error_t **err);
 
 /**
+ * Populate `out` with direct-access info for the item. Safe on a
+ * NULL `it` or `out` (no-op).
+ */
+ void zimru_item_direct_access(const struct zimru_item_t *it, struct zimru_direct_access_t *out);
+
+/**
  * Read the item's data as a heap-allocated blob handle. Caller frees
  * with `zimru_blob_free`.
  */
 
 struct zimru_blob_t *zimru_item_get_data(const struct zimru_item_t *it,
                                          struct zimru_error_t **err);
+
+/**
+ * Derive a deterministic 16-byte UUID from an arbitrary byte seed.
+ *
+ * `seed` may be NULL only if `seed_len` is 0. `out` must point to at
+ * least 16 writable bytes. The output has the high nibble of byte 6
+ * set to `4` and the high two bits of byte 8 set to `10` (RFC 4122
+ * v4 layout), so consumers that validate the variant won't reject it.
+ */
+ void zimru_uuid_generate(const uint8_t *seed, uintptr_t seed_len, uint8_t *out);
 
 #ifdef __cplusplus
 }  // extern "C"

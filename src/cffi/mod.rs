@@ -38,6 +38,7 @@ mod creator;
 mod entry;
 mod error;
 mod item;
+mod uuid;
 
 pub use archive::*;
 pub use blob::*;
@@ -45,3 +46,4 @@ pub use creator::*;
 pub use entry::*;
 pub use error::*;
 pub use item::*;
+pub use uuid::*;
