@@ -70,6 +70,9 @@ pub mod uuid;
 #[cfg(feature = "writer")]
 pub mod writer;
 
+#[cfg(feature = "cffi")]
+pub mod cffi;
+
 pub use archive::{
     Archive, Blob, Entry, EntryIter, Item, PrefixIter, Summary, NS_ARTICLES_LEGACY, NS_CONTENT_NEW,
     NS_INDEX, NS_METADATA, NS_WELLKNOWN,

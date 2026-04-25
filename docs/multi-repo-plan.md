@@ -112,7 +112,44 @@ Could also live inside zimru as a feature flag. Decide later — see
 
 Before libzim-shim work can start in earnest, zimru needs to ship:
 
-### P1. Stable C ABI (blocker)
+### P1. Stable C ABI (blocker) — first cut LANDED
+
+Initial C ABI shipped in commit on branch
+`claude/review-libzim-issues-SGsq0`. Reader surface is end-to-end
+testable; writer surface is a stub (placeholder `zimru_creator_t`)
+pending a follow-up. See [tracking issue #7][i7] and the smoke test
+harness at `tests/cffi_smoke.{c,rs}`.
+
+[i7]: https://github.com/jasontitus/zimru/issues/7
+
+#### What's done
+
+- `cffi` Cargo feature (off by default, implies `writer`).
+- `[lib] crate-type = ["rlib", "cdylib", "staticlib"]`.
+- `cbindgen` build-dep + `build.rs` emit `include/zimru.h` whenever
+  the feature is on.
+- `src/cffi/` modules: `error`, `archive`, `entry`, `item`, `blob`,
+  `creator` (stub). All `extern "C"` functions prefixed `zimru_*`.
+- Conventions documented in module preamble: string lifetimes (tied to
+  parent handle), out-pointer error protocol, `*_free` ownership.
+- `tests/cffi_smoke.c` + `tests/cffi_smoke.rs` end-to-end test:
+  builds a ZIM with the writer, compiles + links a C consumer against
+  the generated header and built dylib, runs it and asserts exit 0.
+  Passes in `cargo test --features cffi`.
+- CI gains a `cffi` job that builds + smoke-tests the feature.
+
+#### What still needs to happen before the shim work can fully start
+
+- **Writer C ABI** — `zimru_creator_*` is currently a stub. Needs the
+  full surface (set_main_path / add_item / add_metadata /
+  add_redirection / add_illustration / set_compression / write_to).
+  Open as a follow-up issue.
+- **Cut zimru 0.2.0** — pin a published version the shim repo can
+  declare as its `zimru = "0.2.0"` dependency.
+- **Header SOVERSION discipline** — decide before downstream apps link
+  against `libzimru.so.0`.
+
+#### Original spec (kept for reference)
 
 Add a `cffi` Cargo feature that builds zimru as a `cdylib` and
 `staticlib` and exposes an `extern "C"` API plus a cbindgen-generated

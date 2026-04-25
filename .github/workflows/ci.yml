@@ -60,3 +60,19 @@ jobs:
           components: rustfmt
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+
+  cffi:
+    name: C ABI build + smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build (cffi feature)
+        run: cargo build --release --features cffi
+      - name: confirm libzimru.so produced
+        run: test -f target/release/libzimru.so
+      - name: confirm include/zimru.h regenerated
+        run: test -f include/zimru.h
+      - name: cargo test (cffi smoke)
+        run: cargo test --release --features cffi --test cffi_smoke

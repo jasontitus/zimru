@@ -15,10 +15,16 @@ default = ["writer"]
 # `zimrecreate` / `zimwriterfs` binaries. With default features disabled
 # the crate is reader-only.
 writer = []
+# Compile the `extern "C"` API surface (`zimru::cffi`) and emit the
+# generated `include/zimru.h` from build.rs. Required when consuming
+# zimru as a `cdylib` / `staticlib` from C, C++, or other FFI callers.
+# Implies the `writer` feature so the C ABI exposes the Creator too.
+cffi = ["writer"]
 
 [lib]
 name = "zimru"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 # Each [[bin]] sets `test = false` so `cargo test` doesn't compile a
 # zero-test harness for it (we keep all integration tests under `tests/`,
@@ -74,6 +80,15 @@ thiserror = "2"
 hex = "0.4"
 md-5 = { version = "0.10", features = ["asm"] }
 zstd = { version = "0.13", default-features = false }
+
+[build-dependencies]
+# Used only when the `cffi` feature is enabled (build.rs gates on the
+# CARGO_FEATURE_CFFI env var); kept unconditional because Cargo does not
+# support truly optional build-dependencies.
+cbindgen = { version = "0.27", default-features = false }
+
+[package.metadata.docs.rs]
+features = ["writer", "cffi"]
 
 [profile.release]
 opt-level = 3
