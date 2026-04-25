@@ -32,7 +32,9 @@ fn restore_sigpipe() {
     }
     // SIGPIPE = 13, SIG_DFL = 0 — restore default so a closed pipe terminates
     // us cleanly instead of panicking inside std's print! machinery.
-    unsafe { let _ = signal(13, 0); }
+    unsafe {
+        let _ = signal(13, 0);
+    }
 }
 #[cfg(not(unix))]
 fn restore_sigpipe() {}
@@ -98,22 +100,35 @@ fn parse_opts(args: &[String]) -> Result<Opts, Error> {
             o.idx = Some(v.parse().map_err(|_| io_err("bad --idx"))?);
         } else if a == "--idx" {
             i += 1;
-            o.idx = Some(args.get(i).ok_or_else(|| io_err("--idx needs a value"))?.parse().map_err(|_| io_err("bad --idx"))?);
+            o.idx = Some(
+                args.get(i)
+                    .ok_or_else(|| io_err("--idx needs a value"))?
+                    .parse()
+                    .map_err(|_| io_err("bad --idx"))?,
+            );
         } else if let Some(v) = a.strip_prefix("--url=") {
             o.url = Some(v.to_string());
         } else if a == "--url" {
             i += 1;
-            o.url = Some(args.get(i).ok_or_else(|| io_err("--url needs a value"))?.clone());
+            o.url = Some(
+                args.get(i)
+                    .ok_or_else(|| io_err("--url needs a value"))?
+                    .clone(),
+            );
         } else if let Some(v) = a.strip_prefix("--ns=") {
             o.ns = Some(parse_ns(v)?);
         } else if a == "--ns" {
             i += 1;
-            o.ns = Some(parse_ns(args.get(i).ok_or_else(|| io_err("--ns needs a value"))?)?);
+            o.ns = Some(parse_ns(
+                args.get(i).ok_or_else(|| io_err("--ns needs a value"))?,
+            )?);
         } else if let Some(v) = a.strip_prefix("--dir=") {
             o.dir = Some(PathBuf::from(v));
         } else if a == "--dir" {
             i += 1;
-            o.dir = Some(PathBuf::from(args.get(i).ok_or_else(|| io_err("--dir needs a value"))?));
+            o.dir = Some(PathBuf::from(
+                args.get(i).ok_or_else(|| io_err("--dir needs a value"))?,
+            ));
         } else if a == "--details" {
             o.details = true;
         } else if a == "--redirect" {
@@ -147,7 +162,9 @@ fn parse_ns(s: &str) -> Result<u8, Error> {
     if s.len() == 1 {
         Ok(s.as_bytes()[0])
     } else {
-        Err(io_err(&format!("--ns expects a single character, got `{s}`")))
+        Err(io_err(&format!(
+            "--ns expects a single character, got `{s}`"
+        )))
     }
 }
 
@@ -342,8 +359,10 @@ fn cmd_analyze(args: &[String]) -> Result<ExitCode, Error> {
     }
 
     if opts.by_item {
-        println!("{:<6} {:<6} {:<10} {:<8} {:<14} {:<6} {:<14} path",
-            "clstr", "blob", "compress", "blobs", "decomp(B)", "share", "est_comp(B)");
+        println!(
+            "{:<6} {:<6} {:<10} {:<8} {:<14} {:<6} {:<14} path",
+            "clstr", "blob", "compress", "blobs", "decomp(B)", "share", "est_comp(B)"
+        );
         for entry in arc.iter_by_path() {
             let e = entry?;
             let (cluster_idx, blob_idx) = match e.dirent() {
@@ -362,17 +381,12 @@ fn cmd_analyze(args: &[String]) -> Result<ExitCode, Error> {
                 blob_size as f64 / info.decompressed as f64
             };
             let est_compressed = (share * info.compressed as f64).round() as u64;
+            let compression = format!("{:?}", info.compression).to_lowercase();
+            let ns = char::from(e.namespace());
+            let path = e.path();
             println!(
-                "{:<6} {:<6} {:<10} {:<8} {:<14} {:<6.3} {:<14} {}{}",
-                cluster_idx,
-                blob_idx,
-                format!("{:?}", info.compression).to_lowercase(),
+                "{cluster_idx:<6} {blob_idx:<6} {compression:<10} {:<8} {blob_size:<14} {share:<6.3} {est_compressed:<14} {ns}/{path}",
                 info.blob_count,
-                blob_size,
-                share,
-                est_compressed,
-                char::from(e.namespace()),
-                format!("/{}", e.path()),
             );
         }
         return Ok(ExitCode::SUCCESS);
@@ -380,8 +394,8 @@ fn cmd_analyze(args: &[String]) -> Result<ExitCode, Error> {
 
     // Per-cluster summary table.
     println!(
-        "{:<6} {:<10} {:<8} {:<14} {:<14} {}",
-        "clstr", "compress", "blobs", "compressed(B)", "decompressed(B)", "ratio"
+        "{:<6} {:<10} {:<8} {:<14} {:<14} ratio",
+        "clstr", "compress", "blobs", "compressed(B)", "decompressed(B)"
     );
     let mut total_compressed: u64 = 0;
     let mut total_decompressed: u64 = 0;
@@ -449,7 +463,13 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
                     if let Err(err) = std::os::unix::fs::symlink(&target_path, &dest) {
                         errors += 1;
                         if let Some(f) = errlog.as_mut() {
-                            let _ = writeln!(f, "symlink {} -> {}: {}", dest.display(), target_path, err);
+                            let _ = writeln!(
+                                f,
+                                "symlink {} -> {}: {}",
+                                dest.display(),
+                                target_path,
+                                err
+                            );
                         }
                     }
                 }
@@ -484,7 +504,11 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
             }
         }
     }
-    if errors > 0 { Ok(ExitCode::from(2)) } else { Ok(ExitCode::SUCCESS) }
+    if errors > 0 {
+        Ok(ExitCode::from(2))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
 }
 
 fn safe_path(p: &str) -> String {

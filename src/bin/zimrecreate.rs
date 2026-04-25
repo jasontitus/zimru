@@ -1,20 +1,22 @@
 //! `zimrecreate` — CLI parity with kiwix `zim-tools`' `zimrecreate`.
 //!
 //! Reads every entry (articles + redirects + metadata + illustrations
-//! + main page redirect) from the source archive and writes a new
+//! plus main page redirect) from the source archive and writes a new
 //! archive using `zimru::writer::Creator`.
 //!
+//! ```text
 //! Usage (matches upstream):
 //!   zimrecreate ORIGIN_FILE OUTPUT_FILE [Options]
 //!
 //! Options:
-//!   -v, --version            print software version
-//!   -j, --withoutFTIndex     don't build a fulltext index (always on in
-//!                            zimru — we don't have a fulltext indexer yet)
-//!   -J, --threads <number>   ignored (single-threaded writer for now)
-//!   --compression none|zstd|xz   choose cluster compression (default zstd)
-//!   --compression-level N    compression level (zstd: 1..=22, xz: 0..=9)
-//!   --cluster-size BYTES     cluster size target (default 2MiB)
+//!   -v, --version              print software version
+//!   -j, --withoutFTIndex       don't build a fulltext index (always on
+//!                              in zimru — we don't have a fulltext indexer yet)
+//!   -J, --threads <number>     ignored (single-threaded writer for now)
+//!   --compression none|zstd|xz choose cluster compression (default zstd)
+//!   --compression-level N      compression level (zstd: 1..=22, xz: 0..=9)
+//!   --cluster-size BYTES       cluster size target (default 2MiB)
+//! ```
 
 use std::process::ExitCode;
 
@@ -147,8 +149,12 @@ fn run(
         let path = entry.path();
         let title = entry.title();
 
-        if ns == b'W' && path == "mainPage" { continue; }
-        if ns == b'X' { continue; }
+        if ns == b'W' && path == "mainPage" {
+            continue;
+        }
+        if ns == b'X' {
+            continue;
+        }
 
         match entry.dirent() {
             Dirent::Redirect(r) => {
@@ -156,7 +162,11 @@ fn run(
                     // Look up the target's path so we can add it via the
                     // public redirection API.
                     let target = source.entry_by_url_index(r.redirect_index)?;
-                    creator.add_redirection(path.to_string(), title.to_string(), target.path().to_string());
+                    creator.add_redirection(
+                        path.to_string(),
+                        title.to_string(),
+                        target.path().to_string(),
+                    );
                 }
                 // Redirects in W/M/X namespaces are rebuilt implicitly by
                 // re-adding the underlying entries.
@@ -198,5 +208,9 @@ fn parse_illustration_path(path: &str) -> Option<u32> {
     let (w, h) = dims.split_once('x')?;
     let w: u32 = w.parse().ok()?;
     let h: u32 = h.parse().ok()?;
-    if w == h { Some(w) } else { None }
+    if w == h {
+        Some(w)
+    } else {
+        None
+    }
 }

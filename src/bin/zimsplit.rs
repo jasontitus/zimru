@@ -119,8 +119,7 @@ fn run(file: &str, prefix: &str, size: u64, force: bool) -> Result<(), Error> {
         eprintln!(
             "zimsplit: byte-aligned split may break cluster boundaries; pass --force to proceed."
         );
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(Error::Io(std::io::Error::other(
             "byte-aligned split would split a cluster",
         )));
     }

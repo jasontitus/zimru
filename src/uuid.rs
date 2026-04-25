@@ -93,14 +93,16 @@ impl FromStr for Uuid {
             // Canonical hyphenated: 8-4-4-4-12.
             36 => {
                 if bytes[8] != b'-' || bytes[13] != b'-' || bytes[18] != b'-' || bytes[23] != b'-' {
-                    return Err(UuidParseError { message: "uuid: hyphens not at positions 8/13/18/23" });
+                    return Err(UuidParseError {
+                        message: "uuid: hyphens not at positions 8/13/18/23",
+                    });
                 }
                 let groups = [
-                    (0, 8),    // bytes 0..4
-                    (9, 13),   // bytes 4..6
-                    (14, 18),  // bytes 6..8
-                    (19, 23),  // bytes 8..10
-                    (24, 36),  // bytes 10..16
+                    (0, 8),   // bytes 0..4
+                    (9, 13),  // bytes 4..6
+                    (14, 18), // bytes 6..8
+                    (19, 23), // bytes 8..10
+                    (24, 36), // bytes 10..16
                 ];
                 let mut bi = 0usize;
                 for (start, end) in groups {
@@ -124,7 +126,9 @@ impl FromStr for Uuid {
                 }
                 Ok(Uuid(out))
             }
-            _ => Err(UuidParseError { message: "uuid: expected 32 or 36 characters" }),
+            _ => Err(UuidParseError {
+                message: "uuid: expected 32 or 36 characters",
+            }),
         }
     }
 }
@@ -134,7 +138,9 @@ fn hex_nibble(b: u8) -> Result<u8, UuidParseError> {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(10 + b - b'a'),
         b'A'..=b'F' => Ok(10 + b - b'A'),
-        _ => Err(UuidParseError { message: "uuid: non-hex character" }),
+        _ => Err(UuidParseError {
+            message: "uuid: non-hex character",
+        }),
     }
 }
 
@@ -145,8 +151,8 @@ mod tests {
     #[test]
     fn round_trips_canonical_form() {
         let bytes: [u8; 16] = [
-            0x52, 0x9b, 0x7e, 0x6e, 0x3e, 0x90, 0x9b, 0x9b,
-            0x3d, 0x24, 0xea, 0xc1, 0x4f, 0x2f, 0x1f, 0x00,
+            0x52, 0x9b, 0x7e, 0x6e, 0x3e, 0x90, 0x9b, 0x9b, 0x3d, 0x24, 0xea, 0xc1, 0x4f, 0x2f,
+            0x1f, 0x00,
         ];
         let u = Uuid::from_bytes(bytes);
         let s = u.to_string();
@@ -194,7 +200,10 @@ mod tests {
     #[test]
     fn debug_uses_hyphenated_form() {
         let u = Uuid::from_bytes([0; 16]);
-        assert_eq!(format!("{u:?}"), "Uuid(00000000-0000-0000-0000-000000000000)");
+        assert_eq!(
+            format!("{u:?}"),
+            "Uuid(00000000-0000-0000-0000-000000000000)"
+        );
     }
 
     #[test]

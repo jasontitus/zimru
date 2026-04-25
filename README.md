@@ -70,8 +70,8 @@ follow-up. The current crate is a Rust-only library + CLI.
 | Cluster: 4-byte and 8-byte (extended) blob offsets          | ✅     |
 | MD5 checksum verification                                   | ✅     |
 | Multi-part files (`.zimaa`, `.zimab`, …)                    | ⏳ TODO |
-| Xapian fulltext / suggestion search (`X/fulltext/xapian`)   | ⏳ TODO |
-| ZIM writer (creator)                                        | ⏳ TODO |
+| Xapian fulltext / suggestion search (`X/fulltext/xapian`)   | 🚫 out of scope (see [licensing rationale](#licensing--clean-room-policy)) |
+| ZIM writer (creator)                                        | ✅     |
 
 ## Library example
 
@@ -637,11 +637,12 @@ Run the full suite:
 cargo test --release
 ```
 
-Test breakdown (**48 tests + 6 doctests pass**):
+Test breakdown (**54 tests + 7 doctests pass**):
 
-- **Unit tests** (`src/*.rs`, 12 tests) — synthetic byte-level round-trips
+- **Unit tests** (`src/*.rs`, 20 tests) — synthetic byte-level round-trips
   for the header, MIME list, dirent, and cluster (uncompressed / zstd / xz
-  / extended offsets / unsupported-compression rejection) parsers.
+  / extended offsets / unsupported-compression rejection) parsers, plus
+  `Uuid` Display/FromStr round-trips and malformed-input rejection.
 - **Synthetic ZIM end-to-end** (`tests/synthetic_zim.rs`, 4 tests) — builds
   spec-compliant ZIM files in memory (header → mime list → URL/title/cluster
   pointer lists → dirents → cluster → MD5 trailer) and exercises the public
@@ -653,20 +654,27 @@ Test breakdown (**48 tests + 6 doctests pass**):
   / `content_entries` / `by_prefix` / `namespace_range` / `summary` /
   `par_iter_by_path` / `par_clusters` / `Item::text/bytes/is_html` /
   `Blob::as_str/reader/Deref` / `Entry::item/resolve/Display`).
-- **Writer round-trip** (`tests/writer_roundtrip.rs`, 7 tests) — builds
+- **Writer round-trip** (`tests/writer_roundtrip.rs`, 8 tests) — builds
   ZIMs through `Creator`, reopens them with our reader, and (when
   upstream zim-tools is installed) cross-validates each output with
   `upstream zimcheck -A`/`-C`/`-M`/`-P` and `upstream zimdump info/list`.
   Covers single-article round-trip, full archive (items + metadata +
   illustration + main-page redirect + custom redirection),
   multi-cluster bin-packing, every compression (None / Zstd / Xz),
-  dangling-redirect rejection.
+  compression-level extremes (zstd 1↔19, xz 0↔9), dangling-redirect
+  rejection.
 - **`zimwriterfs` end-to-end** (`tests/zimwriterfs_e2e.rs`, 3 tests) —
   builds an HTML site under a temp dir, runs the `zimwriterfs` binary,
   reopens the produced ZIM, validates content + metadata, runs upstream
   `zimcheck -A`. Includes a side-by-side parity check that builds the
   same site with both `zimru zimwriterfs` and `upstream zimwriterfs`
   and verifies the same C-namespace path set.
+- **`zimdump analyze` end-to-end** (`tests/zimdump_analyze.rs`, 3 tests)
+  — builds a multi-cluster ZIM, runs the `zimdump analyze` binary, and
+  asserts that cluster byte ranges sum exactly to the on-disk cluster
+  region, that the per-cluster table prints one row per cluster + a
+  TOTAL row, and that `--by-item` lists every article and skips
+  redirects.
 - **Real-file integration** (`tests/real_files.rs`, 3 tests) — runs
   against actual Wikipedia ZIM files placed under `zim-cache/`. The
   files are NOT in this repo. Each test verifies the trailing MD5
@@ -675,8 +683,8 @@ Test breakdown (**48 tests + 6 doctests pass**):
   round-trips a sample), decompresses every cluster, follows the
   main-page redirect, and reads the canonical metadata keys (UTF-8
   including non-Latin scripts). Skip silently if cache files absent.
-- **Doc tests** (6 tests) — every code-block example in `lib.rs` and
-  `archive.rs` is compile-verified.
+- **Doc tests** (7 tests) — every code-block example in `lib.rs`,
+  `archive.rs`, `writer.rs`, and `uuid.rs` is compile-verified.
 
 To populate the real-file cache:
 
@@ -717,6 +725,28 @@ intentionally outside this repo so the MIT-vs-GPL boundary is physical,
 not just conventional. The full multi-repo plan — what to create, what
 order to build it, prerequisites that must land in zimru first — is in
 [`docs/multi-repo-plan.md`](./docs/multi-repo-plan.md).
+
+### Why Xapian fulltext search is "out of scope" rather than "TODO"
+
+Xapian is GPL v2. Linking it into zimru would force any binary that
+embeds zimru to be GPL — exactly the contagion the MIT licence is
+designed to prevent. So zimru deliberately does *not* implement Xapian
+fulltext or suggestion search.
+
+Two paths exist for downstream consumers that need search:
+
+1. **GPL apps** (kiwix-tools, kiwix-serve, kiwix-desktop, kiwix-android,
+   kiwix-apple) link Xapian themselves via the GPL-licensed
+   `libzim-shim` repo, which can implement search alongside its
+   libzim-shaped reader/writer surface.
+2. **Non-GPL apps** can build their own search experience on top of
+   zimru — anything from no search at all, to a different indexing
+   stack (tantivy, sled, custom inverted index), to a server-side
+   search service. zimru exposes everything needed to extract
+   fulltext content for indexing: parallel cluster decompression,
+   zero-copy blob access, MIME-type filtering.
+
+Either way, zimru itself stays MIT and small.
 
 [libzim]: https://github.com/openzim/libzim
 [libkiwix]: https://github.com/kiwix/libkiwix

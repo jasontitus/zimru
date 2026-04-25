@@ -60,25 +60,45 @@ fn main() -> ExitCode {
     while i < args.len() {
         let a = &args[i];
         match split_flag(a) {
-            ("-h", _) | ("--help", _) => { print_help(); return ExitCode::SUCCESS; }
-            ("-V", _) | ("--version", _) => { println!("{VERSION}"); return ExitCode::SUCCESS; }
+            ("-h", _) | ("--help", _) => {
+                print_help();
+                return ExitCode::SUCCESS;
+            }
+            ("-V", _) | ("--version", _) => {
+                println!("{VERSION}");
+                return ExitCode::SUCCESS;
+            }
             ("-v", _) | ("--verbose", _) => o.verbose = true,
             ("-x", _) | ("--inflateHtml", _) => o.inflate_html = true,
             ("-j", _) | ("--withoutFTIndex", _) => o.without_ft_index = true,
             ("--skip-libmagic-check", _) => o.skip_libmagic = true,
             ("-w", v) | ("--welcome", v) => o.welcome = Some(value_or_next(v, &args, &mut i)),
-            ("-I", v) | ("--illustration", v) => o.illustration = Some(PathBuf::from(value_or_next(v, &args, &mut i))),
+            ("-I", v) | ("--illustration", v) => {
+                o.illustration = Some(PathBuf::from(value_or_next(v, &args, &mut i)))
+            }
             ("-l", v) | ("--language", v) => o.language = Some(value_or_next(v, &args, &mut i)),
             ("-n", v) | ("--name", v) => o.name = Some(value_or_next(v, &args, &mut i)),
             ("-t", v) | ("--title", v) => o.title = Some(value_or_next(v, &args, &mut i)),
-            ("-d", v) | ("--description", v) => o.description = Some(value_or_next(v, &args, &mut i)),
+            ("-d", v) | ("--description", v) => {
+                o.description = Some(value_or_next(v, &args, &mut i))
+            }
             ("-c", v) | ("--creator", v) => o.creator = Some(value_or_next(v, &args, &mut i)),
             ("-p", v) | ("--publisher", v) => o.publisher = Some(value_or_next(v, &args, &mut i)),
-            ("-L", v) | ("--longDescription", v) => o.long_description = Some(value_or_next(v, &args, &mut i)),
-            ("-m", v) | ("--clusterSize", v) => o.cluster_size_kb = value_or_next(v, &args, &mut i).parse().ok(),
-            ("--compression-level", v) => o.compression_level = value_or_next(v, &args, &mut i).parse().ok(),
-            ("-J", v) | ("--threads", v) => o.threads = value_or_next(v, &args, &mut i).parse().ok(),
-            ("-r", v) | ("--redirects", v) => o.redirects_file = Some(PathBuf::from(value_or_next(v, &args, &mut i))),
+            ("-L", v) | ("--longDescription", v) => {
+                o.long_description = Some(value_or_next(v, &args, &mut i))
+            }
+            ("-m", v) | ("--clusterSize", v) => {
+                o.cluster_size_kb = value_or_next(v, &args, &mut i).parse().ok()
+            }
+            ("--compression-level", v) => {
+                o.compression_level = value_or_next(v, &args, &mut i).parse().ok()
+            }
+            ("-J", v) | ("--threads", v) => {
+                o.threads = value_or_next(v, &args, &mut i).parse().ok()
+            }
+            ("-r", v) | ("--redirects", v) => {
+                o.redirects_file = Some(PathBuf::from(value_or_next(v, &args, &mut i)))
+            }
             ("-a", v) | ("--tags", v) => o.tags = Some(value_or_next(v, &args, &mut i)),
             ("-e", v) | ("--source", v) => o.source = Some(value_or_next(v, &args, &mut i)),
             ("-o", v) | ("--flavour", v) => o.flavour = Some(value_or_next(v, &args, &mut i)),
@@ -175,24 +195,33 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     creator.add_metadata("Creator", o.creator.clone().unwrap());
     creator.add_metadata("Publisher", o.publisher.clone().unwrap());
     creator.add_metadata("Name", o.name.clone().unwrap());
-    creator.add_metadata(
-        "Date",
-        chrono_today_iso(),
-    );
+    creator.add_metadata("Date", chrono_today_iso());
 
     // Optional metadata.
-    if let Some(s) = &o.long_description { creator.add_metadata("LongDescription", s.clone()); }
-    if let Some(s) = &o.tags             { creator.add_metadata("Tags",            s.clone()); }
-    if let Some(s) = &o.source           { creator.add_metadata("Source",          s.clone()); }
-    if let Some(s) = &o.flavour          { creator.add_metadata("Flavour",         s.clone()); }
-    if let Some(s) = &o.scraper          { creator.add_metadata("Scraper",         s.clone()); }
+    if let Some(s) = &o.long_description {
+        creator.add_metadata("LongDescription", s.clone());
+    }
+    if let Some(s) = &o.tags {
+        creator.add_metadata("Tags", s.clone());
+    }
+    if let Some(s) = &o.source {
+        creator.add_metadata("Source", s.clone());
+    }
+    if let Some(s) = &o.flavour {
+        creator.add_metadata("Flavour", s.clone());
+    }
+    if let Some(s) = &o.scraper {
+        creator.add_metadata("Scraper", s.clone());
+    }
 
     // Illustration (must exist; mandatory upstream).
     let illu_path = html_dir.join(o.illustration.as_ref().unwrap());
-    let illu_bytes = fs::read(&illu_path).map_err(|e| zimru::Error::Io(std::io::Error::new(
-        e.kind(),
-        format!("--illustration {}: {e}", illu_path.display()),
-    )))?;
+    let illu_bytes = fs::read(&illu_path).map_err(|e| {
+        zimru::Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("--illustration {}: {e}", illu_path.display()),
+        ))
+    })?;
     creator.add_illustration(48, illu_bytes);
 
     // Walk HTML_DIR and ingest every file. The illustration is also kept
@@ -230,7 +259,9 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     if let Some(rfile) = &o.redirects_file {
         let raw = fs::read_to_string(rfile)?;
         for (lineno, line) in raw.lines().enumerate() {
-            if line.trim().is_empty() || line.starts_with('#') { continue; }
+            if line.trim().is_empty() || line.starts_with('#') {
+                continue;
+            }
             let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() < 3 {
                 eprintln!("zimwriterfs: redirect file line {} malformed (need 3 tab-separated fields): {line}", lineno + 1);
@@ -240,9 +271,13 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
         }
     }
 
-    if o.verbose { eprintln!("[zimwriterfs] {count} items collected; finalising…"); }
+    if o.verbose {
+        eprintln!("[zimwriterfs] {count} items collected; finalising…");
+    }
     creator.write_to(zim_file)?;
-    if o.verbose { eprintln!("[zimwriterfs] wrote {}", zim_file.display()); }
+    if o.verbose {
+        eprintln!("[zimwriterfs] wrote {}", zim_file.display());
+    }
     Ok(())
 }
 
@@ -255,7 +290,9 @@ fn walk_dir(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
             let entry = entry?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') { continue; }
+            if name.starts_with('.') {
+                continue;
+            }
             let ft = entry.file_type()?;
             if ft.is_dir() {
                 stack.push(path);
@@ -271,42 +308,43 @@ fn walk_dir(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 fn mime_for_path(p: &Path) -> String {
     static TABLE: &[(&str, &str)] = &[
         ("html", "text/html"),
-        ("htm",  "text/html"),
-        ("xhtml","application/xhtml+xml"),
-        ("css",  "text/css"),
-        ("js",   "application/javascript"),
-        ("mjs",  "application/javascript"),
+        ("htm", "text/html"),
+        ("xhtml", "application/xhtml+xml"),
+        ("css", "text/css"),
+        ("js", "application/javascript"),
+        ("mjs", "application/javascript"),
         ("json", "application/json"),
-        ("xml",  "application/xml"),
-        ("svg",  "image/svg+xml"),
-        ("png",  "image/png"),
-        ("jpg",  "image/jpeg"),
+        ("xml", "application/xml"),
+        ("svg", "image/svg+xml"),
+        ("png", "image/png"),
+        ("jpg", "image/jpeg"),
         ("jpeg", "image/jpeg"),
-        ("gif",  "image/gif"),
+        ("gif", "image/gif"),
         ("webp", "image/webp"),
-        ("ico",  "image/x-icon"),
-        ("bmp",  "image/bmp"),
-        ("pdf",  "application/pdf"),
+        ("ico", "image/x-icon"),
+        ("bmp", "image/bmp"),
+        ("pdf", "application/pdf"),
         ("epub", "application/epub+zip"),
-        ("zip",  "application/zip"),
-        ("gz",   "application/gzip"),
+        ("zip", "application/zip"),
+        ("gz", "application/gzip"),
         ("woff", "font/woff"),
-        ("woff2","font/woff2"),
-        ("ttf",  "font/ttf"),
-        ("otf",  "font/otf"),
-        ("mp3",  "audio/mpeg"),
-        ("ogg",  "audio/ogg"),
+        ("woff2", "font/woff2"),
+        ("ttf", "font/ttf"),
+        ("otf", "font/otf"),
+        ("mp3", "audio/mpeg"),
+        ("ogg", "audio/ogg"),
         ("opus", "audio/ogg"),
-        ("wav",  "audio/wav"),
-        ("mp4",  "video/mp4"),
+        ("wav", "audio/wav"),
+        ("mp4", "video/mp4"),
         ("webm", "video/webm"),
-        ("ogv",  "video/ogg"),
-        ("txt",  "text/plain"),
-        ("md",   "text/markdown"),
-        ("csv",  "text/csv"),
-        ("tsv",  "text/tab-separated-values"),
+        ("ogv", "video/ogg"),
+        ("txt", "text/plain"),
+        ("md", "text/markdown"),
+        ("csv", "text/csv"),
+        ("tsv", "text/tab-separated-values"),
     ];
-    let ext = p.extension()
+    let ext = p
+        .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
     if let Some(ref e) = ext {

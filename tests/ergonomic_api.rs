@@ -11,9 +11,23 @@ use zimru::{Archive, Error};
 
 const MAGIC: u32 = 0x44D495A;
 
-struct Article { ns: u8, url: &'static str, title: &'static str, mime: u16, blob: u32 }
-struct Redirect { ns: u8, url: &'static str, title: &'static str, target: u32 }
-enum D { A(Article), R(Redirect) }
+struct Article {
+    ns: u8,
+    url: &'static str,
+    title: &'static str,
+    mime: u16,
+    blob: u32,
+}
+struct Redirect {
+    ns: u8,
+    url: &'static str,
+    title: &'static str,
+    target: u32,
+}
+enum D {
+    A(Article),
+    R(Redirect),
+}
 
 fn write_dirent(out: &mut Vec<u8>, d: &D) {
     match d {
@@ -54,7 +68,9 @@ fn uncompressed_cluster(blobs: &[&[u8]]) -> Vec<u8> {
         cursor += b.len() as u32;
     }
     out.extend_from_slice(&cursor.to_le_bytes());
-    for b in blobs { out.extend_from_slice(b); }
+    for b in blobs {
+        out.extend_from_slice(b);
+    }
     out
 }
 
@@ -70,8 +86,8 @@ fn build_test_zim() -> Vec<u8> {
         b"An apple.",                    // 0 apple
         b"A banana.",                    // 1 banana
         b"A fig.",                       // 2 fig
-        b"Demo",                          // 3 Title
-        b"eng",                           // 4 Language
+        b"Demo",                         // 3 Title
+        b"eng",                          // 4 Language
         &[0x89, 0x50, 0x4E, 0x47],       // 5 logo.png (fake PNG bytes)
         &[0x89, 0x50, 0x4E, 0x47, 0xAA], // 6 header.png
     ];
@@ -79,22 +95,77 @@ fn build_test_zim() -> Vec<u8> {
 
     // Dirents in (ns, url) order. blob indices point into `blobs`.
     let dirents = vec![
-        D::A(Article { ns: b'C', url: "apple",               title: "Apple",  mime: 0, blob: 0 }),
-        D::A(Article { ns: b'C', url: "banana",              title: "Banana", mime: 0, blob: 1 }),
-        D::A(Article { ns: b'C', url: "fig",                 title: "Fig",    mime: 0, blob: 2 }),
-        D::R(Redirect { ns: b'C', url: "fruit",              title: "Fruit", target: 0 }),
-        D::A(Article { ns: b'C', url: "images/header.png",   title: "header", mime: 2, blob: 6 }),
-        D::A(Article { ns: b'C', url: "images/logo.png",     title: "logo",   mime: 2, blob: 5 }),
-        D::A(Article { ns: b'M', url: "Language",            title: "Language", mime: 1, blob: 4 }),
-        D::A(Article { ns: b'M', url: "Title",               title: "Title", mime: 1, blob: 3 }),
-        D::R(Redirect { ns: b'W', url: "mainPage",           title: "mainPage", target: 0 }),
+        D::A(Article {
+            ns: b'C',
+            url: "apple",
+            title: "Apple",
+            mime: 0,
+            blob: 0,
+        }),
+        D::A(Article {
+            ns: b'C',
+            url: "banana",
+            title: "Banana",
+            mime: 0,
+            blob: 1,
+        }),
+        D::A(Article {
+            ns: b'C',
+            url: "fig",
+            title: "Fig",
+            mime: 0,
+            blob: 2,
+        }),
+        D::R(Redirect {
+            ns: b'C',
+            url: "fruit",
+            title: "Fruit",
+            target: 0,
+        }),
+        D::A(Article {
+            ns: b'C',
+            url: "images/header.png",
+            title: "header",
+            mime: 2,
+            blob: 6,
+        }),
+        D::A(Article {
+            ns: b'C',
+            url: "images/logo.png",
+            title: "logo",
+            mime: 2,
+            blob: 5,
+        }),
+        D::A(Article {
+            ns: b'M',
+            url: "Language",
+            title: "Language",
+            mime: 1,
+            blob: 4,
+        }),
+        D::A(Article {
+            ns: b'M',
+            url: "Title",
+            title: "Title",
+            mime: 1,
+            blob: 3,
+        }),
+        D::R(Redirect {
+            ns: b'W',
+            url: "mainPage",
+            title: "mainPage",
+            target: 0,
+        }),
     ];
     let mimes = ["text/html", "text/plain", "image/png"];
 
     // --- compute layout ---
     let header_size = 80usize;
     let mut mime_bytes: Vec<u8> = Vec::new();
-    for m in &mimes { mime_bytes.extend_from_slice(m.as_bytes()); mime_bytes.push(0); }
+    for m in &mimes {
+        mime_bytes.extend_from_slice(m.as_bytes());
+        mime_bytes.push(0);
+    }
     mime_bytes.push(0);
 
     let entry_count = dirents.len() as u32;
@@ -147,10 +218,16 @@ fn build_test_zim() -> Vec<u8> {
     debug_assert_eq!(out.len(), header_size);
 
     out.extend_from_slice(&mime_bytes);
-    for o in &dirent_offsets { out.extend_from_slice(&o.to_le_bytes()); }
-    for i in &title_order   { out.extend_from_slice(&i.to_le_bytes()); }
+    for o in &dirent_offsets {
+        out.extend_from_slice(&o.to_le_bytes());
+    }
+    for i in &title_order {
+        out.extend_from_slice(&i.to_le_bytes());
+    }
     out.extend_from_slice(&cluster_offset.to_le_bytes());
-    for d in &drawn { out.extend_from_slice(d); }
+    for d in &drawn {
+        out.extend_from_slice(d);
+    }
     out.extend_from_slice(&cluster);
 
     let mut h = Md5::new();
@@ -162,7 +239,14 @@ fn build_test_zim() -> Vec<u8> {
 
 fn write_tmp(bytes: &[u8]) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("zimru-ergo-{}-{}.zim", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    p.push(format!(
+        "zimru-ergo-{}-{}.zim",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     std::fs::File::create(&p).unwrap().write_all(bytes).unwrap();
     p
 }
@@ -237,17 +321,26 @@ fn articles_and_redirects_and_content_entries() {
     let p = write_tmp(&z);
     let a = Archive::open(&p).unwrap();
 
-    let arts: Vec<String> = a.articles().map(|r| r.unwrap().path().to_string()).collect();
+    let arts: Vec<String> = a
+        .articles()
+        .map(|r| r.unwrap().path().to_string())
+        .collect();
     // articles() includes M/W articles too (just skips redirects).
     assert!(arts.contains(&"apple".to_string()));
     assert!(arts.contains(&"Language".to_string()));
     assert!(!arts.iter().any(|p| p == "fruit"));
 
-    let reds: Vec<String> = a.redirects().map(|r| r.unwrap().path().to_string()).collect();
+    let reds: Vec<String> = a
+        .redirects()
+        .map(|r| r.unwrap().path().to_string())
+        .collect();
     assert!(reds.contains(&"fruit".to_string()));
     assert!(reds.contains(&"mainPage".to_string()));
 
-    let content: Vec<String> = a.content_entries().map(|r| r.unwrap().path().to_string()).collect();
+    let content: Vec<String> = a
+        .content_entries()
+        .map(|r| r.unwrap().path().to_string())
+        .collect();
     // content_entries only covers C-namespace (includes redirects in C).
     assert!(content.iter().all(|p| !p.contains("Language"))); // no M entries
     assert!(content.contains(&"apple".to_string()));
@@ -260,7 +353,8 @@ fn by_prefix_binary_searches_for_start() {
     let p = write_tmp(&z);
     let a = Archive::open(&p).unwrap();
 
-    let imgs: Vec<String> = a.by_prefix(b'C', "images/")
+    let imgs: Vec<String> = a
+        .by_prefix(b'C', "images/")
         .map(|r| r.unwrap().path().to_string())
         .collect();
     assert_eq!(imgs, vec!["images/header.png", "images/logo.png"]);
@@ -278,7 +372,8 @@ fn par_iter_by_path_yields_every_entry() {
     let p = write_tmp(&z);
     let a = Archive::open(&p).unwrap();
 
-    let n = a.par_iter_by_path()
+    let n = a
+        .par_iter_by_path()
         .map(|r| r.unwrap().path().to_string())
         .count();
     assert_eq!(n as u32, a.entry_count());
@@ -291,12 +386,14 @@ fn par_clusters_visits_each_cluster_once() {
     let p = write_tmp(&z);
     let a = Archive::open(&p).unwrap();
 
-    let sizes: Vec<usize> = a.par_clusters(|_idx, c| {
-        (0..c.blob_count())
-            .filter_map(|i| c.blob(i).ok())
-            .map(|b| b.len())
-            .sum::<usize>()
-    }).unwrap();
+    let sizes: Vec<usize> = a
+        .par_clusters(|_idx, c| {
+            (0..c.blob_count())
+                .filter_map(|i| c.blob(i).ok())
+                .map(|b| b.len())
+                .sum::<usize>()
+        })
+        .unwrap();
     assert_eq!(sizes.len() as u32, a.cluster_count());
     let _ = std::fs::remove_file(p);
 }

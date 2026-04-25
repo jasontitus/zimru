@@ -44,12 +44,19 @@ fn exercise_archive(label: &str, archive: &Archive) {
         h.entry_count,
         h.cluster_count,
         archive.mime_list().len(),
-        if h.uses_new_namespaces() { "new" } else { "legacy" },
+        if h.uses_new_namespaces() {
+            "new"
+        } else {
+            "legacy"
+        },
     );
 
     // 1. Checksum.
     if archive.has_checksum() {
-        assert!(archive.check().expect("checksum check"), "checksum mismatch on {label}");
+        assert!(
+            archive.check().expect("checksum check"),
+            "checksum mismatch on {label}"
+        );
     }
 
     // 2. Walk every entry by path; round-trip via binary search.
@@ -112,11 +119,13 @@ fn exercise_archive(label: &str, archive: &Archive) {
         let item = e.get_item(false).expect("article item");
         let blob = item.get_data().expect("blob data");
         total_bytes += blob.size() as u64;
-        clusters_seen.entry(item.cluster_index()).or_insert_with(|| {
-            // Approximation: re-derive compression by re-parsing the cluster
-            // is overkill; instead store a placeholder and overwrite below.
-            Compression::None
-        });
+        clusters_seen
+            .entry(item.cluster_index())
+            .or_insert_with(|| {
+                // Approximation: re-derive compression by re-parsing the cluster
+                // is overkill; instead store a placeholder and overwrite below.
+                Compression::None
+            });
     }
     println!(
         "[{label}]   cluster-touch unique={} total_blob_bytes={total_bytes}",
@@ -128,7 +137,11 @@ fn exercise_archive(label: &str, archive: &Archive) {
         let main = archive.main_entry().expect("main entry");
         let item = main.get_item(true).expect("main item");
         assert!(item.size().unwrap() > 0);
-        println!("[{label}]   main {} ({} bytes)", item.path(), item.size().unwrap());
+        println!(
+            "[{label}]   main {} ({} bytes)",
+            item.path(),
+            item.size().unwrap()
+        );
     }
 
     // 6. Metadata round-trip of common keys.
@@ -137,7 +150,10 @@ fn exercise_archive(label: &str, archive: &Archive) {
     for k in ["Title", "Language", "Description"] {
         if let Ok(v) = archive.get_metadata(k) {
             let s = String::from_utf8_lossy(&v);
-            println!("[{label}]   meta[{k}] = {}", s.chars().take(40).collect::<String>());
+            println!(
+                "[{label}]   meta[{k}] = {}",
+                s.chars().take(40).collect::<String>()
+            );
         }
     }
 }

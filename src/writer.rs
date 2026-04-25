@@ -60,13 +60,25 @@ impl Item {
             content: content.into(),
         }
     }
-    pub fn html(path: impl Into<String>, title: impl Into<String>, content: impl Into<Vec<u8>>) -> Self {
+    pub fn html(
+        path: impl Into<String>,
+        title: impl Into<String>,
+        content: impl Into<Vec<u8>>,
+    ) -> Self {
         Self::new(path, title, "text/html", content)
     }
-    pub fn text(path: impl Into<String>, title: impl Into<String>, content: impl Into<Vec<u8>>) -> Self {
+    pub fn text(
+        path: impl Into<String>,
+        title: impl Into<String>,
+        content: impl Into<Vec<u8>>,
+    ) -> Self {
         Self::new(path, title, "text/plain", content)
     }
-    pub fn png(path: impl Into<String>, title: impl Into<String>, content: impl Into<Vec<u8>>) -> Self {
+    pub fn png(
+        path: impl Into<String>,
+        title: impl Into<String>,
+        content: impl Into<Vec<u8>>,
+    ) -> Self {
         Self::new(path, title, "image/png", content)
     }
 }
@@ -93,7 +105,9 @@ pub struct Creator {
 }
 
 impl Default for Creator {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Creator {
@@ -226,7 +240,9 @@ enum RawDirent {
 impl RawDirent {
     fn namespace(&self) -> u8 {
         match self {
-            RawDirent::Article { namespace, .. } | RawDirent::Redirect { namespace, .. } => *namespace,
+            RawDirent::Article { namespace, .. } | RawDirent::Redirect { namespace, .. } => {
+                *namespace
+            }
         }
     }
     fn url(&self) -> &str {
@@ -320,7 +336,11 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
 
     // 2. Sort payloads by (namespace, url) — keeps URL-pointer order and
     //    cluster order consistent for a stable on-disk layout across runs.
-    payloads.sort_by(|a, b| a.namespace.cmp(&b.namespace).then_with(|| a.url.cmp(&b.url)));
+    payloads.sort_by(|a, b| {
+        a.namespace
+            .cmp(&b.namespace)
+            .then_with(|| a.url.cmp(&b.url))
+    });
 
     // 3. Bin-pack payloads into clusters.
     let mut groups: Vec<Vec<Payload>> = Vec::new();
@@ -363,25 +383,36 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
             });
             blobs_for_cluster.push(p.content);
         }
-        cluster_bytes.push(encode_cluster(&blobs_for_cluster, compression, compression_level)?);
+        cluster_bytes.push(encode_cluster(
+            &blobs_for_cluster,
+            compression,
+            compression_level,
+        )?);
     }
 
     // 5. Append pending redirects.
     dirents.extend(pending_redirects);
 
     // 6. Sort all dirents by (ns, url) → URL-pointer order.
-    dirents.sort_by(|a, b| a.namespace().cmp(&b.namespace()).then_with(|| a.url().cmp(b.url())));
+    dirents.sort_by(|a, b| {
+        a.namespace()
+            .cmp(&b.namespace())
+            .then_with(|| a.url().cmp(b.url()))
+    });
 
     // 7. Resolve redirect targets to url-pointer indices.
     for i in 0..dirents.len() {
         // Extract the target, look it up, stash it back.
-        if let RawDirent::Redirect { target_ns, target_url, .. } = &dirents[i] {
+        if let RawDirent::Redirect {
+            target_ns,
+            target_url,
+            ..
+        } = &dirents[i]
+        {
             let ns = *target_ns;
             let url = target_url.clone();
             let resolved = dirents
-                .binary_search_by(|d| {
-                    d.namespace().cmp(&ns).then_with(|| d.url().cmp(&url))
-                })
+                .binary_search_by(|d| d.namespace().cmp(&ns).then_with(|| d.url().cmp(&url)))
                 .ok()
                 .map(|j| j as u32);
             match &mut dirents[i] {
@@ -392,10 +423,22 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
     }
     // Any redirect whose target wasn't found is a user error.
     for d in &dirents {
-        if let RawDirent::Redirect { resolved_index: None, url, target_ns, target_url, .. } = d {
+        if let RawDirent::Redirect {
+            resolved_index: None,
+            url,
+            target_ns,
+            target_url,
+            ..
+        } = d
+        {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("redirect {} -> {}/{} has no target", url, char::from(*target_ns), target_url),
+                format!(
+                    "redirect {} -> {}/{} has no target",
+                    url,
+                    char::from(*target_ns),
+                    target_url
+                ),
             )));
         }
     }
@@ -445,7 +488,11 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
     // 12. Main page index (as stored in the header).
     let main_page_idx = if main_path.is_some() {
         dirents
-            .binary_search_by(|d| d.namespace().cmp(&b'W').then_with(|| d.url().cmp("mainPage")))
+            .binary_search_by(|d| {
+                d.namespace()
+                    .cmp(&b'W')
+                    .then_with(|| d.url().cmp("mainPage"))
+            })
             .ok()
             .map(|i| i as u32)
             .unwrap_or(u32::MAX)
@@ -455,19 +502,23 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
 
     // 13. Write everything, hashing as we go.
     let mut hasher = Md5::new();
-    write_all(&mut file, &mut hasher, &encode_header(&HeaderFields {
-        major_version: 5,
-        minor_version: 1,
-        uuid,
-        entry_count,
-        cluster_count,
-        url_ptr_pos,
-        title_ptr_pos,
-        cluster_ptr_pos,
-        mime_list_pos,
-        main_page: main_page_idx,
-        checksum_pos,
-    }))?;
+    write_all(
+        &mut file,
+        &mut hasher,
+        &encode_header(&HeaderFields {
+            major_version: 5,
+            minor_version: 1,
+            uuid,
+            entry_count,
+            cluster_count,
+            url_ptr_pos,
+            title_ptr_pos,
+            cluster_ptr_pos,
+            mime_list_pos,
+            main_page: main_page_idx,
+            checksum_pos,
+        }),
+    )?;
     write_all(&mut file, &mut hasher, &mime_list_bytes)?;
     for off in &dirent_offsets {
         write_all(&mut file, &mut hasher, &off.to_le_bytes())?;
@@ -543,7 +594,14 @@ fn encode_mime_list(mimes: &[String]) -> Vec<u8> {
 fn encode_dirent(d: &RawDirent) -> Vec<u8> {
     let mut out = Vec::new();
     match d {
-        RawDirent::Article { namespace, url, title, mime_idx, cluster, blob } => {
+        RawDirent::Article {
+            namespace,
+            url,
+            title,
+            mime_idx,
+            cluster,
+            blob,
+        } => {
             out.extend_from_slice(&mime_idx.to_le_bytes());
             out.push(0); // parameter_len
             out.push(*namespace);
@@ -557,7 +615,13 @@ fn encode_dirent(d: &RawDirent) -> Vec<u8> {
             }
             out.push(0);
         }
-        RawDirent::Redirect { namespace, url, title, resolved_index, .. } => {
+        RawDirent::Redirect {
+            namespace,
+            url,
+            title,
+            resolved_index,
+            ..
+        } => {
             let idx = resolved_index.unwrap_or(0);
             out.extend_from_slice(&0xFFFFu16.to_le_bytes());
             out.push(0);
@@ -612,14 +676,13 @@ fn encode_cluster(
         }
         Compression::Xz => {
             let lvl = level.unwrap_or(3).clamp(0, 9) as u32;
-            (
-                4u8,
-                {
-                    let mut enc = xz2::write::XzEncoder::new(Vec::new(), lvl);
-                    enc.write_all(&payload).map_err(|e| Error::Decompression(format!("xz encode: {e}")))?;
-                    enc.finish().map_err(|e| Error::Decompression(format!("xz finish: {e}")))?
-                },
-            )
+            (4u8, {
+                let mut enc = xz2::write::XzEncoder::new(Vec::new(), lvl);
+                enc.write_all(&payload)
+                    .map_err(|e| Error::Decompression(format!("xz encode: {e}")))?;
+                enc.finish()
+                    .map_err(|e| Error::Decompression(format!("xz finish: {e}")))?
+            })
         }
     };
 

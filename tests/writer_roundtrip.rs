@@ -23,7 +23,11 @@ fn tmp_path(tag: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     let mut p = std::env::temp_dir();
-    p.push(format!("zimru-writer-{tag}-{}-{}.zim", std::process::id(), ns));
+    p.push(format!(
+        "zimru-writer-{tag}-{}-{}.zim",
+        std::process::id(),
+        ns
+    ));
     p
 }
 
@@ -35,31 +39,39 @@ fn minimal_png() -> Vec<u8> {
     // PNG signature.
     let mut v = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
     // A 1×1 placeholder IHDR (not a valid CRC, but zimcheck doesn't look).
-    v.extend_from_slice(&13u32.to_be_bytes());          // chunk length
+    v.extend_from_slice(&13u32.to_be_bytes()); // chunk length
     v.extend_from_slice(b"IHDR");
-    v.extend_from_slice(&1u32.to_be_bytes());            // width
-    v.extend_from_slice(&1u32.to_be_bytes());            // height
-    v.extend_from_slice(&[8, 0, 0, 0, 0]);              // bit depth, color type, ...
-    v.extend_from_slice(&[0, 0, 0, 0]);                 // stub CRC
-    // Empty IDAT.
+    v.extend_from_slice(&1u32.to_be_bytes()); // width
+    v.extend_from_slice(&1u32.to_be_bytes()); // height
+    v.extend_from_slice(&[8, 0, 0, 0, 0]); // bit depth, color type, ...
+    v.extend_from_slice(&[0, 0, 0, 0]); // stub CRC
+                                        // Empty IDAT.
     v.extend_from_slice(&0u32.to_be_bytes());
     v.extend_from_slice(b"IDAT");
     v.extend_from_slice(&[0, 0, 0, 0]);
     // IEND.
     v.extend_from_slice(&0u32.to_be_bytes());
     v.extend_from_slice(b"IEND");
-    v.extend_from_slice(&[0xAE, 0x42, 0x60, 0x82]);     // real IEND CRC
+    v.extend_from_slice(&[0xAE, 0x42, 0x60, 0x82]); // real IEND CRC
     v
 }
 
 fn upstream_zimcheck() -> Option<PathBuf> {
     let candidate = PathBuf::from("/opt/zim-tools-upstream/zim-tools_linux-x86_64-3.6.0/zimcheck");
-    if candidate.exists() { Some(candidate) } else { None }
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 fn upstream_zimdump() -> Option<PathBuf> {
     let candidate = PathBuf::from("/opt/zim-tools-upstream/zim-tools_linux-x86_64-3.6.0/zimdump");
-    if candidate.exists() { Some(candidate) } else { None }
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 /// Run `upstream zimcheck -A` on a file and assert it passes.
@@ -82,7 +94,9 @@ fn assert_upstream_ok(path: &std::path::Path) {
 }
 
 fn assert_upstream_checksum_ok(path: &std::path::Path) {
-    let Some(zimcheck) = upstream_zimcheck() else { return };
+    let Some(zimcheck) = upstream_zimcheck() else {
+        return;
+    };
     let out = Command::new(&zimcheck)
         .arg("-C")
         .arg(path)
@@ -122,9 +136,21 @@ fn roundtrips_items_metadata_and_main_page() {
     c.set_compression(Compression::Zstd);
     c.set_main_path("home");
     c.add_item(Item::html("home", "Home", "<h1>Welcome</h1>"));
-    c.add_item(Item::html("about", "About", "<p>An archive built by zimru.</p>"));
-    c.add_item(Item::text("robots.txt", "robots", "User-agent: *\nDisallow:\n"));
-    c.add_item(Item::png("favicon.png", "favicon", vec![0x89, 0x50, 0x4E, 0x47]));
+    c.add_item(Item::html(
+        "about",
+        "About",
+        "<p>An archive built by zimru.</p>",
+    ));
+    c.add_item(Item::text(
+        "robots.txt",
+        "robots",
+        "User-agent: *\nDisallow:\n",
+    ));
+    c.add_item(Item::png(
+        "favicon.png",
+        "favicon",
+        vec![0x89, 0x50, 0x4E, 0x47],
+    ));
     c.add_metadata("Title", "Zimru Demo");
     c.add_metadata("Description", "Round-trip test");
     c.add_metadata("Language", "eng");
@@ -140,9 +166,18 @@ fn roundtrips_items_metadata_and_main_page() {
     assert!(a.has_main_entry());
     assert_eq!(a.main_path().unwrap(), "home");
     assert_eq!(a.get_text("home").unwrap(), "<h1>Welcome</h1>");
-    assert_eq!(a.get_text("about").unwrap(), "<p>An archive built by zimru.</p>");
-    assert_eq!(a.get_text("robots.txt").unwrap(), "User-agent: *\nDisallow:\n");
-    assert_eq!(a.get_bytes("favicon.png").unwrap(), vec![0x89, 0x50, 0x4E, 0x47]);
+    assert_eq!(
+        a.get_text("about").unwrap(),
+        "<p>An archive built by zimru.</p>"
+    );
+    assert_eq!(
+        a.get_text("robots.txt").unwrap(),
+        "User-agent: *\nDisallow:\n"
+    );
+    assert_eq!(
+        a.get_bytes("favicon.png").unwrap(),
+        vec![0x89, 0x50, 0x4E, 0x47]
+    );
 
     // Redirect should resolve to the target.
     let start = a.get_entry_by_path("start").unwrap();
@@ -153,8 +188,19 @@ fn roundtrips_items_metadata_and_main_page() {
     assert_eq!(a.metadata_str("Title").unwrap(), "Zimru Demo");
     assert_eq!(a.metadata_str("Language").unwrap(), "eng");
     let keys = a.get_metadata_keys();
-    for required in ["Title", "Description", "Language", "Creator", "Publisher", "Date", "Name"] {
-        assert!(keys.iter().any(|k| k == required), "missing metadata: {required}");
+    for required in [
+        "Title",
+        "Description",
+        "Language",
+        "Creator",
+        "Publisher",
+        "Date",
+        "Name",
+    ] {
+        assert!(
+            keys.iter().any(|k| k == required),
+            "missing metadata: {required}"
+        );
     }
 
     // Illustration is visible.
@@ -176,13 +222,22 @@ fn splits_into_multiple_clusters_when_content_exceeds_target() {
     c.set_cluster_size_target(256 * 1024);
     for i in 0..16 {
         let body = vec![b'A' + (i % 26) as u8; 128 * 1024];
-        c.add_item(Item::new(format!("a{i:02}"), format!("Article {i}"), "text/plain", body));
+        c.add_item(Item::new(
+            format!("a{i:02}"),
+            format!("Article {i}"),
+            "text/plain",
+            body,
+        ));
     }
     c.write_to(&out).expect("write");
 
     let a = Archive::open(&out).expect("reopen");
     assert_eq!(a.entry_count(), 16);
-    assert!(a.cluster_count() >= 8, "expected ≥8 clusters, got {}", a.cluster_count());
+    assert!(
+        a.cluster_count() >= 8,
+        "expected ≥8 clusters, got {}",
+        a.cluster_count()
+    );
     // Every article decompresses intact.
     for i in 0..16 {
         let want = vec![b'A' + (i % 26) as u8; 128 * 1024];
@@ -202,8 +257,16 @@ fn written_file_passes_upstream_zimcheck_integrity() {
     let out = tmp_path("integrity");
     let mut c = Creator::new();
     c.set_main_path("home");
-    c.add_item(Item::html("home", "Home", "<html><body><h1>H</h1><a href=\"about\">About</a></body></html>"));
-    c.add_item(Item::html("about", "About", "<html><body><p>A</p></body></html>"));
+    c.add_item(Item::html(
+        "home",
+        "Home",
+        "<html><body><h1>H</h1><a href=\"about\">About</a></body></html>",
+    ));
+    c.add_item(Item::html(
+        "about",
+        "About",
+        "<html><body><p>A</p></body></html>",
+    ));
     c.add_metadata("Title", "integrity test");
     c.add_metadata("Description", "checked by upstream");
     c.add_metadata("Language", "eng");
@@ -240,14 +303,28 @@ fn written_file_readable_by_upstream_zimdump() {
     c.write_to(&out).expect("write");
 
     // zimdump info should print a sane summary.
-    let info = Command::new(&zimdump).arg("info").arg(&out).output().expect("info");
+    let info = Command::new(&zimdump)
+        .arg("info")
+        .arg(&out)
+        .output()
+        .expect("info");
     let stdout = String::from_utf8_lossy(&info.stdout);
     assert!(stdout.contains("uuid:"), "info missing uuid:\n{stdout}");
-    assert!(stdout.contains("cluster count:"), "info missing cluster count:\n{stdout}");
-    assert!(stdout.contains("main page:"), "info missing main page:\n{stdout}");
+    assert!(
+        stdout.contains("cluster count:"),
+        "info missing cluster count:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("main page:"),
+        "info missing main page:\n{stdout}"
+    );
 
     // zimdump list should enumerate the C-namespace entry.
-    let list = Command::new(&zimdump).arg("list").arg(&out).output().expect("list");
+    let list = Command::new(&zimdump)
+        .arg("list")
+        .arg(&out)
+        .output()
+        .expect("list");
     let stdout = String::from_utf8_lossy(&list.stdout);
     assert!(stdout.contains("home"), "list missing 'home':\n{stdout}");
 
@@ -284,10 +361,7 @@ fn compression_level_round_trips_at_extremes() {
     // better).
     let payload = vec![b'A'; 64 * 1024];
 
-    for (comp, lo, hi) in [
-        (Compression::Zstd, 1, 19),
-        (Compression::Xz,   0, 9),
-    ] {
+    for (comp, lo, hi) in [(Compression::Zstd, 1, 19), (Compression::Xz, 0, 9)] {
         let make = |level: i32| -> std::path::PathBuf {
             let p = tmp_path(&format!("level-{comp:?}-{level}"));
             let mut c = Creator::new();
@@ -323,9 +397,8 @@ fn rejects_dangling_redirect() {
     let mut c = Creator::new();
     c.add_item(Item::text("real", "Real", "present"));
     c.add_redirection("alias", "Alias", "nonexistent");
-    match c.write_to(&out) {
-        Ok(()) => panic!("expected error for dangling redirect"),
-        Err(_) => {}
+    if let Ok(()) = c.write_to(&out) {
+        panic!("expected error for dangling redirect")
     }
     // File may exist but partial — don't try to read it.
     let _ = std::fs::remove_file(&out);

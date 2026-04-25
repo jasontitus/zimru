@@ -321,8 +321,7 @@ impl Archive {
             // Modern listings are entirely C; legacy listings span all ns. We
             // can take the binary-search path only when the listing namespace
             // matches the requested one.
-            probe == ns
-                || self.core.header.title_ptr_pos != u64::MAX // legacy: full
+            probe == ns || self.core.header.title_ptr_pos != u64::MAX // legacy: full
         };
         if listing_covers_ns {
             let mut lo = 0usize;
@@ -399,7 +398,9 @@ impl Archive {
         let mut out = Vec::new();
         let n = self.core.header.entry_count;
         for i in 0..n {
-            let Ok(off) = self.url_pointer(i) else { continue };
+            let Ok(off) = self.url_pointer(i) else {
+                continue;
+            };
             let Ok(d) = Dirent::parse(&self.core.mmap, off as usize) else {
                 continue;
             };
@@ -595,7 +596,9 @@ impl Archive {
     /// decompresses each cluster exactly once, which is usually much faster.
     pub fn par_iter_by_path(&self) -> impl ParallelIterator<Item = Result<Entry>> + '_ {
         let n = self.core.header.entry_count;
-        (0..n).into_par_iter().map(move |i| self.entry_by_url_index(i))
+        (0..n)
+            .into_par_iter()
+            .map(move |i| self.entry_by_url_index(i))
     }
 
     /// Run a closure over every decompressed cluster in parallel. Workers
@@ -635,7 +638,11 @@ impl Archive {
             uses_new_namespaces: h.uses_new_namespaces(),
             entry_count: h.entry_count,
             content_entry_count: self
-                .namespace_range(if h.uses_new_namespaces() { NS_CONTENT_NEW } else { NS_ARTICLES_LEGACY })
+                .namespace_range(if h.uses_new_namespaces() {
+                    NS_CONTENT_NEW
+                } else {
+                    NS_ARTICLES_LEGACY
+                })
                 .map(|r| r.end - r.start)
                 .unwrap_or(0),
             cluster_count: h.cluster_count,
@@ -1045,24 +1052,21 @@ pub struct PrefixIter {
 impl Iterator for PrefixIter {
     type Item = Result<Entry>;
     fn next(&mut self) -> Option<Self::Item> {
-        while self.i < self.n {
-            let idx = self.i;
-            self.i += 1;
-            let entry = match self.archive.entry_by_url_index(idx) {
-                Ok(e) => e,
-                Err(e) => return Some(Err(e)),
-            };
-            if entry.namespace() != self.ns {
-                self.i = self.n;
-                return None;
-            }
-            if !entry.path().starts_with(&self.prefix) {
-                self.i = self.n;
-                return None;
-            }
-            return Some(Ok(entry));
+        if self.i >= self.n {
+            return None;
         }
-        None
+        let idx = self.i;
+        self.i += 1;
+        let entry = match self.archive.entry_by_url_index(idx) {
+            Ok(e) => e,
+            Err(e) => return Some(Err(e)),
+        };
+        // First (namespace, url) outside the prefix range ends iteration.
+        if entry.namespace() != self.ns || !entry.path().starts_with(&self.prefix) {
+            self.i = self.n;
+            return None;
+        }
+        Some(Ok(entry))
     }
 }
 
@@ -1086,19 +1090,32 @@ pub struct Summary {
 impl std::fmt::Display for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "uuid            {}", self.uuid)?;
-        writeln!(f, "version         {}.{}{}",
+        writeln!(
+            f,
+            "version         {}.{}{}",
             self.major_version,
             self.minor_version,
-            if self.uses_new_namespaces { " (new namespaces)" } else { " (legacy)" })?;
-        writeln!(f, "entries         {} total ({} content)",
-            self.entry_count, self.content_entry_count)?;
+            if self.uses_new_namespaces {
+                " (new namespaces)"
+            } else {
+                " (legacy)"
+            }
+        )?;
+        writeln!(
+            f,
+            "entries         {} total ({} content)",
+            self.entry_count, self.content_entry_count
+        )?;
         writeln!(f, "clusters        {}", self.cluster_count)?;
         writeln!(f, "mime types      {}", self.mime_type_count)?;
         if let Some(p) = &self.main_path {
             writeln!(f, "main page       {}", p)?;
         }
-        writeln!(f, "checksum        {}", if self.has_checksum { "yes" } else { "no" })?;
+        writeln!(
+            f,
+            "checksum        {}",
+            if self.has_checksum { "yes" } else { "no" }
+        )?;
         Ok(())
     }
 }
-

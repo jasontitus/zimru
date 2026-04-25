@@ -160,7 +160,14 @@ pub fn cmp_path(a_ns: u8, a_url: &str, b_ns: u8, b_url: &str) -> std::cmp::Order
 mod tests {
     use super::*;
 
-    fn build_article(mime: u16, ns: u8, cluster: u32, blob: u32, url: &str, title: &str) -> Vec<u8> {
+    fn build_article(
+        mime: u16,
+        ns: u8,
+        cluster: u32,
+        blob: u32,
+        url: &str,
+        title: &str,
+    ) -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(&mime.to_le_bytes());
         v.push(0); // parameter_len

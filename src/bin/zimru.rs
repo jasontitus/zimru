@@ -68,7 +68,14 @@ fn cmd_info(args: &[String]) -> Result<(), Error> {
     let h = arc.header();
     println!("file:           {path}");
     println!("version:        {}.{}", h.major_version, h.minor_version);
-    println!("namespaces:     {}", if h.uses_new_namespaces() { "new (C/M/W/X)" } else { "legacy (A/I/M/...)" });
+    println!(
+        "namespaces:     {}",
+        if h.uses_new_namespaces() {
+            "new (C/M/W/X)"
+        } else {
+            "legacy (A/I/M/...)"
+        }
+    );
     println!("uuid:           {}", hex_lower(&h.uuid));
     println!("entry_count:    {}", h.entry_count);
     println!("cluster_count:  {}", h.cluster_count);
@@ -120,7 +127,12 @@ fn cmd_list(args: &[String], by_title: bool) -> Result<(), Error> {
         let e = ent?;
         let kind = if e.is_redirect() { "R" } else { "A" };
         let ns = char::from(e.namespace());
-        println!("{:>6}  {kind} {ns}/{}    {}", e.index(), e.path(), e.title());
+        println!(
+            "{:>6}  {kind} {ns}/{}    {}",
+            e.index(),
+            e.path(),
+            e.title()
+        );
         count += 1;
         if let Some(lim) = limit {
             if count >= lim {
@@ -251,7 +263,10 @@ fn cmd_mimes(args: &[String]) -> Result<(), Error> {
 }
 
 fn io_arg() -> Error {
-    Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "missing argument"))
+    Error::Io(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "missing argument",
+    ))
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

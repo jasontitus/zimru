@@ -22,13 +22,21 @@ fn tmp_path(tag: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     let mut p = std::env::temp_dir();
-    p.push(format!("zimru-analyze-{tag}-{}-{}.zim", std::process::id(), ns));
+    p.push(format!(
+        "zimru-analyze-{tag}-{}-{}.zim",
+        std::process::id(),
+        ns
+    ));
     p
 }
 
 fn zimdump_binary() -> Option<PathBuf> {
     let candidate = PathBuf::from("target/release/zimdump");
-    if candidate.exists() { Some(candidate) } else { None }
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 #[test]
@@ -39,7 +47,12 @@ fn cluster_byte_ranges_cover_the_cluster_region() {
     c.set_cluster_size_target(8 * 1024); // force several clusters
     for i in 0..6 {
         let body = vec![b'A' + (i % 26) as u8; 4 * 1024];
-        c.add_item(Item::new(format!("a{i:02}"), format!("Article {i}"), "text/plain", body));
+        c.add_item(Item::new(
+            format!("a{i:02}"),
+            format!("Article {i}"),
+            "text/plain",
+            body,
+        ));
     }
     c.write_to(&out).expect("write");
 
@@ -61,7 +74,9 @@ fn cluster_byte_ranges_cover_the_cluster_region() {
     // (or EOF if no checksum).
     let first = a.cluster_byte_range(0).unwrap().start;
     let h = a.header();
-    let region_end = if h.has_checksum() { h.checksum_pos } else {
+    let region_end = if h.has_checksum() {
+        h.checksum_pos
+    } else {
         std::fs::metadata(&out).unwrap().len()
     };
     assert_eq!(total, region_end - first);
@@ -81,7 +96,12 @@ fn analyze_subcommand_prints_one_row_per_cluster() {
     c.set_cluster_size_target(8 * 1024);
     for i in 0..6 {
         let body = vec![b'X'; 4 * 1024];
-        c.add_item(Item::new(format!("a{i:02}"), format!("A{i}"), "text/plain", body));
+        c.add_item(Item::new(
+            format!("a{i:02}"),
+            format!("A{i}"),
+            "text/plain",
+            body,
+        ));
     }
     c.write_to(&out).expect("write");
     let a = Archive::open(&out).unwrap();
@@ -91,14 +111,19 @@ fn analyze_subcommand_prints_one_row_per_cluster() {
         .arg(&out)
         .output()
         .expect("run zimdump analyze");
-    assert!(result.status.success(), "zimdump analyze failed: {:?}", result);
+    assert!(
+        result.status.success(),
+        "zimdump analyze failed: {:?}",
+        result
+    );
     let stdout = String::from_utf8_lossy(&result.stdout);
 
     // Header line + N cluster rows + TOTAL row.
     let n = stdout.lines().count();
     let expected = 1 + a.cluster_count() as usize + 1;
     assert_eq!(
-        n, expected,
+        n,
+        expected,
         "expected {expected} lines (header + {} clusters + total), got {n}:\n{stdout}",
         a.cluster_count()
     );
@@ -118,7 +143,7 @@ fn analyze_by_item_lists_every_article() {
     let mut c = Creator::new();
     c.set_compression(Compression::Zstd);
     c.add_item(Item::text("alpha", "Alpha", "alpha"));
-    c.add_item(Item::text("beta",  "Beta",  "beta"));
+    c.add_item(Item::text("beta", "Beta", "beta"));
     c.add_item(Item::text("gamma", "Gamma", "gamma"));
     c.add_redirection("a", "Alias", "alpha");
     c.write_to(&out).expect("write");
@@ -129,7 +154,11 @@ fn analyze_by_item_lists_every_article() {
         .arg(&out)
         .output()
         .expect("run zimdump analyze --by-item");
-    assert!(result.status.success(), "zimdump analyze --by-item failed: {:?}", result);
+    assert!(
+        result.status.success(),
+        "zimdump analyze --by-item failed: {:?}",
+        result
+    );
     let stdout = String::from_utf8_lossy(&result.stdout);
 
     // Three article rows; redirect must NOT appear.
@@ -140,7 +169,10 @@ fn analyze_by_item_lists_every_article() {
         }
     }
     assert_eq!(count, 3, "expected 3 article rows, got {count}:\n{stdout}");
-    assert!(!stdout.contains("C/a "), "redirect alias must not be listed:\n{stdout}");
+    assert!(
+        !stdout.contains("C/a "),
+        "redirect alias must not be listed:\n{stdout}"
+    );
 
     let _ = std::fs::remove_file(&out);
 }
