@@ -714,7 +714,9 @@ repository and provide the libzim-shaped C++ headers and JNI symbols
 that downstream consumers (libkiwix, kiwix-apple's `.mm` files,
 java-libkiwix) need to switch their bridges over to zimru. That shim is
 intentionally outside this repo so the MIT-vs-GPL boundary is physical,
-not just conventional.
+not just conventional. The full multi-repo plan — what to create, what
+order to build it, prerequisites that must land in zimru first — is in
+[`docs/multi-repo-plan.md`](./docs/multi-repo-plan.md).
 
 [libzim]: https://github.com/openzim/libzim
 [libkiwix]: https://github.com/kiwix/libkiwix
