@@ -35,6 +35,7 @@ struct Opts {
 
     long_description: Option<String>,
     cluster_size_kb: Option<usize>,
+    compression_level: Option<i32>,
     threads: Option<usize>,
     inflate_html: bool,
     redirects_file: Option<PathBuf>,
@@ -75,6 +76,7 @@ fn main() -> ExitCode {
             ("-p", v) | ("--publisher", v) => o.publisher = Some(value_or_next(v, &args, &mut i)),
             ("-L", v) | ("--longDescription", v) => o.long_description = Some(value_or_next(v, &args, &mut i)),
             ("-m", v) | ("--clusterSize", v) => o.cluster_size_kb = value_or_next(v, &args, &mut i).parse().ok(),
+            ("--compression-level", v) => o.compression_level = value_or_next(v, &args, &mut i).parse().ok(),
             ("-J", v) | ("--threads", v) => o.threads = value_or_next(v, &args, &mut i).parse().ok(),
             ("-r", v) | ("--redirects", v) => o.redirects_file = Some(PathBuf::from(value_or_next(v, &args, &mut i))),
             ("-a", v) | ("--tags", v) => o.tags = Some(value_or_next(v, &args, &mut i)),
@@ -142,7 +144,7 @@ fn value_or_next(v: Option<&str>, args: &[String], i: &mut usize) -> String {
 
 fn print_help() {
     println!(
-        "Usage: zimwriterfs [mandatory arguments] [optional arguments] HTML_DIR ZIM_FILE\n\nMandatory:\n  -w/--welcome PATH      main HTML page (relative to HTML_DIR)\n  -I/--illustration PATH 48×48 PNG illustration (relative)\n  -l/--language LANG     ISO639-3 language code (e.g. eng)\n  -n/--name NAME         version-independent identifier\n  -t/--title TITLE       ZIM title\n  -d/--description TEXT  short description\n  -c/--creator AUTHOR    content creator\n  -p/--publisher PUB     ZIM creator/publisher\n\nOptional:\n  -L/--longDescription TEXT\n  -m/--clusterSize KB    cluster size in KiB (default 2048)\n  -J/--threads N         number of threads (default 4) — currently no-op\n  -x/--inflateHtml       gunzip *.html files before packing\n  -j/--withoutFTIndex    don't build fulltext index (always)\n  -r/--redirects PATH    TSV file: url\\ttitle\\ttarget_url\n  -a/--tags TAGS         semicolon-separated tags\n  -e/--source URL        source URL\n  -o/--flavour NAME      content flavour\n  -s/--scraper NAME      scraper tool name+version\n  --skip-libmagic-check  ignore libmagic; use file-extension mime detection (default in zimru)\n  -v/--verbose           print processing details\n  -V/--version           print version\n"
+        "Usage: zimwriterfs [mandatory arguments] [optional arguments] HTML_DIR ZIM_FILE\n\nMandatory:\n  -w/--welcome PATH      main HTML page (relative to HTML_DIR)\n  -I/--illustration PATH 48×48 PNG illustration (relative)\n  -l/--language LANG     ISO639-3 language code (e.g. eng)\n  -n/--name NAME         version-independent identifier\n  -t/--title TITLE       ZIM title\n  -d/--description TEXT  short description\n  -c/--creator AUTHOR    content creator\n  -p/--publisher PUB     ZIM creator/publisher\n\nOptional:\n  -L/--longDescription TEXT\n  -m/--clusterSize KB    cluster size in KiB (default 2048)\n  --compression-level N  compression level (zstd: 1..=22, xz: 0..=9)\n  -J/--threads N         number of threads (default 4) — currently no-op\n  -x/--inflateHtml       gunzip *.html files before packing\n  -j/--withoutFTIndex    don't build fulltext index (always)\n  -r/--redirects PATH    TSV file: url\\ttitle\\ttarget_url\n  -a/--tags TAGS         semicolon-separated tags\n  -e/--source URL        source URL\n  -o/--flavour NAME      content flavour\n  -s/--scraper NAME      scraper tool name+version\n  --skip-libmagic-check  ignore libmagic; use file-extension mime detection (default in zimru)\n  -v/--verbose           print processing details\n  -V/--version           print version\n"
     );
 }
 
@@ -158,6 +160,9 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
 
     let mut creator = Creator::new();
     creator.set_compression(Compression::Zstd);
+    if let Some(level) = o.compression_level {
+        creator.set_compression_level(level);
+    }
     if let Some(kb) = o.cluster_size_kb {
         creator.set_cluster_size_target(kb * 1024);
     }

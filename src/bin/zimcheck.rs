@@ -191,14 +191,12 @@ struct LogLine {
     /// `true` => print with the `[BUCKET]` prefix; `false` => indented body
     /// line that follows a header in the same bucket.
     is_header: bool,
-    check: Option<Check>,
     text: String,
 }
 
 /// Structured payload attached to each log entry, so the JSON output can
 /// reproduce the per-check field shapes upstream emits.
 enum JsonExtra {
-    None,
     Redundant { path1: String, path2: String },
     UrlInternal { article: String, link: String, normalized_link: String },
     UrlExternal { article: String, url: String },
@@ -236,22 +234,22 @@ impl Report {
         self.preamble_warns.push(s.into());
     }
     fn add_info<S: Into<String>>(&mut self, s: S) {
-        self.infos.push(LogLine { bucket: Bucket::Info, is_header: true, check: None, text: s.into() });
+        self.infos.push(LogLine { bucket: Bucket::Info, is_header: true, text: s.into() });
     }
     fn add_info_body<S: Into<String>>(&mut self, s: S) {
-        self.infos.push(LogLine { bucket: Bucket::Info, is_header: false, check: None, text: s.into() });
+        self.infos.push(LogLine { bucket: Bucket::Info, is_header: false, text: s.into() });
     }
     fn add_warn<S: Into<String>>(&mut self, s: S) {
-        self.warns.push(LogLine { bucket: Bucket::Warning, is_header: true, check: None, text: s.into() });
+        self.warns.push(LogLine { bucket: Bucket::Warning, is_header: true, text: s.into() });
     }
     fn add_warn_body<S: Into<String>>(&mut self, s: S) {
-        self.warns.push(LogLine { bucket: Bucket::Warning, is_header: false, check: None, text: s.into() });
+        self.warns.push(LogLine { bucket: Bucket::Warning, is_header: false, text: s.into() });
     }
-    fn add_error<S: Into<String>>(&mut self, c: Check, s: S) {
-        self.errs.push(LogLine { bucket: Bucket::Error, is_header: true, check: Some(c), text: s.into() });
+    fn add_error<S: Into<String>>(&mut self, _c: Check, s: S) {
+        self.errs.push(LogLine { bucket: Bucket::Error, is_header: true, text: s.into() });
     }
-    fn add_error_body<S: Into<String>>(&mut self, c: Check, s: S) {
-        self.errs.push(LogLine { bucket: Bucket::Error, is_header: false, check: Some(c), text: s.into() });
+    fn add_error_body<S: Into<String>>(&mut self, _c: Check, s: S) {
+        self.errs.push(LogLine { bucket: Bucket::Error, is_header: false, text: s.into() });
     }
     fn errors(&self) -> impl Iterator<Item = &LogLine> {
         self.errs.iter().filter(|l| l.is_header)
@@ -327,9 +325,6 @@ impl Report {
                 println!("      \"check\" : \"{}\",", e.check.name());
                 println!("      \"level\" : \"{}\",", e.level);
                 match &e.extra {
-                    JsonExtra::None => {
-                        println!("      \"message\" : \"{}\"", esc(&e.message));
-                    }
                     JsonExtra::Redundant { path1, path2 } => {
                         println!("      \"message\" : \"{}\",", esc(&e.message));
                         println!("      \"path1\" : \"{}\",", esc(path1));

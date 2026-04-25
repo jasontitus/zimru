@@ -694,6 +694,34 @@ mv wikipedia_zh_chemistry_mini_2026-03.zim wikipedia_zh_chemistry_mini.zim
   the smallest available Chinese Wikipedia ZIM and exercises the same code
   paths plus UTF-8 metadata.)
 
+## Licensing & clean-room policy
+
+zimru is **MIT-licensed** and is an independent re-implementation of the
+[ZIM file format spec][spec] — no code is shared with the GPL-licensed
+[`libzim`][libzim] or [`libkiwix`][libkiwix].
+
+To preserve that licence claim, contributors follow a clean-room
+discipline: the GPL source of `libzim`, `libkiwix`, `java-libkiwix`'s
+JNI wrappers, `kiwix-apple`'s `.mm` wrappers, and `python-libzim`'s
+Cython bodies must not be consulted. The full policy — including the
+list of sources you may and may not read, and the two-role split for
+any work that necessarily touches an interface libzim already defines —
+is documented in [CONTRIBUTING.md](./CONTRIBUTING.md). Please read it
+before sending a patch.
+
+A future GPL-licensed `libzim-shim` project will live in a *separate*
+repository and provide the libzim-shaped C++ headers and JNI symbols
+that downstream consumers (libkiwix, kiwix-apple's `.mm` files,
+java-libkiwix) need to switch their bridges over to zimru. That shim is
+intentionally outside this repo so the MIT-vs-GPL boundary is physical,
+not just conventional. The full multi-repo plan — what to create, what
+order to build it, prerequisites that must land in zimru first — is in
+[`docs/multi-repo-plan.md`](./docs/multi-repo-plan.md).
+
+[libzim]: https://github.com/openzim/libzim
+[libkiwix]: https://github.com/kiwix/libkiwix
+[spec]: https://wiki.openzim.org/wiki/ZIM_file_format
+
 ## License
 
 MIT. See `LICENSE`.

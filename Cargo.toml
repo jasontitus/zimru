@@ -9,37 +9,58 @@ readme = "README.md"
 keywords = ["zim", "openzim", "wikipedia", "kiwix"]
 categories = ["filesystem", "compression", "parser-implementations"]
 
+[features]
+default = ["writer"]
+# Enable the ZIM file writer (`zimru::writer::Creator`) and the
+# `zimrecreate` / `zimwriterfs` binaries. With default features disabled
+# the crate is reader-only.
+writer = []
+
 [lib]
 name = "zimru"
 path = "src/lib.rs"
 
+# Each [[bin]] sets `test = false` so `cargo test` doesn't compile a
+# zero-test harness for it (we keep all integration tests under `tests/`,
+# which shell out to the built binaries; no `#[test]` lives inside any
+# `src/bin/*.rs`).
+
 [[bin]]
 name = "zimru"
 path = "src/bin/zimru.rs"
+test = false
 
 [[bin]]
 name = "zimcheck"
 path = "src/bin/zimcheck.rs"
+test = false
 
 [[bin]]
 name = "zimdump"
 path = "src/bin/zimdump.rs"
+test = false
 
 [[bin]]
 name = "zimbench"
 path = "src/bin/zimbench.rs"
+test = false
 
 [[bin]]
 name = "zimsplit"
 path = "src/bin/zimsplit.rs"
+test = false
 
 [[bin]]
 name = "zimrecreate"
 path = "src/bin/zimrecreate.rs"
+required-features = ["writer"]
+test = false
 
 [[bin]]
 name = "zimwriterfs"
 path = "src/bin/zimwriterfs.rs"
+required-features = ["writer"]
+test = false
 
 [dependencies]
 memmap2 = "0.9"

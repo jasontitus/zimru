@@ -1,3 +1,4 @@
+#![cfg(feature = "writer")]
 //! Tests for the ZIM writer (`zimru::writer::Creator`).
 //!
 //! Strategy for each test:
@@ -271,6 +272,48 @@ fn zimru_reader_round_trips_every_compression() {
         assert!(a.check().unwrap());
 
         let _ = std::fs::remove_file(&out);
+    }
+}
+
+#[test]
+fn compression_level_round_trips_at_extremes() {
+    // For zstd and xz, build the same archive at the lowest and highest
+    // levels. Both must round-trip identically; the high-level output must
+    // not be larger than the low-level output (the payload is the highly
+    // redundant "AAAA…" pattern, so a higher level can only do as well or
+    // better).
+    let payload = vec![b'A'; 64 * 1024];
+
+    for (comp, lo, hi) in [
+        (Compression::Zstd, 1, 19),
+        (Compression::Xz,   0, 9),
+    ] {
+        let make = |level: i32| -> std::path::PathBuf {
+            let p = tmp_path(&format!("level-{comp:?}-{level}"));
+            let mut c = Creator::new();
+            c.set_compression(comp);
+            c.set_compression_level(level);
+            c.add_item(Item::text("blob", "Blob", payload.clone()));
+            c.write_to(&p).expect("write");
+            p
+        };
+
+        let lo_path = make(lo);
+        let hi_path = make(hi);
+
+        let lo_size = std::fs::metadata(&lo_path).unwrap().len();
+        let hi_size = std::fs::metadata(&hi_path).unwrap().len();
+        assert!(
+            hi_size <= lo_size,
+            "{comp:?}: level {hi} ({hi_size} bytes) larger than level {lo} ({lo_size} bytes)"
+        );
+
+        for p in [&lo_path, &hi_path] {
+            let a = Archive::open(p).expect("reopen");
+            assert_eq!(a.get_bytes("blob").unwrap(), payload);
+            assert!(a.check().unwrap(), "checksum should verify ({comp:?})");
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
