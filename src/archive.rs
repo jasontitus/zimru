@@ -6,11 +6,11 @@
 //! `zimru` should mostly require only a `use` change.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use lru::LruCache;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
@@ -35,6 +35,73 @@ pub const NS_INDEX: u8 = b'X';
 /// Articles namespace (legacy archives).
 pub const NS_ARTICLES_LEGACY: u8 = b'A';
 
+/// Default cluster-cache byte budget (sum of decompressed payload bytes
+/// held resident at most). Sized for phone-class hosts: 64 MB is enough
+/// to keep ~30 typical 2 MB clusters cached for hot-article reuse, but
+/// won't dominate a 4 GB-RAM device. Override per-archive with
+/// [`Archive::set_cluster_cache_max_bytes`] — bulk-iteration tools that
+/// pass over the whole archive once can size up; memory-constrained
+/// embedded callers can size down.
+pub const DEFAULT_CLUSTER_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Byte-budget LRU cache for decompressed clusters. Wraps `LruCache`
+/// (count-based) and adds eviction-by-bytes on every insert: clusters
+/// are tracked by their decompressed payload length, and the LRU tail
+/// is evicted until the resident-byte total is under budget. Keeps the
+/// most-recently-used cluster pinned even if it exceeds the budget on
+/// its own (otherwise a single oversized cluster would lock the cache
+/// into a permanent miss).
+#[derive(Debug)]
+struct ClusterByteCache {
+    inner: LruCache<u32, Arc<Cluster>>,
+    max_bytes: usize,
+    current_bytes: usize,
+}
+
+impl ClusterByteCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            inner: LruCache::unbounded(),
+            max_bytes,
+            current_bytes: 0,
+        }
+    }
+
+    fn get(&mut self, idx: u32) -> Option<Arc<Cluster>> {
+        self.inner.get(&idx).cloned()
+    }
+
+    fn put(&mut self, idx: u32, cluster: Arc<Cluster>) {
+        let size = cluster.payload().len();
+        if let Some(prev) = self.inner.put(idx, cluster) {
+            self.current_bytes = self.current_bytes.saturating_sub(prev.payload().len());
+        }
+        self.current_bytes = self.current_bytes.saturating_add(size);
+        self.evict_to_budget();
+    }
+
+    fn resize(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+        self.evict_to_budget();
+    }
+
+    fn evict_to_budget(&mut self) {
+        while self.current_bytes > self.max_bytes && self.inner.len() > 1 {
+            if let Some((_, evicted)) = self.inner.pop_lru() {
+                self.current_bytes = self
+                    .current_bytes
+                    .saturating_sub(evicted.payload().len());
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+}
+
 #[derive(Debug)]
 struct ArchiveCore {
     mmap: Mmap,
@@ -42,7 +109,7 @@ struct ArchiveCore {
     mimes: MimeList,
     /// File length, used as the upper bound when sizing the trailing cluster.
     file_len: u64,
-    cluster_cache: Mutex<HashMap<u32, Arc<Cluster>>>,
+    cluster_cache: Mutex<ClusterByteCache>,
     /// Cached title-order listing: dirent indices sorted by (namespace, title).
     /// In legacy archives this comes from `header.title_ptr_pos`; in modern
     /// archives (v6.2+) it's stored at `X/listing/titleOrdered/v1` and only
@@ -81,7 +148,9 @@ impl Archive {
                 header,
                 mimes,
                 file_len,
-                cluster_cache: Mutex::new(HashMap::new()),
+                cluster_cache: Mutex::new(ClusterByteCache::new(
+                    DEFAULT_CLUSTER_CACHE_MAX_BYTES,
+                )),
                 title_listing: OnceLock::new(),
                 content_counts: OnceLock::new(),
             }),
@@ -279,28 +348,38 @@ impl Archive {
         self.core.file_len
     }
 
-    /// Walk the content namespace once, counting how many entries are
-    /// "articles" (mimetype starts with `text/html`) and how many are
-    /// "media" (any other non-redirect item). Redirects don't count
-    /// toward either total. Result is cached after the first call.
+    /// Count "articles" (mimetype starts with `text/html`) and "media"
+    /// (any other non-redirect item) for catalog purposes. Redirects
+    /// don't count toward either total. Result is cached.
+    ///
+    /// On modern (new-namespace) archives all user content lives under
+    /// `C/`, so this walks just that range. On legacy archives the user
+    /// content is spread across `A` (articles), `I` (images/files),
+    /// `J` (image text), `-` (layout: CSS/JS/fonts), and a few rarer
+    /// per-article meta namespaces (`B`, `H`, `U`, `V`, `W`); the only
+    /// namespaces explicitly *not* counted are `M` (metadata) and `X`
+    /// (search indexes). The walk skips both regardless of namespace
+    /// scheme so it stays robust to unusual legacy shapes.
     pub fn article_and_media_counts(&self) -> Result<(u64, u64)> {
         if let Some(&cached) = self.core.content_counts.get() {
             return Ok(cached);
         }
-        let ns = if self.core.header.uses_new_namespaces() {
-            NS_CONTENT_NEW
+        let new_scheme = self.core.header.uses_new_namespaces();
+        let range: Box<dyn Iterator<Item = u32>> = if new_scheme {
+            Box::new(self.namespace_range(NS_CONTENT_NEW)?)
         } else {
-            NS_ARTICLES_LEGACY
+            Box::new(0..self.all_entry_count())
         };
-        let range = self.namespace_range(ns)?;
         let mut articles: u64 = 0;
         let mut media: u64 = 0;
         for idx in range {
             let entry = self.entry_by_url_index(idx)?;
-            if entry.is_redirect() {
-                continue;
+            if !new_scheme {
+                let ns = entry.namespace();
+                if ns == NS_METADATA || ns == NS_INDEX {
+                    continue;
+                }
             }
-            // Get the mimetype without paying the full Item construction.
             let mime_idx = match entry.dirent() {
                 crate::Dirent::Article(a) => a.mimetype,
                 crate::Dirent::Redirect(_) => continue,
@@ -391,15 +470,18 @@ impl Archive {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let off = self.url_pointer(mid)?;
-            let d = Dirent::parse(&self.core.mmap, off as usize)?;
-            let cmp = match ns.cmp(&d.namespace()) {
-                Ordering::Equal => url.cmp(d.url()),
+            // Probe with `key_at` (no allocation) — only materialize the
+            // full dirent on the matched leaf.
+            let (d_ns, d_url) = Dirent::key_at(&self.core.mmap, off as usize)?;
+            let cmp = match ns.cmp(&d_ns) {
+                Ordering::Equal => url.cmp(d_url),
                 other => other,
             };
             match cmp {
                 Ordering::Less => hi = mid,
                 Ordering::Greater => lo = mid + 1,
                 Ordering::Equal => {
+                    let d = Dirent::parse(&self.core.mmap, off as usize)?;
                     return Ok(Entry {
                         archive: self.clone(),
                         url_index: mid,
@@ -429,15 +511,18 @@ impl Archive {
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
                 let url_idx = listing[mid];
-                let d = self.entry_by_url_index(url_idx)?.dirent;
-                let cmp = match ns.cmp(&d.namespace()) {
-                    Ordering::Equal => title.cmp(d.title()),
+                let off = self.url_pointer(url_idx)?;
+                let (d_ns, d_title) =
+                    Dirent::title_key_at(&self.core.mmap, off as usize)?;
+                let cmp = match ns.cmp(&d_ns) {
+                    Ordering::Equal => title.cmp(d_title),
                     other => other,
                 };
                 match cmp {
                     Ordering::Less => hi = mid,
                     Ordering::Greater => lo = mid + 1,
                     Ordering::Equal => {
+                        let d = Dirent::parse(&self.core.mmap, off as usize)?;
                         return Ok(Entry {
                             archive: self.clone(),
                             url_index: url_idx,
@@ -461,6 +546,61 @@ impl Archive {
             }
         }
         Err(Error::EntryNotFound)
+    }
+
+    /// Half-open `[lo, hi)` range of *title-order* indices whose entries are
+    /// in namespace `ns` and whose title begins with `prefix`. Returns
+    /// `lo == hi` (an empty range) when nothing matches.
+    ///
+    /// Designed to back `SuggestionSearcher` fallbacks for ZIMs that lack a
+    /// Xapian title index: callers iterate `lo..hi` and call
+    /// [`Archive::entry_by_title_index`] on each to materialize entries.
+    /// Two binary searches over [`Archive::title_listing`] using
+    /// [`Dirent::title_key_at`] (no allocation per probe) — `O(log N)`
+    /// regardless of prefix length or match count.
+    ///
+    /// On modern (new-namespace) archives the title listing only covers
+    /// the `C/` namespace, so passing any other namespace yields an
+    /// empty range. Legacy archives' listings span every namespace.
+    pub fn title_prefix_range(&self, ns: u8, prefix: &str) -> Result<std::ops::Range<u32>> {
+        let listing = self.title_listing()?;
+        let lo = self.lower_bound_in_title_listing(&listing, ns, prefix.as_bytes())?;
+        // The first key strictly greater than every UTF-8 string starting
+        // with `prefix` is `prefix` followed by `0xFF` — `0xFF` never appears
+        // in valid UTF-8 so this is a safe sentinel.
+        let mut succ = Vec::with_capacity(prefix.len() + 1);
+        succ.extend_from_slice(prefix.as_bytes());
+        succ.push(0xFF);
+        let hi = self.lower_bound_in_title_listing(&listing, ns, &succ)?;
+        Ok(lo as u32..hi as u32)
+    }
+
+    /// First index in `listing` where the dirent's `(namespace, title)` is
+    /// `>= (ns, key)`. Helper for [`Archive::title_prefix_range`].
+    fn lower_bound_in_title_listing(
+        &self,
+        listing: &[u32],
+        ns: u8,
+        key: &[u8],
+    ) -> Result<usize> {
+        let mut lo = 0usize;
+        let mut hi = listing.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let url_idx = listing[mid];
+            let off = self.url_pointer(url_idx)?;
+            let (d_ns, d_title) = Dirent::title_key_at(&self.core.mmap, off as usize)?;
+            let cmp = match d_ns.cmp(&ns) {
+                Ordering::Equal => d_title.as_bytes().cmp(key),
+                other => other,
+            };
+            if cmp.is_lt() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
     }
 
     /// Iterate every entry in URL-pointer (path) order.
@@ -508,6 +648,22 @@ impl Archive {
                 out.push(d.url().to_string());
             }
         }
+        out
+    }
+
+    /// Enumerate every cover/thumbnail illustration recorded in the
+    /// archive's metadata. ZIM stores these as `M/Illustration_<W>x<H>@<scale>`
+    /// entries; this helper parses every such key and returns the
+    /// `(width, height, scale)` tuples sorted ascending. Keys that don't
+    /// match the pattern are silently skipped — callers get only valid
+    /// illustration descriptors.
+    pub fn illustrations(&self) -> Vec<(u32, u32, u32)> {
+        let mut out: Vec<(u32, u32, u32)> = self
+            .get_metadata_keys()
+            .into_iter()
+            .filter_map(|k| parse_illustration_key(&k))
+            .collect();
+        out.sort();
         out
     }
 
@@ -853,7 +1009,7 @@ impl Archive {
     }
 
     fn load_cluster(&self, idx: u32) -> Result<Arc<Cluster>> {
-        if let Some(c) = self.core.cluster_cache.lock().unwrap().get(&idx).cloned() {
+        if let Some(c) = self.core.cluster_cache.lock().unwrap().get(idx) {
             return Ok(c);
         }
         let start = self.cluster_pointer(idx)? as usize;
@@ -871,9 +1027,41 @@ impl Archive {
             .cluster_cache
             .lock()
             .unwrap()
-            .insert(idx, cluster.clone());
+            .put(idx, cluster.clone());
         Ok(cluster)
     }
+
+    /// Reconfigure the cluster cache's byte budget. The cache holds
+    /// decompressed clusters; `max_bytes` is the upper bound on the
+    /// summed payload sizes resident at once. Default is
+    /// [`DEFAULT_CLUSTER_CACHE_MAX_BYTES`]. Existing entries that push
+    /// the cache over the new budget are evicted in LRU order; a
+    /// single most-recently-used cluster larger than the budget is
+    /// kept pinned to avoid permanent misses.
+    pub fn set_cluster_cache_max_bytes(&self, max_bytes: usize) {
+        self.core
+            .cluster_cache
+            .lock()
+            .unwrap()
+            .resize(max_bytes);
+    }
+
+    /// Current cluster-cache byte budget. See
+    /// [`Archive::set_cluster_cache_max_bytes`].
+    pub fn cluster_cache_max_bytes(&self) -> usize {
+        self.core.cluster_cache.lock().unwrap().max_bytes()
+    }
+}
+
+/// Parse a `Illustration_<W>x<H>@<scale>` metadata key into its
+/// `(width, height, scale)` components. Returns `None` if the key
+/// doesn't match the pattern or any of the dimensions fail to parse
+/// as a `u32`.
+fn parse_illustration_key(name: &str) -> Option<(u32, u32, u32)> {
+    let rest = name.strip_prefix("Illustration_")?;
+    let (dims, scale) = rest.split_once('@')?;
+    let (w, h) = dims.split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?, scale.parse().ok()?))
 }
 
 fn split_legacy_path(path: &str) -> Option<(u8, &str)> {
@@ -1024,6 +1212,14 @@ impl Item {
 
     pub fn title(&self) -> &str {
         &self.article.title
+    }
+
+    /// Single-byte namespace this item belongs to (e.g. `b'C'`, `b'A'`).
+    /// On items reached via redirect-following lookups this is the
+    /// resolved entry's namespace, which may differ from the source
+    /// entry's namespace on legacy cross-namespace redirects.
+    pub fn namespace(&self) -> u8 {
+        self.article.namespace
     }
 
     pub fn mimetype(&self) -> &str {

@@ -209,6 +209,15 @@ fn cmd_readall(args: &[String]) -> Result<(), Error> {
         }
     }
     let arc = Archive::open(path)?;
+    // `readall` walks every entry in URL order, but adjacent entries
+    // are not always packed into the same cluster — on real wiki ZIMs
+    // the cluster index can interleave across the URL space. Bumping
+    // the cluster cache budget high enough to hold the whole archive
+    // resident eliminates re-decompression. Memory cost is the sum of
+    // decompressed cluster sizes, which a "read every entry once" tool
+    // can afford to spend on the dev box; library users keep the much
+    // smaller phone-friendly default.
+    arc.set_cluster_cache_max_bytes(usize::MAX);
     let n = arc.entry_count();
     let start = std::time::Instant::now();
     let mut articles = 0u64;

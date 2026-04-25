@@ -54,6 +54,17 @@
  */
 #define NS_ARTICLES_LEGACY 65
 
+/**
+ * Default cluster-cache byte budget (sum of decompressed payload bytes
+ * held resident at most). Sized for phone-class hosts: 64 MB is enough
+ * to keep ~30 typical 2 MB clusters cached for hot-article reuse, but
+ * won't dominate a 4 GB-RAM device. Override per-archive with
+ * [`Archive::set_cluster_cache_max_bytes`] — bulk-iteration tools that
+ * pass over the whole archive once can size up; memory-constrained
+ * embedded callers can size down.
+ */
+#define DEFAULT_CLUSTER_CACHE_MAX_BYTES ((64 * 1024) * 1024)
+
 #define MIME_REDIRECT 65535
 
 #define MIME_LINKTARGET 65534
@@ -112,6 +123,18 @@ typedef struct zimru_error_t zimru_error_t;
  * accessors stays valid for the item's lifetime.
  */
 typedef struct zimru_item_t zimru_item_t;
+
+/**
+ * Cover / thumbnail descriptor returned by
+ * [`zimru_archive_illustrations`]. Mirrors libzim's
+ * `IllustrationInfo`: width and height in pixels, and a `scale`
+ * factor (typically 1 or 2 for HiDPI variants).
+ */
+typedef struct zimru_illustration_t {
+  uint32_t width;
+  uint32_t height;
+  uint32_t scale;
+} zimru_illustration_t;
 
 /**
  * Direct-access info for an item. POD struct populated by
@@ -259,6 +282,69 @@ struct zimru_entry_t *zimru_archive_get_entry_by_title(const struct zimru_archiv
  * `X/`, well-known under `W/`). Old archives put articles in `A/`.
  */
  bool zimru_archive_uses_new_namespaces(const struct zimru_archive_t *arc);
+
+/**
+ * True iff the archive was opened from a split `.zimaa`/`.zimab`/...
+ * part-set rather than a single `.zim` file. zimru does not yet
+ * implement multipart open, so this currently always returns `false`;
+ * the accessor exists so downstream tooling that branches on it
+ * (single- vs multi-URL download flows) can compile and run against
+ * zimru without conditionally compiling the call out.
+ */
+ bool zimru_archive_is_multipart(const struct zimru_archive_t *arc);
+
+/**
+ * Reconfigure the cluster-cache byte budget. The cache holds
+ * decompressed clusters; `max_bytes` caps the summed payload sizes
+ * resident at once. The default is conservative (~64 MB) so memory-
+ * constrained hosts (phones, embedded) don't pin hundreds of MB of
+ * decompressed cluster data; bulk-iteration tools can size up.
+ */
+
+void zimru_archive_set_cluster_cache_max_bytes(const struct zimru_archive_t *arc,
+                                               uintptr_t max_bytes);
+
+/**
+ * Current cluster-cache byte budget. Returns `0` on a NULL archive.
+ */
+ uintptr_t zimru_archive_cluster_cache_max_bytes(const struct zimru_archive_t *arc);
+
+/**
+ * Enumerate every illustration descriptor recorded in the archive's
+ * metadata. ZIM stores covers/thumbnails as
+ * `M/Illustration_<W>x<H>@<scale>` entries; this returns a heap-
+ * allocated array sorted ascending. Sets `*out_count` and returns the
+ * pointer; the caller frees with [`zimru_illustrations_free`]. On
+ * archives with no illustrations sets `*out_count = 0` and returns
+ * NULL (still safe to pass to free).
+ */
+
+struct zimru_illustration_t *zimru_archive_illustrations(const struct zimru_archive_t *arc,
+                                                         uintptr_t *out_count);
+
+/**
+ * Free an illustration array previously returned by
+ * [`zimru_archive_illustrations`]. `count` must match the value
+ * written into `*out_count`. Safe on a NULL pointer (no-op).
+ */
+ void zimru_illustrations_free(struct zimru_illustration_t *ptr, uintptr_t count);
+
+/**
+ * Half-open title-order range `[*out_lo, *out_hi)` of entries in
+ * namespace `ns` whose title starts with `prefix`. Returns `true` on
+ * success (including empty matches, where `*out_lo == *out_hi`),
+ * `false` with `*err` set on a parse failure. `prefix` is a
+ * NUL-terminated UTF-8 string. Designed to back
+ * `SuggestionSearcher` fallbacks; iterate the returned range and
+ * resolve each index with `zimru_archive_entry_by_title_index`.
+ */
+
+bool zimru_archive_title_prefix_range(const struct zimru_archive_t *arc,
+                                      uint8_t ns,
+                                      const char *prefix,
+                                      uint32_t *out_lo,
+                                      uint32_t *out_hi,
+                                      struct zimru_error_t **err);
 
 /**
  * Write the archive's trailing-MD5 checksum into `out` as a 32-byte
@@ -445,6 +531,15 @@ struct zimru_entry_t *zimru_entry_get_redirect_entry(const struct zimru_entry_t 
  * NUL-terminated MIME type. Lifetime tied to the item.
  */
  const char *zimru_item_mimetype(const struct zimru_item_t *it);
+
+/**
+ * Single-byte namespace of the resolved entry this item belongs to
+ * (e.g. `'C'`, `'A'`, `'I'`). On items obtained via redirect-following
+ * lookups this is the redirect *target's* namespace, which may differ
+ * from the source entry's namespace on legacy cross-namespace
+ * redirects. Returns `0` on a NULL item.
+ */
+ uint8_t zimru_item_namespace(const struct zimru_item_t *it);
 
 /**
  * Decompressed size of the item's data. Returns 0 with `*err` set if

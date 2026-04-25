@@ -158,7 +158,21 @@ fn decode_xz(body: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn decode_zstd(body: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(body.len() * 4);
+    // Fast path: when the frame header carries pledgedSrcSize (libzim and
+    // zimru's writer both set it on every cluster), `bulk::decompress`
+    // pre-allocates the exact output size and runs the whole
+    // decompression in libzstd's tight inner loop with no streaming-
+    // reader hop. This is the dominant case for real ZIMs and is what
+    // makes the difference on zstd22 clusters.
+    //
+    // Slow path: streams without an FCS header (some hand-built test
+    // fixtures, or ZIMs from older writers) fall back to streaming with
+    // an 8× capacity guess, which grows transparently.
+    if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(body) {
+        return zstd::bulk::decompress(body, size as usize)
+            .map_err(|e| Error::Decompression(format!("zstd: {e}")));
+    }
+    let mut out = Vec::with_capacity(body.len().saturating_mul(8));
     let mut dec = zstd::stream::read::Decoder::new(body)
         .map_err(|e| Error::Decompression(format!("zstd init: {e}")))?;
     dec.read_to_end(&mut out)

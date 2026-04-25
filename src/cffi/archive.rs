@@ -310,6 +310,146 @@ pub unsafe extern "C" fn zimru_archive_uses_new_namespaces(arc: *const zimru_arc
     (*arc).inner.header().uses_new_namespaces()
 }
 
+/// True iff the archive was opened from a split `.zimaa`/`.zimab`/...
+/// part-set rather than a single `.zim` file. zimru does not yet
+/// implement multipart open, so this currently always returns `false`;
+/// the accessor exists so downstream tooling that branches on it
+/// (single- vs multi-URL download flows) can compile and run against
+/// zimru without conditionally compiling the call out.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_is_multipart(arc: *const zimru_archive_t) -> bool {
+    if arc.is_null() {
+        return false;
+    }
+    false
+}
+
+/// Reconfigure the cluster-cache byte budget. The cache holds
+/// decompressed clusters; `max_bytes` caps the summed payload sizes
+/// resident at once. The default is conservative (~64 MB) so memory-
+/// constrained hosts (phones, embedded) don't pin hundreds of MB of
+/// decompressed cluster data; bulk-iteration tools can size up.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_set_cluster_cache_max_bytes(
+    arc: *const zimru_archive_t,
+    max_bytes: usize,
+) {
+    if arc.is_null() {
+        return;
+    }
+    (*arc).inner.set_cluster_cache_max_bytes(max_bytes);
+}
+
+/// Current cluster-cache byte budget. Returns `0` on a NULL archive.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_cluster_cache_max_bytes(
+    arc: *const zimru_archive_t,
+) -> usize {
+    if arc.is_null() {
+        return 0;
+    }
+    (*arc).inner.cluster_cache_max_bytes()
+}
+
+/// Cover / thumbnail descriptor returned by
+/// [`zimru_archive_illustrations`]. Mirrors libzim's
+/// `IllustrationInfo`: width and height in pixels, and a `scale`
+/// factor (typically 1 or 2 for HiDPI variants).
+#[repr(C)]
+pub struct zimru_illustration_t {
+    pub width: u32,
+    pub height: u32,
+    pub scale: u32,
+}
+
+/// Enumerate every illustration descriptor recorded in the archive's
+/// metadata. ZIM stores covers/thumbnails as
+/// `M/Illustration_<W>x<H>@<scale>` entries; this returns a heap-
+/// allocated array sorted ascending. Sets `*out_count` and returns the
+/// pointer; the caller frees with [`zimru_illustrations_free`]. On
+/// archives with no illustrations sets `*out_count = 0` and returns
+/// NULL (still safe to pass to free).
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_illustrations(
+    arc: *const zimru_archive_t,
+    out_count: *mut usize,
+) -> *mut zimru_illustration_t {
+    if arc.is_null() || out_count.is_null() {
+        return std::ptr::null_mut();
+    }
+    let triples = (*arc).inner.illustrations();
+    *out_count = triples.len();
+    if triples.is_empty() {
+        return std::ptr::null_mut();
+    }
+    let mut boxed: Vec<zimru_illustration_t> = triples
+        .into_iter()
+        .map(|(width, height, scale)| zimru_illustration_t {
+            width,
+            height,
+            scale,
+        })
+        .collect();
+    boxed.shrink_to_fit();
+    let ptr = boxed.as_mut_ptr();
+    // Capacity == length (post-shrink_to_fit), so the matching free
+    // can reconstruct the Vec from `(ptr, count, count)`.
+    std::mem::forget(boxed);
+    ptr
+}
+
+/// Free an illustration array previously returned by
+/// [`zimru_archive_illustrations`]. `count` must match the value
+/// written into `*out_count`. Safe on a NULL pointer (no-op).
+#[no_mangle]
+pub unsafe extern "C" fn zimru_illustrations_free(
+    ptr: *mut zimru_illustration_t,
+    count: usize,
+) {
+    if !ptr.is_null() && count > 0 {
+        drop(Vec::from_raw_parts(ptr, count, count));
+    }
+}
+
+/// Half-open title-order range `[*out_lo, *out_hi)` of entries in
+/// namespace `ns` whose title starts with `prefix`. Returns `true` on
+/// success (including empty matches, where `*out_lo == *out_hi`),
+/// `false` with `*err` set on a parse failure. `prefix` is a
+/// NUL-terminated UTF-8 string. Designed to back
+/// `SuggestionSearcher` fallbacks; iterate the returned range and
+/// resolve each index with `zimru_archive_entry_by_title_index`.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_title_prefix_range(
+    arc: *const zimru_archive_t,
+    ns: u8,
+    prefix: *const c_char,
+    out_lo: *mut u32,
+    out_hi: *mut u32,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if arc.is_null() || prefix.is_null() || out_lo.is_null() || out_hi.is_null() {
+        return false;
+    }
+    let prefix_str = match CStr::from_ptr(prefix).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_err(err, crate::Error::BadUtf8(0));
+            return false;
+        }
+    };
+    match (*arc).inner.title_prefix_range(ns, prefix_str) {
+        Ok(range) => {
+            *out_lo = range.start;
+            *out_hi = range.end;
+            true
+        }
+        Err(e) => {
+            set_err(err, e);
+            false
+        }
+    }
+}
+
 /// Write the archive's trailing-MD5 checksum into `out` as a 32-byte
 /// lowercase hex string (no NUL terminator, no hyphens). Returns
 /// `false` with `*err` set if the archive has no checksum or the read

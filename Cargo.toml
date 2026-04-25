@@ -75,11 +75,18 @@ xz2 = "0.1"
 md-5 = { version = "0.10", features = ["asm"] }
 rayon = "1"
 thiserror = "2"
+lru = "0.12"
 
 [dev-dependencies]
 hex = "0.4"
 md-5 = { version = "0.10", features = ["asm"] }
 zstd = { version = "0.13", default-features = false }
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+[[bench]]
+name = "get_entry_by_path"
+harness = false
+required-features = []
 
 [build-dependencies]
 # Used only when the `cffi` feature is enabled (build.rs gates on the

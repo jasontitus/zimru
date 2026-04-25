@@ -124,6 +124,42 @@ impl Dirent {
         }
     }
 
+    /// Cheap key extraction for binary-search probes: read just the
+    /// `(namespace, url)` of the dirent at `off` without allocating. The
+    /// returned `&str` borrows from `buf`. Hot-path equivalent of
+    /// [`Dirent::parse`] — that fully materializes the dirent and pays
+    /// two `String` allocations per call (url + title), which is the
+    /// bulk of the `~1.2 µs/op` `entry_by_ns_path` cost on a 17 K-entry
+    /// archive (14-probe binary search → 28 String allocs per lookup).
+    pub fn key_at(buf: &[u8], off: usize) -> Result<(u8, &str)> {
+        let mimetype = raw::u16_at(buf, off)?;
+        let namespace = raw::u8_at(buf, off + 3)?;
+        let url_off = if mimetype == MIME_REDIRECT {
+            off + 12
+        } else {
+            off + 16
+        };
+        let (url, _) = raw::cstr_at(buf, url_off)?;
+        Ok((namespace, url))
+    }
+
+    /// Cheap title extraction for binary-search probes — returns
+    /// `(namespace, title)` borrowed from `buf`. Title falls back to
+    /// `url` when the dirent's title field is empty (matching
+    /// [`Dirent::parse`]'s behaviour).
+    pub fn title_key_at(buf: &[u8], off: usize) -> Result<(u8, &str)> {
+        let mimetype = raw::u16_at(buf, off)?;
+        let namespace = raw::u8_at(buf, off + 3)?;
+        let url_off = if mimetype == MIME_REDIRECT {
+            off + 12
+        } else {
+            off + 16
+        };
+        let (url, after_url) = raw::cstr_at(buf, url_off)?;
+        let (title, _) = raw::cstr_at(buf, after_url)?;
+        Ok((namespace, if title.is_empty() { url } else { title }))
+    }
+
     pub fn url(&self) -> &str {
         match self {
             Dirent::Article(a) => &a.url,

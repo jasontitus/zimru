@@ -54,6 +54,19 @@ pub unsafe extern "C" fn zimru_item_mimetype(it: *const zimru_item_t) -> *const 
     (*it).mimetype.as_ptr()
 }
 
+/// Single-byte namespace of the resolved entry this item belongs to
+/// (e.g. `'C'`, `'A'`, `'I'`). On items obtained via redirect-following
+/// lookups this is the redirect *target's* namespace, which may differ
+/// from the source entry's namespace on legacy cross-namespace
+/// redirects. Returns `0` on a NULL item.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_item_namespace(it: *const zimru_item_t) -> u8 {
+    if it.is_null() {
+        return 0;
+    }
+    (*it).inner.namespace()
+}
+
 /// Decompressed size of the item's data. Returns 0 with `*err` set if
 /// the cluster cannot be decoded.
 #[no_mangle]

@@ -440,6 +440,241 @@ fn lookup_returns_not_found() {
 }
 
 #[test]
+fn illustrations_enumerate_metadata_pattern() {
+    // M/Illustration_48x48@1 + M/Illustration_96x96@2 + an unrelated
+    // M/Title metadata key. The illustrations() helper must return
+    // sorted (w, h, scale) tuples for the first two and ignore Title.
+
+    let body_48 = b"\x89PNG48".to_vec();
+    let body_96 = b"\x89PNG96".to_vec();
+    let body_title = b"Test".to_vec();
+    let cluster = build_uncompressed_cluster(&[&body_48, &body_96, &body_title]);
+
+    // Dirents in (ns, url) order. All three are M/.
+    let dirents = vec![
+        Dir::Art(Article {
+            namespace: b'M',
+            url: "Illustration_48x48@1",
+            title: "Illustration_48x48@1",
+            mime: 0,
+            cluster: 0,
+            blob: 0,
+        }),
+        Dir::Art(Article {
+            namespace: b'M',
+            url: "Illustration_96x96@2",
+            title: "Illustration_96x96@2",
+            mime: 0,
+            cluster: 0,
+            blob: 1,
+        }),
+        Dir::Art(Article {
+            namespace: b'M',
+            url: "Title",
+            title: "Title",
+            mime: 1,
+            cluster: 0,
+            blob: 2,
+        }),
+    ];
+    let title_order = vec![0u32, 1, 2];
+    let zim = build_zim(
+        true,
+        None,
+        &dirents,
+        &title_order,
+        &[cluster],
+        &["image/png", "text/plain"],
+        true,
+    );
+    let path = write_temp("illustrations", &zim);
+    let arc = Archive::open(&path).unwrap();
+    assert_eq!(arc.illustrations(), vec![(48, 48, 1), (96, 96, 2)]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn title_prefix_range_brackets_matching_entries() {
+    // Build a content namespace with eight titles: Alpha, Apple, Apricot,
+    // Banana, Cherry, Coconut, Cranberry, Date. After title-order sort
+    // they collate the same. A prefix scan for "Ap" should land on
+    // [Apple, Apricot]; for "C" on [Cherry, Coconut, Cranberry];
+    // "Z" on the empty range; "" on the full set.
+
+    let bodies: Vec<&[u8]> = (0..8).map(|_| b"x" as &[u8]).collect();
+    let cluster = build_uncompressed_cluster(&bodies);
+
+    // Dirents ordered by (ns, url). Use url == lowercased title so
+    // url-order matches title-order for this fixture.
+    let titles_in_url_order = [
+        ("alpha", "Alpha"),
+        ("apple", "Apple"),
+        ("apricot", "Apricot"),
+        ("banana", "Banana"),
+        ("cherry", "Cherry"),
+        ("coconut", "Coconut"),
+        ("cranberry", "Cranberry"),
+        ("date", "Date"),
+    ];
+    let dirents: Vec<Dir> = titles_in_url_order
+        .iter()
+        .enumerate()
+        .map(|(i, (url, title))| {
+            Dir::Art(Article {
+                namespace: b'C',
+                url,
+                title,
+                mime: 0,
+                cluster: 0,
+                blob: i as u32,
+            })
+        })
+        .collect();
+
+    let title_order: Vec<u32> = (0..titles_in_url_order.len() as u32).collect();
+    let zim = build_zim(
+        true,
+        None,
+        &dirents,
+        &title_order,
+        &[cluster],
+        &["text/plain"],
+        true,
+    );
+    let path = write_temp("title_prefix_range", &zim);
+    let arc = Archive::open(&path).unwrap();
+
+    assert_eq!(arc.title_prefix_range(b'C', "Ap").unwrap(), 1u32..3);
+    assert_eq!(arc.title_prefix_range(b'C', "C").unwrap(), 4u32..7);
+    assert_eq!(arc.title_prefix_range(b'C', "Z").unwrap(), 8u32..8);
+    assert_eq!(arc.title_prefix_range(b'C', "").unwrap(), 0u32..8);
+    // Wrong namespace yields the empty range — modern archives' listing
+    // covers C only.
+    assert_eq!(arc.title_prefix_range(b'A', "A").unwrap(), 0u32..0);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn legacy_archive_media_count_includes_non_article_namespaces() {
+    // Regression for ZIMRU_GAPS.md G1: on legacy (uses_new_namespaces=false)
+    // archives the article/media walk must visit user content outside the
+    // `A/` namespace (`-/` for layout, `I/` for images, `J/` for image-text)
+    // and only exclude `M/` (metadata) and `X/` (search indexes). Counting
+    // just `A/` makes catalogs of legacy archives report `media_count=0`.
+
+    let mime_html = 0u16; // text/html
+    let mime_png = 1u16; // image/png
+    let mime_css = 2u16; // text/css
+    let mime_xapian = 3u16; // application/octet-stream
+    let mime_text = 4u16; // text/plain
+
+    let blob_css = b"body{}".to_vec();
+    let blob_page1 = b"<h1>1</h1>".to_vec();
+    let blob_page2 = b"<h1>2</h1>".to_vec();
+    let blob_png = b"\x89PNGstub".to_vec();
+    let blob_title = b"Test Legacy".to_vec();
+    let blob_idx = b"xapian-bytes".to_vec();
+
+    let cluster = build_uncompressed_cluster(&[
+        &blob_css,
+        &blob_page1,
+        &blob_page2,
+        &blob_png,
+        &blob_title,
+        &blob_idx,
+    ]);
+
+    // Dirents in (namespace, url) order — `-` (0x2D), `A`, `I`, `M`, `X`.
+    let dirents = vec![
+        Dir::Art(Article {
+            namespace: b'-',
+            url: "style.css",
+            title: "Style",
+            mime: mime_css,
+            cluster: 0,
+            blob: 0,
+        }),
+        Dir::Red(Redirect {
+            namespace: b'A',
+            url: "aredirect",
+            title: "ARedir",
+            target_url_index: 2,
+        }),
+        Dir::Art(Article {
+            namespace: b'A',
+            url: "page1",
+            title: "One",
+            mime: mime_html,
+            cluster: 0,
+            blob: 1,
+        }),
+        Dir::Art(Article {
+            namespace: b'A',
+            url: "page2",
+            title: "Two",
+            mime: mime_html,
+            cluster: 0,
+            blob: 2,
+        }),
+        Dir::Art(Article {
+            namespace: b'I',
+            url: "img.png",
+            title: "Image",
+            mime: mime_png,
+            cluster: 0,
+            blob: 3,
+        }),
+        Dir::Art(Article {
+            namespace: b'M',
+            url: "Title",
+            title: "Title",
+            mime: mime_text,
+            cluster: 0,
+            blob: 4,
+        }),
+        Dir::Art(Article {
+            namespace: b'X',
+            url: "idx",
+            title: "Idx",
+            mime: mime_xapian,
+            cluster: 0,
+            blob: 5,
+        }),
+    ];
+
+    // Title order (url-pointer indices sorted by (ns, title)).
+    let title_order = vec![0u32, 1, 2, 3, 4, 5, 6];
+
+    let zim = build_zim(
+        false,
+        None,
+        &dirents,
+        &title_order,
+        &[cluster],
+        &[
+            "text/html",
+            "image/png",
+            "text/css",
+            "application/octet-stream",
+            "text/plain",
+        ],
+        true,
+    );
+    let path = write_temp("legacy_media_count", &zim);
+    let arc = Archive::open(&path).unwrap();
+
+    assert!(!arc.header().uses_new_namespaces(), "legacy archive expected");
+    // Two text/html articles in `A/` (not counting the redirect).
+    assert_eq!(arc.article_count().unwrap(), 2);
+    // Two media items: `-/style.css` and `I/img.png`. The `M/Title` and
+    // `X/idx` entries must be excluded, the redirect must be skipped.
+    assert_eq!(arc.media_count().unwrap(), 2);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn detects_corrupted_checksum() {
     let cluster = build_uncompressed_cluster(&[b"hi"]);
     let dirents = vec![Dir::Art(Article {
