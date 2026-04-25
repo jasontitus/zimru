@@ -18,7 +18,15 @@ if [[ ! -f "$ZIM" ]]; then
     echo "ZIM file not found: $ZIM" >&2
     exit 1
 fi
-SIZE_BYTES=$(stat -c%s "$ZIM")
+# Portable file size: GNU stat (-c%s) on Linux / coreutils-on-Mac, BSD stat
+# (-f%z) on stock macOS.
+file_size() {
+    if command -v gstat >/dev/null 2>&1; then gstat -c%s "$1"
+    elif stat -c%s "$1" >/dev/null 2>&1; then stat -c%s "$1"
+    else stat -f%z "$1"
+    fi
+}
+SIZE_BYTES=$(file_size "$ZIM")
 SIZE_HUMAN=$(numfmt --to=iec --suffix=B "$SIZE_BYTES")
 echo "ZIM: $ZIM ($SIZE_HUMAN)"
 echo
@@ -75,7 +83,8 @@ echo
 # 5. Header inspection (cold call)
 # -------------------------------------------------------------------
 echo "## 5. zimdump info"
-hyperfine --warmup 2 --runs 10 --export-markdown bench/results-info.md \
+# --shell=none avoids shell-startup variance dominating the sub-5ms zimru run.
+hyperfine --shell=none --warmup 2 --runs 10 --export-markdown bench/results-info.md \
     -n "zimru zimdump info" "$ZIMRU_DUMP info $ZIM" \
     -n "upstream zimdump info" "$UP_DUMP info $ZIM"
 echo

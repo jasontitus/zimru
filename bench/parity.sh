@@ -18,12 +18,17 @@ mkdir -p "$OUT_UP" "$OUT_US"
 [[ -f "$ZIM" ]] || { echo "zim not found: $ZIM" >&2; exit 1; }
 [[ -d "$UPSTREAM_DIR" ]] || { echo "upstream tools not found: $UPSTREAM_DIR" >&2; exit 1; }
 
+# Prefer GNU sed when available — materially faster than macOS BSD sed on
+# the multi-GB outputs `zimdump show` and `zimcheck -A` produce on real ZIMs.
+SED="sed"
+command -v gsed >/dev/null 2>&1 && SED="gsed"
+
 cargo build --release --quiet
 
 # Normalize differences that aren't substantive (version strings, "<3 seconds"
 # vs "1 seconds", trailing whitespace).
 normalize() {
-    sed -E \
+    "$SED" -E \
         -e 's/(Zimcheck version is) [0-9.]+/\1 X.Y.Z/' \
         -e 's/("zimcheck_version" : )"[0-9.]+"/\1"X.Y.Z"/' \
         -e 's/zim-tools [0-9.]+/zim-tools X.Y.Z/' \
@@ -61,11 +66,6 @@ strip_setlike_bodies() {
         skip && /^[[:space:]]*$/ { skip=0 }
         !skip { print }
     '
-}
-
-count_json_entries_of_check() {
-    local file="$1" check="$2"
-    grep -c "\"check\" : \"$check\"" "$file" 2>/dev/null | head -1
 }
 
 # Count the number of dangling-link triple-line blocks and redundant pairs;
@@ -111,6 +111,18 @@ add_case "zimcheck-redirect"       "$UPSTREAM_DIR/zimcheck -L '$ZIM'"           
 add_case "zimcheck-all"            "$UPSTREAM_DIR/zimcheck -A '$ZIM'"                "$OUR_DIR/zimcheck -A '$ZIM'"   structural
 add_case "zimcheck-all-json"       "$UPSTREAM_DIR/zimcheck -A -J '$ZIM'"             "$OUR_DIR/zimcheck -A -J '$ZIM'" structural
 
+# Stream raw output through normalize (and strip_setlike_bodies for structural
+# cases) into a sibling .norm file. Streaming to disk avoids the multi-GB
+# shell-variable round-trip the original used, which segfaults bash on
+# real-world ZIMs whose `zimdump show` output is ~GB-scale.
+build_normalized() {
+    local src="$1" mode="$2" dst="$3"
+    case "$mode" in
+        exact)      normalize < "$src" > "$dst" ;;
+        structural) normalize < "$src" | strip_setlike_bodies > "$dst" ;;
+    esac
+}
+
 passed=0
 failed=0
 printf "%-30s %-12s %s\n" "TEST" "STATUS" "DETAIL"
@@ -118,19 +130,13 @@ printf -- "------------------------------ ------------ -------------------------
 for label in "${LABELS[@]}"; do
     up_out="$OUT_UP/$label.txt"
     us_out="$OUT_US/$label.txt"
+    up_norm_f="$OUT_UP/$label.norm"
+    us_norm_f="$OUT_US/$label.norm"
     bash -c "${UP_CMD[$label]}" > "$up_out" 2>&1 || true
     bash -c "${US_CMD[$label]}" > "$us_out" 2>&1 || true
-    case "${MODE[$label]}" in
-        exact)
-            up_norm="$(normalize < "$up_out")"
-            us_norm="$(normalize < "$us_out")"
-            ;;
-        structural)
-            up_norm="$(normalize < "$up_out" | strip_setlike_bodies)"
-            us_norm="$(normalize < "$us_out" | strip_setlike_bodies)"
-            ;;
-    esac
-    if [[ "$up_norm" == "$us_norm" ]]; then
+    build_normalized "$up_out" "${MODE[$label]}" "$up_norm_f"
+    build_normalized "$us_out" "${MODE[$label]}" "$us_norm_f"
+    if cmp -s "$up_norm_f" "$us_norm_f"; then
         if [[ "${MODE[$label]}" == "structural" ]]; then
             up_dang=$(count_dangling "$up_out")
             us_dang=$(count_dangling "$us_out")
@@ -145,7 +151,7 @@ for label in "${LABELS[@]}"; do
         fi
         passed=$((passed+1))
     else
-        differ=$(diff <(echo "$up_norm") <(echo "$us_norm") | grep -c '^[<>]' || true)
+        differ=$(diff "$up_norm_f" "$us_norm_f" 2>/dev/null | grep -c '^[<>]' || true)
         printf "%-30s \033[31m%-12s\033[0m %d differing lines (see bench/parity-out)\n" "$label" "DIFF" "$differ"
         failed=$((failed+1))
     fi

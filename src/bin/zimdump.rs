@@ -198,6 +198,8 @@ fn cmd_info(args: &[String]) -> Result<ExitCode, Error> {
     if arc.entry_by_ns_path(b'M', "Illustration_48x48@1").is_ok() {
         println!("favicon: Illustration_48x48@1");
     }
+    // Upstream zimdump info ends with a trailing blank line.
+    println!();
     Ok(ExitCode::SUCCESS)
 }
 
