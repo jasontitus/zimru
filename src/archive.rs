@@ -453,36 +453,54 @@ impl Archive {
         Ok(self.article_and_media_counts()?.1)
     }
 
-    /// Pick a uniformly-random entry from the content namespace.
+    /// Pick a uniformly-random entry suitable for serving as a user URL.
     /// Pseudo-random, seeded from the system clock + process id; not
-    /// suitable for cryptographic use. Returns [`Error::EntryNotFound`]
-    /// if the content namespace is empty.
+    /// suitable for cryptographic use.
+    ///
+    /// On modern (new-namespace) archives all user content lives under
+    /// `C/`, so this picks uniformly from that range. On legacy archives
+    /// user content is spread across many namespaces (`A/I/J/-/B/H/U/V/W`
+    /// — Kiwix OSM builds put vector tile data under `I/`); this picks
+    /// uniformly from the whole entry space then rejects the metadata
+    /// (`M/`) and search-index (`X/`) namespaces, retrying until a
+    /// user-namespace entry is found. Probabilistic; converges in O(1)
+    /// expected probes because `M/X` are typically << 1 % of entries on
+    /// real archives.
+    ///
+    /// Returns [`Error::EntryNotFound`] when the archive is empty or
+    /// every entry is in a non-user namespace.
     pub fn random_content_entry(&self) -> Result<Entry> {
-        let ns = if self.core.header.uses_new_namespaces() {
-            NS_CONTENT_NEW
-        } else {
-            NS_ARTICLES_LEGACY
-        };
-        let range = self.namespace_range(ns)?;
-        if range.is_empty() {
+        let mut x = pseudo_random_seed();
+        if self.core.header.uses_new_namespaces() {
+            let range = self.namespace_range(NS_CONTENT_NEW)?;
+            if range.is_empty() {
+                return Err(Error::EntryNotFound);
+            }
+            let span = range.end - range.start;
+            let pick = range.start + (x % span as u64) as u32;
+            return self.entry_by_url_index(pick);
+        }
+        // Legacy: walk the full entry space, skip metadata and index
+        // namespaces. The mixer's avalanche means each retry probes a
+        // different bucket, so even on adversarial archives where M/X
+        // occupy a high fraction we converge in O(N) worst case.
+        let n = self.core.header.entry_count;
+        if n == 0 {
             return Err(Error::EntryNotFound);
         }
-        let span = range.end - range.start;
-        // Cheap PRNG seed: nanos + pid, hashed via xorshift mixer. Adequate
-        // for "give me a random article" — not for security.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let mut x = nanos.wrapping_mul(0x9E3779B97F4A7C15)
-            ^ (std::process::id() as u64).wrapping_mul(0xBF58476D1CE4E5B9);
-        x ^= x >> 30;
-        x = x.wrapping_mul(0xBF58476D1CE4E5B9);
-        x ^= x >> 27;
-        x = x.wrapping_mul(0x94D049BB133111EB);
-        x ^= x >> 31;
-        let pick = range.start + (x % span as u64) as u32;
-        self.entry_by_url_index(pick)
+        for _ in 0..n {
+            let pick = (x % n as u64) as u32;
+            let off = self.url_pointer(pick)? as usize;
+            let ns_byte = raw::u8_at(&self.core.mmap, off + 3)?;
+            if ns_byte != NS_METADATA && ns_byte != NS_INDEX {
+                return self.entry_by_url_index(pick);
+            }
+            // Advance the PRNG state for the next attempt.
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+            x ^= x >> 27;
+        }
+        Err(Error::EntryNotFound)
     }
 
     fn lower_bound_ns(&self, ns: u8, n: u32) -> Result<u32> {
@@ -1101,6 +1119,23 @@ impl Archive {
     pub fn cluster_cache_stats(&self) -> ClusterCacheStats {
         self.core.cluster_cache.lock().unwrap().snapshot()
     }
+}
+
+/// Cheap PRNG seed: nanoseconds + pid run through SplitMix64's mixer.
+/// Adequate for "give me a random article" — not for security.
+fn pseudo_random_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut x = nanos.wrapping_mul(0x9E3779B97F4A7C15)
+        ^ (std::process::id() as u64).wrapping_mul(0xBF58476D1CE4E5B9);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58476D1CE4E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D049BB133111EB);
+    x ^= x >> 31;
+    x
 }
 
 /// Parse a `Illustration_<W>x<H>@<scale>` metadata key into its

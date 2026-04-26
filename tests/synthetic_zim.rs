@@ -618,6 +618,89 @@ fn title_prefix_range_brackets_matching_entries() {
 }
 
 #[test]
+fn legacy_random_entry_walks_non_article_namespaces() {
+    // OSM-style legacy archive: user content lives only under `I/`
+    // (image/tile namespace). The previous random_content_entry impl
+    // looked at `A/` only and would return EntryNotFound on this
+    // shape — exactly the symptom the shim observed on
+    // osm-west-asia-v3.zim. After G6 random must reach the I/J/-
+    // namespaces (and skip M/X) so /random returns 302, not 404.
+
+    let cluster = build_uncompressed_cluster(&[b"tile-a", b"tile-b", b"tile-c", b"meta", b"idx"]);
+    let dirents = vec![
+        Dir::Art(Article {
+            namespace: b'I',
+            url: "tile-a.pbf",
+            title: "tile-a",
+            mime: 0,
+            cluster: 0,
+            blob: 0,
+        }),
+        Dir::Art(Article {
+            namespace: b'I',
+            url: "tile-b.pbf",
+            title: "tile-b",
+            mime: 0,
+            cluster: 0,
+            blob: 1,
+        }),
+        Dir::Art(Article {
+            namespace: b'I',
+            url: "tile-c.pbf",
+            title: "tile-c",
+            mime: 0,
+            cluster: 0,
+            blob: 2,
+        }),
+        Dir::Art(Article {
+            namespace: b'M',
+            url: "Title",
+            title: "Title",
+            mime: 1,
+            cluster: 0,
+            blob: 3,
+        }),
+        Dir::Art(Article {
+            namespace: b'X',
+            url: "fulltextIndex/xapian",
+            title: "fulltextIndex/xapian",
+            mime: 1,
+            cluster: 0,
+            blob: 4,
+        }),
+    ];
+    let title_order = vec![0u32, 1, 2, 3, 4];
+    let zim = build_zim(
+        false,
+        None,
+        &dirents,
+        &title_order,
+        &[cluster],
+        &["application/x-protobuf", "text/plain"],
+        true,
+    );
+    let path = write_temp("legacy_random", &zim);
+    let arc = Archive::open(&path).unwrap();
+
+    // Pick many times — each pick must land in `I/` (the only user
+    // namespace), never in `M/` or `X/`. A handful of picks would be
+    // enough; 50 keeps the failure mode obvious without slowing the
+    // suite.
+    for _ in 0..50 {
+        let entry = arc.random_content_entry().unwrap();
+        let ns = entry.namespace();
+        assert!(
+            ns != b'M' && ns != b'X',
+            "random returned non-user namespace {}",
+            ns as char
+        );
+        assert_eq!(ns, b'I');
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn legacy_archive_media_count_includes_non_article_namespaces() {
     // Regression for ZIMRU_GAPS.md G1: on legacy (uses_new_namespaces=false)
     // archives the article/media walk must visit user content outside the
