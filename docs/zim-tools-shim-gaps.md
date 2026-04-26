@@ -3,15 +3,15 @@
 The `libzim-shim` repo (separate, GPL) presents a libzim-shaped
 C++ API on top of zimru's C ABI. It is currently good enough for
 `libkiwix` / `kiwix-tools` / `kiwix-serve` to build and run end-
-to-end. It is **not** good enough for the `zim-tools` 3.6.0
+to-end. It is **not yet** good enough for the `zim-tools` 3.6.0
 binary suite (`zimcheck` / `zimdump` / `zimsplit` / `zimrecreate`
 / `zimwriterfs` / `zimsearch` / `zimbench` / `zimdiff` /
 `zimpatch`) — those tools call methods on the C++ surface that
-do not currently route through to zimru.
+need to route through to zimru.
 
-When the gap below is closed, all 9 zim-tools binaries should
-build cleanly against the shim and pass head-to-head runs against
-the real libzim.
+This doc tracks the gap for that suite. zimru exposes the
+underlying primitives; the libzim-shim repo wires them into C++
+methods named to match libzim's API.
 
 ## How to scope this work
 
@@ -65,17 +65,91 @@ opt in to them deliberately.
 Don't duplicate. Existing primitives an implementer may find
 useful:
 
-- `zimru_archive_cluster_count` — total cluster count
+- `zimru_archive_cluster_count` — total cluster count (covers
+  `getClusterCount`)
 - `zimru_archive_get_entry_by_ns_path(arc, ns, url, err)` —
-  namespace + path lookup
+  namespace + path lookup (covers `getEntryByPathWithNamespace`)
 - `zimru_archive_entry_by_url_index(arc, idx, err)` — by-index
 - `zimru_archive_entry_by_title_index(arc, idx, err)` — by-title-
   index
 - `zimru_archive_main_entry(arc, err)` + `zimru_entry_index(e)` —
-  may be enough to compose certain main-entry-index needs without
-  a new primitive
+  also see the new `zimru_archive_main_entry_index` below
 - `zimru_item_direct_access` — file offset / size for items in
   uncompressed clusters
+- `zimru_archive_illustrations` + `zimru_archive_illustrations`
+  → `zimru_illustration_t[]` — cover/thumbnail descriptors. The
+  shim wraps this into `getIllustrationItem(width)` /
+  `hasIllustration(width)`; libzim's overloads carry default
+  args (`scale=1`), so the shim's C++ wrappers must declare the
+  defaults explicitly to match the call sites in
+  `zimrecreate.cpp:123` and `zimdump.cpp:147`.
+
+## What's now in `zimru.h` for this batch
+
+Added in this round, mapping one-for-one to the build-error list
+above:
+
+- `zimru_archive_main_entry_index(arc) -> uint32_t` —
+  URL-pointer index of the archive's main entry, or
+  `NO_MAIN_PAGE` (0xFFFFFFFF) when none. Covers libzim's
+  `Archive::getMainEntryIndex` (`zimcheck/checks.cpp:283`).
+  Cheaper than `zimru_archive_main_entry + zimru_entry_index`
+  because it skips the dirent parse and the entry handle alloc.
+- `zimru_archive_cluster_offset(arc, idx, err) -> uint64_t` —
+  absolute on-disk byte offset where cluster `idx` begins
+  (the cluster's leading info-byte). Covers libzim's
+  `Archive::getClusterOffset` (`zimsplit.cpp:118`,
+  `zimdump.cpp:134`).
+- `zimru_item_cluster_index(it) -> uint32_t` — cluster index
+  for an item. Covers libzim's `Item::getClusterIndex`
+  (`zimcheck/checks.cpp:97`).
+- `zimru_item_blob_index(it) -> uint32_t` — blob index within
+  the item's cluster. Covers libzim's `Item::getBlobIndex`
+  (`zimcheck/checks.cpp:97`).
+- `zimru_archive_check_dirent_ptrs(arc, err) -> bool`
+- `zimru_archive_check_dirent_order(arc, err) -> bool`
+- `zimru_archive_check_title_index(arc, err) -> bool`
+- `zimru_archive_check_cluster_ptrs(arc, err) -> bool`
+- `zimru_archive_check_mimetypes(arc, err) -> bool` — five
+  fine-grained structural checks. Together with the existing
+  `zimru_archive_check` (MD5 verify), they let the shim
+  re-implement libzim's `IntegrityCheckList` /
+  `zim::validate(path, list)`
+  (`zimcheck/checks.cpp:245-247`) by composition: build a
+  bit-set on the C++ side, run the per-check primitive for
+  each enabled bit, AND the results. Each primitive returns
+  `true` on a clean archive, `false` on a structural defect,
+  and `false`-with-`*err`-set when the read itself fails.
+
+## Shim-side wiring sketch
+
+For the integrity-check aggregator, a sketch on the shim side
+(pseudocode, not a real header):
+
+```cpp
+namespace zim {
+enum class IntegrityCheck { CHECKSUM, DIRENT_PTRS, DIRENT_ORDER,
+                            TITLE_INDEX, CLUSTER_PTRS,
+                            DIRENT_MIMETYPES, COUNT };
+class IntegrityCheckList { /* bitset over IntegrityCheck */ };
+bool validate(const std::string& path, IntegrityCheckList list) {
+    auto* a = zimru_archive_open(path.c_str(), &err);
+    bool ok = true;
+    if (list.test(IntegrityCheck::CHECKSUM))
+        ok &= zimru_archive_check(a, &err);
+    if (list.test(IntegrityCheck::DIRENT_PTRS))
+        ok &= zimru_archive_check_dirent_ptrs(a, &err);
+    /* … one branch per check kind … */
+    zimru_archive_close(a);
+    return ok;
+}
+}
+```
+
+For `getMainEntryIndex` / `getClusterOffset` /
+`Item::getClusterIndex` / `Item::getBlobIndex` the wrapping is
+a one-liner — just call the matching `zimru_*` primitive and
+return the result.
 
 ## Tests to add alongside any new primitive
 
@@ -91,6 +165,11 @@ For each primitive added:
    corrupt the relevant byte region, reopen, assert the primitive
    reports the defect.
 
+This batch of additions is covered by `tests/integrity_checks.rs`
+(round-trip + corruption tests for every new primitive) and
+extensions to `tests/cffi_smoke.{c,cpp}` (C and C++ link/call
+smoke through the regenerated header).
+
 The shim repo carries its own smoke + parity tests for the C++
 wrappers; those are in scope of the shim repo's CI, not zimru's.
 
@@ -103,7 +182,10 @@ wrappers; those are in scope of the shim repo's CI, not zimru's.
 - The libzim-shim wiring itself.
 - Aggregate "validate the whole archive" entry points that
   could just as easily be composed by the caller from finer-
-  grained primitives.
+  grained primitives — see the
+  `zimru_archive_check_*` set above for the granular surface
+  the shim composes into libzim's `IntegrityCheckList` /
+  `validate()` shape.
 
 ## Companion benchmark doc
 

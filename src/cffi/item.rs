@@ -68,6 +68,32 @@ pub unsafe extern "C" fn zimru_item_namespace(it: *const zimru_item_t) -> u8 {
     (*it).inner.namespace()
 }
 
+/// Cluster index this item's bytes live in. Combine with
+/// [`zimru_archive_cluster_offset`] to find where the cluster starts
+/// in the file, or with [`zimru_item_blob_index`] +
+/// [`zimru_item_direct_access`] to address the blob within the
+/// cluster. Returns `0` on a NULL item — callers that care must not
+/// call this without a non-NULL `it`.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_item_cluster_index(it: *const zimru_item_t) -> u32 {
+    if it.is_null() {
+        return 0;
+    }
+    (*it).inner.cluster_index()
+}
+
+/// Blob index within the item's cluster. Together with
+/// [`zimru_item_cluster_index`] this is the `(cluster, blob)` pair
+/// `zimcheck` and similar tools use to talk about an item's physical
+/// position. Returns `0` on a NULL item.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_item_blob_index(it: *const zimru_item_t) -> u32 {
+    if it.is_null() {
+        return 0;
+    }
+    (*it).inner.blob_index()
+}
+
 /// Decompressed size of the item's data. Returns 0 with `*err` set if
 /// the cluster cannot be decoded.
 #[no_mangle]

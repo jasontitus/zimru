@@ -167,6 +167,69 @@ int main(int argc, char **argv) {
     fprintf(stderr, "random entry path: %s\n", zimru_entry_path(rnd));
     zimru_entry_free(rnd);
 
+    /* Newly added shim primitives: main_entry_index, cluster_offset,
+     * item_cluster_index / item_blob_index, and the structural
+     * integrity checks. Spot-check that they all return sensible
+     * values on this clean fixture. */
+    uint32_t mei = zimru_archive_main_entry_index(a);
+    if (mei == 0xFFFFFFFFu) {
+        DIE("main_entry_index returned NO_MAIN_PAGE on archive with main entry");
+    }
+    fprintf(stderr, "main_entry_index: %u\n", mei);
+
+    zimru_error_t *co_err = NULL;
+    uint64_t coff = zimru_archive_cluster_offset(a, 0, &co_err);
+    if (co_err) {
+        DIE("cluster_offset(0): %s", zimru_error_message(co_err));
+    }
+    if (coff == 0 || coff >= fsz) {
+        DIE("cluster_offset(0) out of range: %llu (file size %llu)",
+            (unsigned long long)coff, (unsigned long long)fsz);
+    }
+
+    /* Re-open "home" briefly to exercise item_cluster_index /
+     * item_blob_index. */
+    zimru_error_t *ie_err = NULL;
+    zimru_entry_t *he = zimru_archive_get_entry_by_path(a, "home", &ie_err);
+    if (!he) {
+        DIE("re-lookup home: %s", ie_err ? zimru_error_message(ie_err) : "?");
+    }
+    zimru_item_t *hi = zimru_entry_get_item(he, true, &ie_err);
+    if (!hi) {
+        DIE("re-get_item home: %s", ie_err ? zimru_error_message(ie_err) : "?");
+    }
+    uint32_t ci = zimru_item_cluster_index(hi);
+    uint32_t bi = zimru_item_blob_index(hi);
+    if (ci >= cluster_count) {
+        DIE("item_cluster_index %u out of range (count %u)", ci, cluster_count);
+    }
+    fprintf(stderr, "home cluster=%u blob=%u\n", ci, bi);
+    zimru_item_free(hi);
+    zimru_entry_free(he);
+
+    /* Each integrity primitive should pass on a clean fixture. */
+    zimru_error_t *chk_err = NULL;
+    if (!zimru_archive_check_dirent_ptrs(a, &chk_err)) {
+        DIE("check_dirent_ptrs failed on clean fixture: %s",
+            chk_err ? zimru_error_message(chk_err) : "false");
+    }
+    if (!zimru_archive_check_dirent_order(a, &chk_err)) {
+        DIE("check_dirent_order failed on clean fixture: %s",
+            chk_err ? zimru_error_message(chk_err) : "false");
+    }
+    if (!zimru_archive_check_title_index(a, &chk_err)) {
+        DIE("check_title_index failed on clean fixture: %s",
+            chk_err ? zimru_error_message(chk_err) : "false");
+    }
+    if (!zimru_archive_check_cluster_ptrs(a, &chk_err)) {
+        DIE("check_cluster_ptrs failed on clean fixture: %s",
+            chk_err ? zimru_error_message(chk_err) : "false");
+    }
+    if (!zimru_archive_check_mimetypes(a, &chk_err)) {
+        DIE("check_mimetypes failed on clean fixture: %s",
+            chk_err ? zimru_error_message(chk_err) : "false");
+    }
+
     /* Stable seed → UUID. Same seed twice == identical bytes. */
     uint8_t u1[16] = {0}, u2[16] = {0};
     zimru_uuid_generate((const uint8_t *)"seed", 4, u1);
