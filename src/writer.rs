@@ -37,6 +37,13 @@ use crate::header::{HEADER_SIZE, MAGIC};
 /// (2 MiB — same as libzim's zimwriterfs default).
 pub const DEFAULT_CLUSTER_SIZE_TARGET: usize = 2 * 1024 * 1024;
 
+/// Default mimetype recorded for [`Creator::add_metadata`] entries when
+/// the caller does not specify one. Most ZIM metadata keys are short
+/// UTF-8 strings (Title, Language, Description, …); the explicit-mime
+/// variant [`Creator::add_metadata_with_mimetype`] is for the handful
+/// that aren't (e.g. the per-favicon PNG metadata used by old archives).
+pub const DEFAULT_METADATA_MIMETYPE: &str = "text/plain;charset=utf-8";
+
 /// A content item to add to the archive.
 #[derive(Debug, Clone)]
 pub struct Item {
@@ -91,11 +98,21 @@ pub struct Redirection {
     pub target_path: String,
 }
 
+/// One metadata entry buffered by [`Creator`]. Carries a per-entry mimetype
+/// so non-text metadata (PNG favicons on legacy archives, etc.) round-trips
+/// faithfully — the historical default is [`DEFAULT_METADATA_MIMETYPE`].
+#[derive(Debug, Clone)]
+pub struct MetadataEntry {
+    pub name: String,
+    pub mimetype: String,
+    pub value: Vec<u8>,
+}
+
 /// High-level ZIM file builder.
 pub struct Creator {
     items: Vec<Item>,
     redirections: Vec<Redirection>,
-    metadata: Vec<(String, Vec<u8>)>,
+    metadata: Vec<MetadataEntry>,
     illustrations: Vec<(u32, Vec<u8>)>,
     main_path: Option<String>,
     compression: Compression,
@@ -144,13 +161,32 @@ impl Creator {
         self
     }
 
-    /// Metadata entry, stored in the `M` namespace.
+    /// Metadata entry, stored in the `M` namespace. The recorded mimetype
+    /// is [`DEFAULT_METADATA_MIMETYPE`] (`text/plain;charset=utf-8`) — for
+    /// non-text metadata (PNG favicons on legacy archives, etc.) call
+    /// [`Creator::add_metadata_with_mimetype`] instead.
     pub fn add_metadata(
         &mut self,
         name: impl Into<String>,
         value: impl Into<Vec<u8>>,
     ) -> &mut Self {
-        self.metadata.push((name.into(), value.into()));
+        self.add_metadata_with_mimetype(name, DEFAULT_METADATA_MIMETYPE, value)
+    }
+
+    /// Metadata entry with an explicit mimetype. The mimetype is stored
+    /// verbatim in the dirent's mimetype index — callers are responsible
+    /// for choosing a value that downstream readers will recognise.
+    pub fn add_metadata_with_mimetype(
+        &mut self,
+        name: impl Into<String>,
+        mimetype: impl Into<String>,
+        value: impl Into<Vec<u8>>,
+    ) -> &mut Self {
+        self.metadata.push(MetadataEntry {
+            name: name.into(),
+            mimetype: mimetype.into(),
+            value: value.into(),
+        });
         self
     }
 
@@ -291,13 +327,13 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
             content: it.content,
         });
     }
-    for (name, value) in metadata {
+    for m in metadata {
         payloads.push(Payload {
             namespace: b'M',
-            url: name.clone(),
-            title: name,
-            mimetype: "text/plain;charset=utf-8".to_string(),
-            content: value,
+            url: m.name.clone(),
+            title: m.name,
+            mimetype: m.mimetype,
+            content: m.value,
         });
     }
     for (side, png) in illustrations {

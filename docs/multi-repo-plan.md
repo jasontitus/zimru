@@ -112,13 +112,19 @@ Could also live inside zimru as a feature flag. Decide later — see
 
 Before libzim-shim work can start in earnest, zimru needs to ship:
 
-### P1. Stable C ABI (blocker) — first cut LANDED
+### P1. Stable C ABI (blocker) — reader + writer LANDED
 
-Initial C ABI shipped in commit on branch
-`claude/review-libzim-issues-SGsq0`. Reader surface is end-to-end
-testable; writer surface is a stub (placeholder `zimru_creator_t`)
-pending a follow-up. See [tracking issue #7][i7] and the smoke test
-harness at `tests/cffi_smoke.{c,rs}`.
+Reader-side C ABI shipped first (branch
+`claude/review-libzim-issues-SGsq0`); writer-side C ABI shipped on
+branch `claude/libzim-shim-work-d3Rh4`. The writer surface mirrors
+what the libzim-shim's `src/writer/creator.cpp` wrapper expects from
+`docs/SHIM_WORK.md` (writer-side gap section), which is what unblocks
+the four `zim-tools` writer-side binaries (`zimrecreate`,
+`zimwriterfs`, `zimdiff`, `zimpatch`) building through the shim.
+
+See [tracking issue #7][i7]. Reader smoke harness at
+`tests/cffi_smoke.{c,rs}`; writer smoke harness at
+`tests/cffi_writer_smoke.{c,rs}`.
 
 [i7]: https://github.com/jasontitus/zimru/issues/7
 
@@ -140,10 +146,15 @@ harness at `tests/cffi_smoke.{c,rs}`.
 
 #### What still needs to happen before the shim work can fully start
 
-- **Writer C ABI** — `zimru_creator_*` is currently a stub. Needs the
-  full surface (set_main_path / add_item / add_metadata /
-  add_redirection / add_illustration / set_compression / write_to).
-  Open as a follow-up issue.
+- ~~**Writer C ABI**~~ — landed. The full surface (`zimru_creator_new`
+  / `_free` / `_set_compression` / `_set_compression_level` /
+  `_set_cluster_size_target` / `_set_uuid` / `_set_main_path` /
+  `_add_item` / `_add_metadata` / `_add_illustration` /
+  `_add_redirection` / `_add_alias` / `_write_to`) is in `src/cffi/
+  creator.rs` with smoke coverage at `tests/cffi_writer_smoke.{c,rs}`.
+  One acknowledged gap: `zimru_creator_add_alias` is wired as a
+  redirection until the underlying writer grows true alias semantics
+  — the shim degrades gracefully here, per `docs/SHIM_WORK.md`.
 - **Cut zimru 0.2.0** — pin a published version the shim repo can
   declare as its `zimru = "0.2.0"` dependency.
 - **Header SOVERSION discipline** — decide before downstream apps link
