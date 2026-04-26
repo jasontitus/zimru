@@ -105,6 +105,115 @@ wrappers; those are in scope of the shim repo's CI, not zimru's.
   could just as easily be composed by the caller from finer-
   grained primitives.
 
+## Notes about zim-tools 3.6.0 itself
+
+Discovered while trying to build zim-tools against the shim. None
+of these depend on libzim source — they're properties of
+`zim-tools` and its build glue.
+
+### `zimbench`'s random-URL phase crashes
+
+`zimbench`'s second phase ("collect random urls") fails on every
+ZIM tested — both legacy and modern, against real libzim ("Cannot
+find entry") and against builds that get past the shim's
+buildable subset ("entry not found"). The first phase ("linear
+urls") completes fine on either backend.
+
+Practical consequence: `zimbench` is **not usable as a head-to-
+head benchmark harness**. Either drive it with `-n 0` to skip
+the random phase, or build a custom bench (see
+`libzim-shim/bench/bench.cpp` for the shape) to measure
+read/lookup/search latencies. zimru's own `bench/run.sh` works
+around this by exercising different binaries (`zimcheck`,
+`zimdump`, `zimru readall`) instead.
+
+### Files that `#define ZIM_PRIVATE`
+
+These three `.cpp` files at the top of zim-tools/src use
+libzim's `ZIM_PRIVATE`-gated internal API:
+
+- `src/zimcheck/checks.cpp`
+- `src/zimdump.cpp`
+- `src/zimsplit.cpp`
+
+The shim must expose its corresponding additions inside the same
+`#ifdef ZIM_PRIVATE` guard so the boundary stays explicit on the
+caller side too.
+
+### Build-glue quirks (macOS + homebrew)
+
+Reproducing a release build of zim-tools 3.6.0 against the
+homebrew install of libzim 9.6.0 needs three workarounds beyond
+"meson setup":
+
+- **`mustache.hpp` not on the default include path.** zim-tools'
+  `src/zimcheck/meson.build` does `compiler.has_header('mustache.hpp')`
+  with no `-I` hint. On homebrew it ships at `/opt/homebrew/
+  include/mustache.hpp` and meson won't find it without
+  `CXXFLAGS=-I/opt/homebrew/include`.
+- **`icu-i18n.pc` doesn't propagate `icuuc` for shared linkage.**
+  `Requires.private: icu-uc` only adds `-licuuc` for static
+  builds. zim-tools' `metadata.cpp` references `icu_NN::Unicode
+  String::fromUTF8` which lives in libicuuc, so a release build
+  fails with "Undefined symbols ... fromUTF8". Workaround:
+  `LDFLAGS="-L/opt/homebrew/Cellar/icu4c@78/78.3/lib -licuuc"`
+  during `meson setup`.
+- **`PKG_CONFIG_PATH` must include both libzim's and icu4c's pc
+  directories.** The brew prefix's flat
+  `/opt/homebrew/lib/pkgconfig` does not contain `libzim.pc`
+  (it's keg-only) or `icu-uc.pc` (the @78 keg is also keg-only).
+
+A working invocation:
+
+```sh
+PKG_CONFIG_PATH=/opt/homebrew/Cellar/libzim/9.6.0/lib/pkgconfig:\
+/opt/homebrew/Cellar/icu4c@78/78.3/lib/pkgconfig:\
+/opt/homebrew/lib/pkgconfig:\
+/opt/homebrew/opt/zstd/lib/pkgconfig \
+CXXFLAGS="-I/opt/homebrew/include" \
+LDFLAGS="-L/opt/homebrew/Cellar/icu4c@78/78.3/lib -licuuc" \
+meson setup build --buildtype=release
+meson compile -C build
+```
+
+### Built-binary layout
+
+meson emits zim-tools binaries at *two different* locations:
+
+- `build/src/zimcheck/zimcheck` (subdir per binary — `zimcheck`
+  and `zimwriterfs` follow this layout).
+- `build/src/zimbench`, `build/src/zimdump`, `build/src/zimrecreate`,
+  etc. (flat at `src/`).
+
+zimru's `bench/run.sh` and similar scripts that take an
+`UPSTREAM_DIR` expect a flat directory of binaries. Either
+symlink them flat, or set `UP_*` env vars individually:
+
+```sh
+mkdir -p /tmp/upstream-flat
+ln -sf $PWD/build/src/zimcheck/zimcheck /tmp/upstream-flat/zimcheck
+ln -sf $PWD/build/src/zimdump            /tmp/upstream-flat/zimdump
+ln -sf $PWD/build/src/zimbench           /tmp/upstream-flat/zimbench
+UPSTREAM_DIR=/tmp/upstream-flat ./bench/run.sh path/to/file.zim
+```
+
+### Building libzim-shim as a libzim drop-in
+
+For zim-tools to find the shim via `pkg-config --libs libzim`,
+configure with `LIBZIM_SHIM_USE_LIBZIM_SONAME=ON` and write a
+`libzim.pc` into the install prefix's `lib/pkgconfig`:
+
+```sh
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/tmp/shim-prefix \
+    -DLIBZIM_SHIM_USE_LIBZIM_SONAME=ON
+cmake --build build --parallel
+cmake --install build
+```
+
+Then `PKG_CONFIG_PATH=/tmp/shim-prefix/lib/pkgconfig:...` ahead
+of any system libzim path picks up the shim.
+
 ## Companion benchmark doc
 
 `libzim-shim/bench/RESULTS.md` records the latency picture from
