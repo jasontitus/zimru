@@ -413,6 +413,77 @@ struct zimru_entry_t *zimru_archive_main_entry(const struct zimru_archive_t *arc
                                                struct zimru_error_t **err);
 
 /**
+ * URL-pointer index of the archive's main entry, or
+ * [`NO_MAIN_PAGE`] (`0xFFFFFFFF`) when no main entry is set in the
+ * header. Cheaper than [`zimru_archive_main_entry`] — avoids the
+ * dirent parse and the entry-handle allocation — for callers that
+ * only need the index (e.g. the libzim-shim's `getMainEntryIndex()`,
+ * or zim-tools' equality checks against `entry.index()` while
+ * iterating).
+ */
+ uint32_t zimru_archive_main_entry_index(const struct zimru_archive_t *arc);
+
+/**
+ * Absolute on-disk byte offset of cluster `idx` (the byte where the
+ * cluster's leading info-byte begins). Used by `zimsplit` /
+ * `zimdump` to walk the cluster region by file position. Returns
+ * `0` with `*err` set on out-of-range indices or read errors.
+ */
+
+uint64_t zimru_archive_cluster_offset(const struct zimru_archive_t *arc,
+                                      uint32_t idx,
+                                      struct zimru_error_t **err);
+
+/**
+ * Verify every URL-pointer-list entry resolves to a parseable dirent
+ * within file bounds. Returns `true` on a clean archive, `false` on a
+ * structural defect, `false` with `*err` set if the pointer list
+ * itself can't be read. Designed as one of the per-check primitives
+ * the libzim-shim's `IntegrityCheckList` / `validate()` aggregator
+ * composes; callers that want a single yes/no can `&&` the set.
+ */
+
+bool zimru_archive_check_dirent_ptrs(const struct zimru_archive_t *arc,
+                                     struct zimru_error_t **err);
+
+/**
+ * Verify every dirent appears in `(namespace, url)` order in the
+ * URL-pointer list. A `false` here would silently break every path
+ * lookup on the archive (the binary search returns the wrong leaf or
+ * `EntryNotFound`).
+ */
+
+bool zimru_archive_check_dirent_order(const struct zimru_archive_t *arc,
+                                      struct zimru_error_t **err);
+
+/**
+ * Verify the title-pointer list (legacy archives) or the modern
+ * `X/listing/titleOrdered/v1` stream yields dirents in
+ * `(namespace, title)` order. `entry_by_ns_title` is a binary search
+ * over this ordering.
+ */
+
+bool zimru_archive_check_title_index(const struct zimru_archive_t *arc,
+                                     struct zimru_error_t **err);
+
+/**
+ * Verify every cluster-pointer-list entry is in-bounds for the file.
+ * Catches truncation between the end of the dirent region and the
+ * trailing checksum.
+ */
+
+bool zimru_archive_check_cluster_ptrs(const struct zimru_archive_t *arc,
+                                      struct zimru_error_t **err);
+
+/**
+ * Verify every article-dirent's mimetype index resolves inside the
+ * on-file mime-type list. Reserved values `0xFFFE` (linktarget) and
+ * `0xFFFD` (deletedentry) are accepted as legal even though they sit
+ * outside the list.
+ */
+ bool zimru_archive_check_mimetypes(const struct zimru_archive_t *arc, struct zimru_error_t **err);
+
+/**
  * Read a metadata value as raw bytes. Writes the byte count to `out_len`
  * and returns a borrowed pointer (lifetime tied to `arc`).
  *
@@ -587,6 +658,24 @@ struct zimru_entry_t *zimru_entry_get_redirect_entry(const struct zimru_entry_t 
  * redirects. Returns `0` on a NULL item.
  */
  uint8_t zimru_item_namespace(const struct zimru_item_t *it);
+
+/**
+ * Cluster index this item's bytes live in. Combine with
+ * [`zimru_archive_cluster_offset`] to find where the cluster starts
+ * in the file, or with [`zimru_item_blob_index`] +
+ * [`zimru_item_direct_access`] to address the blob within the
+ * cluster. Returns `0` on a NULL item — callers that care must not
+ * call this without a non-NULL `it`.
+ */
+ uint32_t zimru_item_cluster_index(const struct zimru_item_t *it);
+
+/**
+ * Blob index within the item's cluster. Together with
+ * [`zimru_item_cluster_index`] this is the `(cluster, blob)` pair
+ * `zimcheck` and similar tools use to talk about an item's physical
+ * position. Returns `0` on a NULL item.
+ */
+ uint32_t zimru_item_blob_index(const struct zimru_item_t *it);
 
 /**
  * Decompressed size of the item's data. Returns 0 with `*err` set if

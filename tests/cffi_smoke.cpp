@@ -246,6 +246,57 @@ int main(int argc, char** argv) {
         if ((u1[8] & 0xc0) != 0x80) die("uuid variant wrong");
     }
 
+    // 12b. Newly-added shim primitives: main_entry_index,
+    //      cluster_offset, item_cluster_index / item_blob_index, and
+    //      the structural integrity checks. Just verify they all
+    //      return sensible values on this clean fixture.
+    {
+        std::uint32_t mei = zimru_archive_main_entry_index(a.get());
+        if (mei == 0xFFFFFFFFu) die("main_entry_index == NO_MAIN_PAGE on archive with main entry");
+
+        zimru_error_t* err_ptr = nullptr;
+        std::uint64_t coff = zimru_archive_cluster_offset(a.get(), 0, &err_ptr);
+        if (err_ptr) {
+            Err er(err_ptr);
+            die("cluster_offset(0): " + err_msg(er.get()));
+        }
+        std::uint64_t fsz = zimru_archive_filesize(a.get());
+        if (coff == 0 || coff >= fsz) die("cluster_offset(0) out of range");
+
+        std::uint32_t ci = zimru_item_cluster_index(it.get());
+        std::uint32_t bi = zimru_item_blob_index(it.get());
+        if (ci >= zimru_archive_cluster_count(a.get())) {
+            die("item_cluster_index out of range");
+        }
+        std::cerr << "home cluster=" << ci << " blob=" << bi << '\n';
+
+        err_ptr = nullptr;
+        if (!zimru_archive_check_dirent_ptrs(a.get(), &err_ptr)) {
+            Err er(err_ptr);
+            die("check_dirent_ptrs: " + err_msg(er.get()));
+        }
+        err_ptr = nullptr;
+        if (!zimru_archive_check_dirent_order(a.get(), &err_ptr)) {
+            Err er(err_ptr);
+            die("check_dirent_order: " + err_msg(er.get()));
+        }
+        err_ptr = nullptr;
+        if (!zimru_archive_check_title_index(a.get(), &err_ptr)) {
+            Err er(err_ptr);
+            die("check_title_index: " + err_msg(er.get()));
+        }
+        err_ptr = nullptr;
+        if (!zimru_archive_check_cluster_ptrs(a.get(), &err_ptr)) {
+            Err er(err_ptr);
+            die("check_cluster_ptrs: " + err_msg(er.get()));
+        }
+        err_ptr = nullptr;
+        if (!zimru_archive_check_mimetypes(a.get(), &err_ptr)) {
+            Err er(err_ptr);
+            die("check_mimetypes: " + err_msg(er.get()));
+        }
+    }
+
     // 13. Error path: open a missing file. Confirm the error pointer is set
     //     and that wrapping it in unique_ptr cleans it up automatically.
     {

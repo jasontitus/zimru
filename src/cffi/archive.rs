@@ -436,10 +436,7 @@ pub unsafe extern "C" fn zimru_archive_illustrations(
 /// [`zimru_archive_illustrations`]. `count` must match the value
 /// written into `*out_count`. Safe on a NULL pointer (no-op).
 #[no_mangle]
-pub unsafe extern "C" fn zimru_illustrations_free(
-    ptr: *mut zimru_illustration_t,
-    count: usize,
-) {
+pub unsafe extern "C" fn zimru_illustrations_free(ptr: *mut zimru_illustration_t, count: usize) {
     if !ptr.is_null() && count > 0 {
         drop(Vec::from_raw_parts(ptr, count, count));
     }
@@ -529,6 +526,153 @@ pub unsafe extern "C" fn zimru_archive_main_entry(
         Err(e) => {
             set_err(err, e);
             std::ptr::null_mut()
+        }
+    }
+}
+
+/// URL-pointer index of the archive's main entry, or
+/// [`NO_MAIN_PAGE`] (`0xFFFFFFFF`) when no main entry is set in the
+/// header. Cheaper than [`zimru_archive_main_entry`] — avoids the
+/// dirent parse and the entry-handle allocation — for callers that
+/// only need the index (e.g. the libzim-shim's `getMainEntryIndex()`,
+/// or zim-tools' equality checks against `entry.index()` while
+/// iterating).
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_main_entry_index(arc: *const zimru_archive_t) -> u32 {
+    if arc.is_null() {
+        return crate::header::NO_MAIN_PAGE;
+    }
+    (*arc)
+        .inner
+        .main_entry_index()
+        .unwrap_or(crate::header::NO_MAIN_PAGE)
+}
+
+/// Absolute on-disk byte offset of cluster `idx` (the byte where the
+/// cluster's leading info-byte begins). Used by `zimsplit` /
+/// `zimdump` to walk the cluster region by file position. Returns
+/// `0` with `*err` set on out-of-range indices or read errors.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_cluster_offset(
+    arc: *const zimru_archive_t,
+    idx: u32,
+    err: *mut *mut zimru_error_t,
+) -> u64 {
+    if arc.is_null() {
+        set_err(err, crate::Error::BadClusterIndex(idx, 0));
+        return 0;
+    }
+    match (*arc).inner.cluster_offset(idx) {
+        Ok(off) => off,
+        Err(e) => {
+            set_err(err, e);
+            0
+        }
+    }
+}
+
+/// Verify every URL-pointer-list entry resolves to a parseable dirent
+/// within file bounds. Returns `true` on a clean archive, `false` on a
+/// structural defect, `false` with `*err` set if the pointer list
+/// itself can't be read. Designed as one of the per-check primitives
+/// the libzim-shim's `IntegrityCheckList` / `validate()` aggregator
+/// composes; callers that want a single yes/no can `&&` the set.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_check_dirent_ptrs(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if arc.is_null() {
+        return false;
+    }
+    match (*arc).inner.check_dirent_ptrs() {
+        Ok(b) => b,
+        Err(e) => {
+            set_err(err, e);
+            false
+        }
+    }
+}
+
+/// Verify every dirent appears in `(namespace, url)` order in the
+/// URL-pointer list. A `false` here would silently break every path
+/// lookup on the archive (the binary search returns the wrong leaf or
+/// `EntryNotFound`).
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_check_dirent_order(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if arc.is_null() {
+        return false;
+    }
+    match (*arc).inner.check_dirent_order() {
+        Ok(b) => b,
+        Err(e) => {
+            set_err(err, e);
+            false
+        }
+    }
+}
+
+/// Verify the title-pointer list (legacy archives) or the modern
+/// `X/listing/titleOrdered/v1` stream yields dirents in
+/// `(namespace, title)` order. `entry_by_ns_title` is a binary search
+/// over this ordering.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_check_title_index(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if arc.is_null() {
+        return false;
+    }
+    match (*arc).inner.check_title_index() {
+        Ok(b) => b,
+        Err(e) => {
+            set_err(err, e);
+            false
+        }
+    }
+}
+
+/// Verify every cluster-pointer-list entry is in-bounds for the file.
+/// Catches truncation between the end of the dirent region and the
+/// trailing checksum.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_check_cluster_ptrs(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if arc.is_null() {
+        return false;
+    }
+    match (*arc).inner.check_cluster_ptrs() {
+        Ok(b) => b,
+        Err(e) => {
+            set_err(err, e);
+            false
+        }
+    }
+}
+
+/// Verify every article-dirent's mimetype index resolves inside the
+/// on-file mime-type list. Reserved values `0xFFFE` (linktarget) and
+/// `0xFFFD` (deletedentry) are accepted as legal even though they sit
+/// outside the list.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_check_mimetypes(
+    arc: *const zimru_archive_t,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if arc.is_null() {
+        return false;
+    }
+    match (*arc).inner.check_mimetypes() {
+        Ok(b) => b,
+        Err(e) => {
+            set_err(err, e);
+            false
         }
     }
 }

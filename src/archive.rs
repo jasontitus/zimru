@@ -103,9 +103,7 @@ impl ClusterByteCache {
     fn evict_to_budget(&mut self) {
         while self.current_bytes > self.max_bytes && self.inner.len() > 1 {
             if let Some((_, evicted)) = self.inner.pop_lru() {
-                self.current_bytes = self
-                    .current_bytes
-                    .saturating_sub(evicted.payload().len());
+                self.current_bytes = self.current_bytes.saturating_sub(evicted.payload().len());
                 self.evictions += 1;
             } else {
                 break;
@@ -189,9 +187,7 @@ impl Archive {
                 header,
                 mimes,
                 file_len,
-                cluster_cache: Mutex::new(ClusterByteCache::new(
-                    DEFAULT_CLUSTER_CACHE_MAX_BYTES,
-                )),
+                cluster_cache: Mutex::new(ClusterByteCache::new(DEFAULT_CLUSTER_CACHE_MAX_BYTES)),
                 title_listing: OnceLock::new(),
                 content_counts: OnceLock::new(),
             }),
@@ -230,6 +226,21 @@ impl Archive {
             return Err(Error::NoMainEntry);
         }
         self.entry_by_url_index(idx)
+    }
+
+    /// URL-pointer index of the archive's main entry, if any. `None`
+    /// when the header carries no main-page pointer (the `main_page`
+    /// header field is `0xFFFFFFFF`). Cheaper than [`Archive::main_entry`]
+    /// — no dirent parse, no clone — for callers that only need the
+    /// index (e.g. equality checks against `entry.index()` while
+    /// iterating).
+    pub fn main_entry_index(&self) -> Option<u32> {
+        let idx = self.core.header.main_page;
+        if idx == NO_MAIN_PAGE {
+            None
+        } else {
+            Some(idx)
+        }
     }
 
     pub fn has_checksum(&self) -> bool {
@@ -571,8 +582,7 @@ impl Archive {
                 let mid = lo + (hi - lo) / 2;
                 let url_idx = listing[mid];
                 let off = self.url_pointer(url_idx)?;
-                let (d_ns, d_title) =
-                    Dirent::title_key_at(&self.core.mmap, off as usize)?;
+                let (d_ns, d_title) = Dirent::title_key_at(&self.core.mmap, off as usize)?;
                 let cmp = match ns.cmp(&d_ns) {
                     Ordering::Equal => title.cmp(d_title),
                     other => other,
@@ -636,12 +646,7 @@ impl Archive {
 
     /// First index in `listing` where the dirent's `(namespace, title)` is
     /// `>= (ns, key)`. Helper for [`Archive::title_prefix_range`].
-    fn lower_bound_in_title_listing(
-        &self,
-        listing: &[u32],
-        ns: u8,
-        key: &[u8],
-    ) -> Result<usize> {
+    fn lower_bound_in_title_listing(&self, listing: &[u32], ns: u8, key: &[u8]) -> Result<usize> {
         let mut lo = 0usize;
         let mut hi = listing.len();
         while lo < hi {
@@ -1035,6 +1040,17 @@ impl Archive {
         }
     }
 
+    /// Absolute on-disk byte offset of cluster `idx` — the byte where
+    /// the cluster's leading info-byte begins. Equal to
+    /// [`Archive::cluster_byte_range`]`(idx).start`. Exposed as a
+    /// standalone primitive for tools that walk the cluster region by
+    /// offset alone (`zimsplit` choosing safe split points,
+    /// `zimdump --list` printing per-cluster file positions) without
+    /// needing the trailing offset.
+    pub fn cluster_offset(&self, idx: u32) -> Result<u64> {
+        self.cluster_pointer(idx)
+    }
+
     /// On-disk byte range occupied by cluster `idx`, including its info
     /// byte. The returned range's length is the compressed size the cluster
     /// takes up in the file.
@@ -1098,11 +1114,7 @@ impl Archive {
     /// single most-recently-used cluster larger than the budget is
     /// kept pinned to avoid permanent misses.
     pub fn set_cluster_cache_max_bytes(&self, max_bytes: usize) {
-        self.core
-            .cluster_cache
-            .lock()
-            .unwrap()
-            .resize(max_bytes);
+        self.core.cluster_cache.lock().unwrap().resize(max_bytes);
     }
 
     /// Current cluster-cache byte budget. See
@@ -1118,6 +1130,132 @@ impl Archive {
     /// telemetry from a long-running server.
     pub fn cluster_cache_stats(&self) -> ClusterCacheStats {
         self.core.cluster_cache.lock().unwrap().snapshot()
+    }
+
+    // ============================================================
+    // ----------- Structural integrity primitives ---------------
+    // ============================================================
+    //
+    // Each `check_*` returns `Ok(true)` for a clean archive, `Ok(false)`
+    // for a structural defect, and `Err(_)` only for a read failure
+    // that prevents the check from running at all (truncated header,
+    // unreadable mmap, …). `Ok(false)` means "we read the bytes; they
+    // don't satisfy this invariant" — actionable for `zimcheck`-style
+    // tools. The set is intentionally fine-grained so callers (the
+    // shim's libzim-shaped `validate()` entry point being the
+    // motivating one) can compose just the checks they need; the
+    // archive-wide MD5 check stays separate as [`Archive::check`].
+
+    /// Verify every URL-pointer-list entry resolves to a parseable
+    /// dirent within file bounds. Catches a truncated dirent region or
+    /// a corrupt url-pointer list entry that points off the end of the
+    /// file or into the middle of another structure.
+    pub fn check_dirent_ptrs(&self) -> Result<bool> {
+        let n = self.core.header.entry_count;
+        let file_len = self.core.file_len;
+        for i in 0..n {
+            let off = self.url_pointer(i)?;
+            if off >= file_len {
+                return Ok(false);
+            }
+            if Dirent::parse(&self.core.mmap, off as usize).is_err() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Verify every dirent appears in `(namespace, url)` order in the
+    /// URL-pointer list. `entry_by_ns_path` is a binary search over
+    /// this ordering; a `false` here would silently break every path
+    /// lookup on the archive.
+    pub fn check_dirent_order(&self) -> Result<bool> {
+        let n = self.core.header.entry_count;
+        let mut prev: Option<(u8, String)> = None;
+        for i in 0..n {
+            let off = self.url_pointer(i)?;
+            let (ns, url) = Dirent::key_at(&self.core.mmap, off as usize)?;
+            if let Some((prev_ns, prev_url)) = &prev {
+                let cmp = prev_ns.cmp(&ns).then_with(|| prev_url.as_str().cmp(url));
+                if cmp.is_gt() {
+                    return Ok(false);
+                }
+            }
+            prev = Some((ns, url.to_string()));
+        }
+        Ok(true)
+    }
+
+    /// Verify the title-pointer list (legacy) or the modern
+    /// `X/listing/titleOrdered/v1` stream (v6+) yields dirents in
+    /// `(namespace, title)` order. `entry_by_ns_title` is a binary
+    /// search over this ordering.
+    pub fn check_title_index(&self) -> Result<bool> {
+        let listing = self.title_listing()?;
+        let mut prev: Option<(u8, String)> = None;
+        for &url_idx in listing.iter() {
+            let off = self.url_pointer(url_idx)?;
+            let (ns, title) = Dirent::title_key_at(&self.core.mmap, off as usize)?;
+            if let Some((prev_ns, prev_title)) = &prev {
+                let cmp = prev_ns
+                    .cmp(&ns)
+                    .then_with(|| prev_title.as_str().cmp(title));
+                if cmp.is_gt() {
+                    return Ok(false);
+                }
+            }
+            prev = Some((ns, title.to_string()));
+        }
+        Ok(true)
+    }
+
+    /// Verify every cluster-pointer-list entry is in-bounds for the
+    /// file. Catches truncation between the end of the dirent region
+    /// and the trailing checksum.
+    pub fn check_cluster_ptrs(&self) -> Result<bool> {
+        let n = self.core.header.cluster_count;
+        let file_len = self.core.file_len;
+        for i in 0..n {
+            let off = self.cluster_pointer(i)?;
+            // A cluster's info-byte must fit in the file; the cluster
+            // itself extends to the next cluster's offset (or the
+            // checksum / EOF for the trailing one). Just bounding the
+            // start byte is enough to catch the corruption modes
+            // `check_cluster_ptrs` exists to surface — full parseability
+            // is what `check_cluster_payloads` (future work) would
+            // cover, and it's expensive enough to keep separate.
+            if off >= file_len {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Verify every article-dirent's mimetype index resolves inside
+    /// the on-file mime-type list. A `false` here means a dirent will
+    /// hand back `application/octet-stream` (or something stranger,
+    /// depending on the consumer) instead of its true mimetype.
+    pub fn check_mimetypes(&self) -> Result<bool> {
+        let n = self.core.header.entry_count;
+        let mime_count = self.core.mimes.len();
+        for i in 0..n {
+            let off = self.url_pointer(i)?;
+            if let Dirent::Article(a) = Dirent::parse(&self.core.mmap, off as usize)? {
+                // Reserved mimetype values 0xFFFE / 0xFFFD (linktarget,
+                // deletedentry) are out-of-list by design; treat them
+                // as legal so legacy archives that still carry them
+                // don't trip the check.
+                if a.mimetype == crate::dirent::MIME_LINKTARGET
+                    || a.mimetype == crate::dirent::MIME_DELETED
+                {
+                    continue;
+                }
+                if (a.mimetype as usize) >= mime_count {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 }
 
