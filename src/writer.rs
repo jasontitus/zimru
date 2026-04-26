@@ -316,13 +316,23 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
         uuid,
     } = builder;
 
-    // 1. Collect every payload.
+    // 1. Collect every payload. An empty title is normalised to the
+    //    url here so the dirent's title field matches the on-disk
+    //    convention "empty title bytes ⇒ title is the url" — without
+    //    this, the writer's title-order sort sees `""` (sorts before
+    //    every non-empty title) but the reader falls back to url on
+    //    parse, leaving the title-pointer list out of sync with what
+    //    `zimcheck -I` and downstream readers expect ("Title index is
+    //    not properly sorted"). Most callers (libzim's `zimwriterfs`
+    //    among them) pass an empty title for non-HTML items where
+    //    they want the filename to surface.
     let mut payloads: Vec<Payload> = Vec::new();
     for it in items {
+        let title = if it.title.is_empty() { it.path.clone() } else { it.title };
         payloads.push(Payload {
             namespace: b'C',
             url: it.path,
-            title: it.title,
+            title,
             mimetype: it.mimetype,
             content: it.content,
         });
@@ -350,10 +360,11 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
     // Collect redirections (including the optional W/mainPage one).
     let mut pending_redirects: Vec<RawDirent> = Vec::new();
     for r in redirections {
+        let title = if r.title.is_empty() { r.path.clone() } else { r.title };
         pending_redirects.push(RawDirent::Redirect {
             namespace: b'C',
             url: r.path,
-            title: r.title,
+            title,
             target_ns: b'C',
             target_url: r.target_path,
             resolved_index: None,

@@ -392,6 +392,86 @@ fn compression_level_round_trips_at_extremes() {
 }
 
 #[test]
+fn empty_title_normalises_to_url_for_correct_title_sort() {
+    // Regression for shim-zimwriterfs interaction: zim-tools'
+    // `zimwriterfs` passes title="" for non-HTML items, expecting the
+    // writer to derive "filename" from the path. The writer now
+    // normalises empty titles to the url before sorting, so the
+    // title-pointer list ends up correctly sorted (was previously
+    // putting empty-title entries at index 0 since "" < everything,
+    // failing zimcheck -I with "Title index is not properly sorted").
+    //
+    // Mix of explicit-title HTML items and empty-title binary items;
+    // after open the title-order iteration must be in lexicographic
+    // (ns, title) order using the *url* as the title for the
+    // empty-title entries.
+
+    let out = tmp_path("empty-title");
+    let mut c = Creator::new();
+    // Items in URL order, with mixed explicit / empty titles.
+    c.add_item(Item::new(
+        "article1.html".to_string(),
+        "Article 1".to_string(),
+        "text/html".to_string(),
+        b"<h1>1</h1>".to_vec(),
+    ));
+    c.add_item(Item::new(
+        "icon.png".to_string(),
+        String::new(), // empty — should fall back to url at sort time
+        "image/png".to_string(),
+        b"\x89PNGstub".to_vec(),
+    ));
+    c.add_item(Item::new(
+        "index.html".to_string(),
+        "Test Site".to_string(),
+        "text/html".to_string(),
+        b"<h1>home</h1>".to_vec(),
+    ));
+    c.add_item(Item::new(
+        "style.css".to_string(),
+        String::new(), // empty
+        "text/css".to_string(),
+        b"body{}".to_vec(),
+    ));
+    c.write_to(&out).expect("write");
+
+    let arc = Archive::open(&out).expect("open");
+    // Expected title order using the url-fallback for empty-title items:
+    //   "Article 1", "Test Site", "icon.png", "style.css"
+    let titles: Vec<String> = arc
+        .iter_by_title()
+        .map(|r| r.unwrap().title().to_string())
+        .collect();
+    assert_eq!(
+        titles,
+        vec![
+            "Article 1".to_string(),
+            "Test Site".to_string(),
+            "icon.png".to_string(),
+            "style.css".to_string(),
+        ],
+        "title order should sort by effective title (url-fallback for empty)"
+    );
+
+    // Independent validation: real zimcheck -I must report Pass on the
+    // produced ZIM. The previous bug surfaced as "Title index is not
+    // properly sorted" — that's the symptom we're guarding against.
+    if let Ok(out_bin) = Command::new("zimcheck")
+        .args(["-I"])
+        .arg(&out)
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&out_bin.stdout);
+        assert!(
+            stdout.contains("Status: Pass"),
+            "real zimcheck -I should Pass on the empty-title round-trip:\n{stdout}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn rejects_dangling_redirect() {
     let out = tmp_path("bad-redirect");
     let mut c = Creator::new();
