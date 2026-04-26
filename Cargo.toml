@@ -93,6 +93,11 @@ name = "cluster_decode"
 harness = false
 required-features = []
 
+[[bench]]
+name = "warmup"
+harness = false
+required-features = []
+
 [build-dependencies]
 # Used only when the `cffi` feature is enabled (build.rs gates on the
 # CARGO_FEATURE_CFFI env var); kept unconditional because Cargo does not
