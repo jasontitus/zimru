@@ -212,6 +212,42 @@ pub unsafe extern "C" fn zimru_item_blob_view(
     true
 }
 
+/// Pre-fault the OS page cache for this item's on-disk bytes. Issues
+/// `madvise(MADV_WILLNEED)` on the item's region and touches one byte
+/// per 4 KB page to force synchronous fault-in. After return, every
+/// page is resident; subsequent reads (including reads issued through
+/// a different fd onto the same file — the OS page cache is keyed by
+/// inode) hit cache instead of disk.
+///
+/// Designed for the libzim-shim P7 scenario: kiwix-serve hosting a
+/// multi-GB Wikipedia hands Xapian a fd at the embedded Xapian-DB
+/// offset, Xapian issues eager DB-validation reads scattered across
+/// the DB, and on a cold page cache the first user `/search`
+/// blocks for ~12 seconds. Calling this at server start (or in a
+/// background thread concurrent with other init) shifts the disk-I/O
+/// cost off the first user-facing search.
+///
+/// No-op on items in compressed clusters (the page-fault game only
+/// makes sense for direct-access regions). Returns `false` with `*err`
+/// set on a NULL item or unrecoverable lookup failure.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_item_warmup(
+    it: *const zimru_item_t,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if it.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return false;
+    }
+    match (*it).inner.warmup() {
+        Ok(()) => true,
+        Err(e) => {
+            set_err(err, e);
+            false
+        }
+    }
+}
+
 /// Release the pin handle inside a [`zimru_blob_view_t`]. Safe to call
 /// on a NULL `view` or a view whose `_pin` is already NULL (no-op).
 /// After release the `data` and `size` fields are unchanged but

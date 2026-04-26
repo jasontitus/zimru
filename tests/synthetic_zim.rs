@@ -440,6 +440,76 @@ fn lookup_returns_not_found() {
 }
 
 #[test]
+fn item_warmup_succeeds_on_direct_and_compressed_items() {
+    // Two clusters in one ZIM:
+    //   cluster 0 — uncompressed → items are direct-access, warmup
+    //               should madvise + page-touch the region.
+    //   cluster 1 — zstd → items are NOT direct-access, warmup must
+    //               silently no-op (return Ok) without touching anything.
+
+    let direct_payload = b"direct-access body".to_vec();
+    let compressed_payload = vec![b'z'; 1024];
+
+    let direct_cluster = build_uncompressed_cluster(&[&direct_payload]);
+    let compressed_cluster = build_zstd_cluster(&[&compressed_payload]);
+
+    let dirents = vec![
+        Dir::Art(Article {
+            namespace: b'C',
+            url: "direct",
+            title: "Direct",
+            mime: 0,
+            cluster: 0,
+            blob: 0,
+        }),
+        Dir::Art(Article {
+            namespace: b'C',
+            url: "zipped",
+            title: "Zipped",
+            mime: 0,
+            cluster: 1,
+            blob: 0,
+        }),
+    ];
+    let zim = build_zim(
+        true,
+        None,
+        &dirents,
+        &[0u32, 1],
+        &[direct_cluster, compressed_cluster],
+        &["text/plain"],
+        true,
+    );
+    let path = write_temp("warmup", &zim);
+    let arc = Archive::open(&path).unwrap();
+
+    // Direct-access item: warmup should succeed.
+    let direct_item = arc
+        .get_entry_by_path("direct")
+        .unwrap()
+        .get_item(false)
+        .unwrap();
+    direct_item.warmup().expect("warmup direct");
+
+    // Verify the data is still readable after warmup (we should not
+    // have corrupted the mmap by touching pages).
+    assert_eq!(direct_item.bytes().unwrap(), direct_payload);
+
+    // Compressed item: warmup must no-op cleanly (compressed clusters
+    // can't be page-warmed at the on-disk-bytes level — Xapian DBs
+    // are uncompressed by spec, so the only valid use case for
+    // warmup is direct-access items).
+    let compressed_item = arc
+        .get_entry_by_path("zipped")
+        .unwrap()
+        .get_item(false)
+        .unwrap();
+    compressed_item.warmup().expect("warmup compressed no-op");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn cluster_cache_stats_track_hits_and_misses() {
     // Two articles in one cluster: the first lookup is a cache miss,
     // the second hits. Over many lookups the hit/miss counters should

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use lru::LruCache;
-use memmap2::Mmap;
+use memmap2::{Advice, Mmap};
 use rayon::prelude::*;
 
 use crate::cluster::Cluster;
@@ -1380,6 +1380,67 @@ impl Item {
             payload: cluster.payload().clone(),
             range,
         })
+    }
+
+    /// Pre-fault the OS page cache for this item's bytes. Designed for
+    /// the libzim-shim P7 scenario: the shim hands Xapian a fresh fd
+    /// at the offset of the embedded Xapian DB, Xapian then issues
+    /// eager DB-validation reads scattered across the multi-GB DB. On
+    /// a cold page cache every one of those reads is a disk seek —
+    /// the 12-second hang on first `/search` after kiwix-serve restart
+    /// on the 48 GB Wikipedia ZIM. The shim's `F_RDAHEAD=0` /
+    /// `POSIX_FADV_RANDOM` mitigation moves the needle by only ~10 %
+    /// because madvise/fadvise hints don't influence Xapian's own
+    /// eager reads.
+    ///
+    /// This function:
+    /// 1. Calls `madvise(MADV_WILLNEED)` on the item's region to ask
+    ///    the kernel to start async read-ahead, then
+    /// 2. Touches one byte per 4 KB page to force synchronous
+    ///    fault-in.
+    ///
+    /// On return, every page in the region is resident — subsequent
+    /// reads (whether through zimru's existing mmap or through any
+    /// other fd onto the same file the OS page cache is keyed by
+    /// inode, not mmap region) hit cache. Cost is O(region size) of
+    /// disk I/O paid once.
+    ///
+    /// Direct-access only: silently no-ops on items in compressed
+    /// clusters (the page-fault game only makes sense for
+    /// uncompressed regions where the on-disk bytes are the same
+    /// bytes the consumer will read).
+    ///
+    /// Suitable for kiwix-serve to call at startup (synchronous,
+    /// blocks server boot but eliminates the first-search hang) or
+    /// in a background thread (concurrent with other init).
+    pub fn warmup(&self) -> Result<()> {
+        let direct = self
+            .archive
+            .blob_direct_access(self.cluster_index(), self.blob_index())?;
+        if !direct.is_direct {
+            return Ok(());
+        }
+        let offset = direct.file_offset as usize;
+        let size = direct.size as usize;
+        let mmap = &self.archive.core.mmap;
+        if offset.saturating_add(size) > mmap.len() {
+            return Err(Error::Truncated((offset + size) as u64));
+        }
+        // Best-effort kernel hint — async read-ahead. Errors are
+        // non-fatal: the page-touch below still forces fault-in.
+        let _ = mmap.advise_range(Advice::WillNeed, offset, size);
+        // Synchronous fault-in: one byte per page is enough to
+        // trigger the kernel to read the whole page.
+        const PAGE: usize = 4096;
+        let region = &mmap[offset..offset + size];
+        let mut acc: u64 = 0;
+        let mut i = 0;
+        while i < region.len() {
+            acc = acc.wrapping_add(region[i] as u64);
+            i += PAGE;
+        }
+        std::hint::black_box(acc);
+        Ok(())
     }
 
     /// Resolve the underlying cluster (kept alive by an `Arc`) and the
