@@ -125,6 +125,22 @@ typedef struct zimru_error_t zimru_error_t;
 typedef struct zimru_item_t zimru_item_t;
 
 /**
+ * Snapshot of cluster-cache occupancy and lifetime counters. Mirrors
+ * [`crate::ClusterCacheStats`]. Counters are monotonic over the
+ * archive's lifetime — useful for verifying hot-article hit ratios,
+ * tuning the byte budget against eviction pressure, or surfacing
+ * cache health to long-running-server telemetry.
+ */
+typedef struct zimru_cluster_cache_stats_t {
+  uint64_t max_bytes;
+  uint64_t current_bytes;
+  uint64_t entries;
+  uint64_t hits;
+  uint64_t misses;
+  uint64_t evictions;
+} zimru_cluster_cache_stats_t;
+
+/**
  * Cover / thumbnail descriptor returned by
  * [`zimru_archive_illustrations`]. Mirrors libzim's
  * `IllustrationInfo`: width and height in pixels, and a `scale`
@@ -156,6 +172,29 @@ typedef struct zimru_direct_access_t {
   uint64_t file_offset;
   uint64_t size;
 } zimru_direct_access_t;
+
+/**
+ * Zero-allocation blob view: a borrowed `(data, size)` slice into the
+ * item's decompressed cluster, plus an opaque pin handle that keeps
+ * the underlying cluster alive even if the LRU cluster cache evicts
+ * the entry. Designed for hot-path consumers (servers serving content
+ * per-request) that would otherwise pay one heap allocation per call
+ * for the `zimru_blob_t*` wrapper.
+ *
+ * Populated by [`zimru_item_blob_view`]; released by
+ * [`zimru_blob_view_release`]. Treat `_pin` as opaque — it is not a
+ * data pointer.
+ */
+typedef struct zimru_blob_view_t {
+  const uint8_t *data;
+  uint64_t size;
+  /**
+   * Opaque cluster-pin handle. Pass to
+   * [`zimru_blob_view_release`]; do not dereference. NULL means the
+   * view has already been released (or was never populated).
+   */
+  const void *_pin;
+} zimru_blob_view_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -308,6 +347,14 @@ void zimru_archive_set_cluster_cache_max_bytes(const struct zimru_archive_t *arc
  * Current cluster-cache byte budget. Returns `0` on a NULL archive.
  */
  uintptr_t zimru_archive_cluster_cache_max_bytes(const struct zimru_archive_t *arc);
+
+/**
+ * Populate `out` with the cluster cache's current state. Safe on a
+ * NULL `arc` or `out` (no-op).
+ */
+
+void zimru_archive_cluster_cache_stats(const struct zimru_archive_t *arc,
+                                       struct zimru_cluster_cache_stats_t *out);
 
 /**
  * Enumerate every illustration descriptor recorded in the archive's
@@ -560,6 +607,28 @@ struct zimru_entry_t *zimru_entry_get_redirect_entry(const struct zimru_entry_t 
 
 struct zimru_blob_t *zimru_item_get_data(const struct zimru_item_t *it,
                                          struct zimru_error_t **err);
+
+/**
+ * Populate `out` with a borrowed view of the item's bytes plus a pin
+ * handle that keeps them alive. Returns `false` with `*err` set on
+ * any failure (cluster decode error, bad blob index, NULL inputs).
+ * Avoids the per-call `Box::new(zimru_blob_t)` of
+ * [`zimru_item_get_data`] — costs one `Arc::clone` (refcount bump,
+ * no allocation) per call. The pin must be released exactly once
+ * with [`zimru_blob_view_release`].
+ */
+
+bool zimru_item_blob_view(const struct zimru_item_t *it,
+                          struct zimru_blob_view_t *out,
+                          struct zimru_error_t **err);
+
+/**
+ * Release the pin handle inside a [`zimru_blob_view_t`]. Safe to call
+ * on a NULL `view` or a view whose `_pin` is already NULL (no-op).
+ * After release the `data` and `size` fields are unchanged but
+ * `data` must not be dereferenced.
+ */
+ void zimru_blob_view_release(struct zimru_blob_view_t *view);
 
 /**
  * Derive a deterministic 16-byte UUID from an arbitrary byte seed.

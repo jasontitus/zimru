@@ -440,6 +440,68 @@ fn lookup_returns_not_found() {
 }
 
 #[test]
+fn cluster_cache_stats_track_hits_and_misses() {
+    // Two articles in one cluster: the first lookup is a cache miss,
+    // the second hits. Over many lookups the hit/miss counters should
+    // separate cleanly.
+
+    let cluster = build_uncompressed_cluster(&[b"first body", b"second body"]);
+    let dirents = vec![
+        Dir::Art(Article {
+            namespace: b'C',
+            url: "first",
+            title: "First",
+            mime: 0,
+            cluster: 0,
+            blob: 0,
+        }),
+        Dir::Art(Article {
+            namespace: b'C',
+            url: "second",
+            title: "Second",
+            mime: 0,
+            cluster: 0,
+            blob: 1,
+        }),
+    ];
+    let zim = build_zim(
+        true,
+        None,
+        &dirents,
+        &[0u32, 1],
+        &[cluster],
+        &["text/plain"],
+        true,
+    );
+    let path = write_temp("cache_stats", &zim);
+    let arc = Archive::open(&path).unwrap();
+
+    // No accesses yet — clean baseline.
+    let s0 = arc.cluster_cache_stats();
+    assert_eq!(s0.hits, 0);
+    assert_eq!(s0.misses, 0);
+    assert_eq!(s0.entries, 0);
+
+    let _ = arc.get_item("first").unwrap().get_data().unwrap();
+    let s1 = arc.cluster_cache_stats();
+    assert_eq!(s1.misses, 1, "first access should miss");
+    assert_eq!(s1.hits, 0);
+    assert_eq!(s1.entries, 1);
+
+    let _ = arc.get_item("second").unwrap().get_data().unwrap();
+    let _ = arc.get_item("first").unwrap().get_data().unwrap();
+    let s2 = arc.cluster_cache_stats();
+    // Both later lookups are in the same cluster as the first, so they
+    // must hit; misses stay at 1.
+    assert_eq!(s2.misses, 1);
+    assert_eq!(s2.hits, 2);
+    assert_eq!(s2.entries, 1);
+    assert_eq!(s2.evictions, 0);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn illustrations_enumerate_metadata_pattern() {
     // M/Illustration_48x48@1 + M/Illustration_96x96@2 + an unrelated
     // M/Title metadata key. The illustrations() helper must return

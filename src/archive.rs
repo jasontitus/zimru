@@ -56,6 +56,9 @@ struct ClusterByteCache {
     inner: LruCache<u32, Arc<Cluster>>,
     max_bytes: usize,
     current_bytes: usize,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
 }
 
 impl ClusterByteCache {
@@ -64,11 +67,23 @@ impl ClusterByteCache {
             inner: LruCache::unbounded(),
             max_bytes,
             current_bytes: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
         }
     }
 
     fn get(&mut self, idx: u32) -> Option<Arc<Cluster>> {
-        self.inner.get(&idx).cloned()
+        match self.inner.get(&idx) {
+            Some(c) => {
+                self.hits += 1;
+                Some(c.clone())
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
     }
 
     fn put(&mut self, idx: u32, cluster: Arc<Cluster>) {
@@ -91,6 +106,7 @@ impl ClusterByteCache {
                 self.current_bytes = self
                     .current_bytes
                     .saturating_sub(evicted.payload().len());
+                self.evictions += 1;
             } else {
                 break;
             }
@@ -100,6 +116,31 @@ impl ClusterByteCache {
     fn max_bytes(&self) -> usize {
         self.max_bytes
     }
+
+    fn snapshot(&self) -> ClusterCacheStats {
+        ClusterCacheStats {
+            max_bytes: self.max_bytes as u64,
+            current_bytes: self.current_bytes as u64,
+            entries: self.inner.len() as u64,
+            hits: self.hits,
+            misses: self.misses,
+            evictions: self.evictions,
+        }
+    }
+}
+
+/// Snapshot of the cluster cache's resident-byte budget, current
+/// occupancy, and lifetime hit/miss/eviction counters. Returned by
+/// [`Archive::cluster_cache_stats`]. Counters are monotonic; resetting
+/// happens only when the archive is closed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClusterCacheStats {
+    pub max_bytes: u64,
+    pub current_bytes: u64,
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
 }
 
 #[derive(Debug)]
@@ -1051,6 +1092,15 @@ impl Archive {
     pub fn cluster_cache_max_bytes(&self) -> usize {
         self.core.cluster_cache.lock().unwrap().max_bytes()
     }
+
+    /// Snapshot of cluster-cache occupancy + lifetime counters. Useful
+    /// for verifying that the cache is doing its job (hit:miss ratio
+    /// for hot-article workloads), tuning [`Archive::set_cluster_cache_max_bytes`]
+    /// against actual eviction pressure, or surfacing cache health to
+    /// telemetry from a long-running server.
+    pub fn cluster_cache_stats(&self) -> ClusterCacheStats {
+        self.core.cluster_cache.lock().unwrap().snapshot()
+    }
 }
 
 /// Parse a `Illustration_<W>x<H>@<scale>` metadata key into its
@@ -1290,6 +1340,24 @@ impl Item {
 
     /// Fetch the blob bytes (decompressing the cluster if needed).
     pub fn get_data(&self) -> Result<Blob> {
+        let (cluster, range) = self.pinned_blob()?;
+        Ok(Blob {
+            payload: cluster.payload().clone(),
+            range,
+        })
+    }
+
+    /// Resolve the underlying cluster (kept alive by an `Arc`) and the
+    /// byte range of this item within the decompressed payload, with
+    /// no per-call wrapper allocation. Designed for zero-allocation
+    /// FFI consumers — the C ABI's `zimru_item_blob_view` calls this
+    /// to skip the per-call `Box::new(zimru_blob_t)` that the
+    /// `get_data → zimru_blob_t` path pays.
+    ///
+    /// Pinning the cluster `Arc` keeps the decompressed payload alive
+    /// even if the cluster cache evicts the entry mid-use, so callers
+    /// can hold the returned slice across LRU pressure.
+    pub fn pinned_blob(&self) -> Result<(Arc<Cluster>, std::ops::Range<usize>)> {
         let cluster = self.archive.load_cluster(self.article.cluster)?;
         let range = cluster.blob_range(self.article.blob).map_err(|e| match e {
             Error::BadBlobIndex { blob, count, .. } => Error::BadBlobIndex {
@@ -1299,10 +1367,7 @@ impl Item {
             },
             other => other,
         })?;
-        Ok(Blob {
-            payload: cluster.payload().clone(),
-            range,
-        })
+        Ok((cluster, range))
     }
 }
 

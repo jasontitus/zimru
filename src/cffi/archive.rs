@@ -351,6 +351,40 @@ pub unsafe extern "C" fn zimru_archive_cluster_cache_max_bytes(
     (*arc).inner.cluster_cache_max_bytes()
 }
 
+/// Snapshot of cluster-cache occupancy and lifetime counters. Mirrors
+/// [`crate::ClusterCacheStats`]. Counters are monotonic over the
+/// archive's lifetime — useful for verifying hot-article hit ratios,
+/// tuning the byte budget against eviction pressure, or surfacing
+/// cache health to long-running-server telemetry.
+#[repr(C)]
+pub struct zimru_cluster_cache_stats_t {
+    pub max_bytes: u64,
+    pub current_bytes: u64,
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+/// Populate `out` with the cluster cache's current state. Safe on a
+/// NULL `arc` or `out` (no-op).
+#[no_mangle]
+pub unsafe extern "C" fn zimru_archive_cluster_cache_stats(
+    arc: *const zimru_archive_t,
+    out: *mut zimru_cluster_cache_stats_t,
+) {
+    if arc.is_null() || out.is_null() {
+        return;
+    }
+    let s = (*arc).inner.cluster_cache_stats();
+    (*out).max_bytes = s.max_bytes;
+    (*out).current_bytes = s.current_bytes;
+    (*out).entries = s.entries;
+    (*out).hits = s.hits;
+    (*out).misses = s.misses;
+    (*out).evictions = s.evictions;
+}
+
 /// Cover / thumbnail descriptor returned by
 /// [`zimru_archive_illustrations`]. Mirrors libzim's
 /// `IllustrationInfo`: width and height in pixels, and a `scale`
