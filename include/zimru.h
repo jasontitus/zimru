@@ -97,7 +97,8 @@ typedef struct zimru_archive_t zimru_archive_t;
 typedef struct zimru_blob_t zimru_blob_t;
 
 /**
- * Opaque writer handle. Empty placeholder for now.
+ * Opaque writer handle. Owns a [`Creator`] until `zimru_creator_write_to`
+ * consumes it.
  */
 typedef struct zimru_creator_t zimru_creator_t;
 
@@ -553,23 +554,155 @@ struct zimru_entry_t *zimru_archive_random_entry(const struct zimru_archive_t *a
  uintptr_t zimru_blob_size(const struct zimru_blob_t *b);
 
 /**
- * Allocate a new creator. Currently always succeeds; the writer C ABI
- * is otherwise unimplemented (see follow-up to issue #7).
+ * Allocate a new creator with default settings (Zstd level 3, 2 MiB
+ * cluster target, time-and-pid-seeded UUID). Always succeeds.
  */
  struct zimru_creator_t *zimru_creator_new(void);
 
 /**
- * Free a creator. Safe to call on NULL.
+ * Free a creator. Safe to call on NULL. Discards any still-buffered
+ * work if the creator was never finalized.
  */
  void zimru_creator_free(struct zimru_creator_t *c);
 
 /**
- * Placeholder for `Creator::write_to` — currently always errors out.
- * Real implementation lands with the rest of the writer C ABI.
+ * Set the cluster compression algorithm by ZIM info-byte ID:
+ *
+ * * `1` — uncompressed (`Compression::None`)
+ * * `4` — xz / lzma2 (`Compression::Xz`)
+ * * `5` — zstd, the default (`Compression::Zstd`)
+ *
+ * Other IDs return `false` with `*err` set to
+ * [`zimru_error_code::UnsupportedCompression`].
  */
 
-bool zimru_creator_write_to(struct zimru_creator_t *_c,
-                            const char *_path,
+bool zimru_creator_set_compression(struct zimru_creator_t *c,
+                                   uint8_t compression_id,
+                                   struct zimru_error_t **err);
+
+/**
+ * Set the compression level for the active algorithm. Range and meaning
+ * are algorithm-specific:
+ *
+ * * Zstd — `1..=22` (negative "fast" levels also accepted by libzstd).
+ *   Default `3`.
+ * * Xz — `0..=9`. Default `3`.
+ * * None — ignored.
+ */
+
+bool zimru_creator_set_compression_level(struct zimru_creator_t *c,
+                                         int32_t level,
+                                         struct zimru_error_t **err);
+
+/**
+ * Set the per-cluster decompressed-payload byte target. The bin-packer
+ * closes the current cluster once its accumulated payload would exceed
+ * this. Default 2 MiB matches `zimwriterfs` / `zimrecreate`.
+ */
+
+bool zimru_creator_set_cluster_size_target(struct zimru_creator_t *c,
+                                           uintptr_t bytes,
+                                           struct zimru_error_t **err);
+
+/**
+ * Set the archive UUID. `uuid` must point to 16 readable bytes; the
+ * bytes are copied (caller retains ownership).
+ */
+
+bool zimru_creator_set_uuid(struct zimru_creator_t *c,
+                            const uint8_t *uuid,
+                            struct zimru_error_t **err);
+
+/**
+ * Declare the archive's main page. A `W/mainPage` redirect to
+ * `C/<main_path>` is written at finalize time, matching how libzim
+ * readers locate the main page.
+ */
+
+bool zimru_creator_set_main_path(struct zimru_creator_t *c,
+                                 const char *main_path,
+                                 struct zimru_error_t **err);
+
+/**
+ * Add a content-namespace item (stored at `C/<path>`). `content` /
+ * `content_len` is copied — the caller retains ownership of the input
+ * buffer. Empty payloads (`content_len == 0`) are permitted.
+ *
+ * Duplicate paths are not detected here; the duplicate surfaces as a
+ * dirent-order failure at finalize time.
+ */
+
+bool zimru_creator_add_item(struct zimru_creator_t *c,
+                            const char *path,
+                            const char *title,
+                            const char *mimetype,
+                            const uint8_t *content,
+                            uintptr_t content_len,
+                            struct zimru_error_t **err);
+
+/**
+ * Add a metadata entry under `M/<name>`. `mimetype` is recorded
+ * verbatim in the dirent — typical values are
+ * `text/plain;charset=utf-8` (Title, Language, Description, …) and
+ * `image/png` (favicons on legacy archives).
+ */
+
+bool zimru_creator_add_metadata(struct zimru_creator_t *c,
+                                const char *name,
+                                const char *mimetype,
+                                const uint8_t *content,
+                                uintptr_t content_len,
+                                struct zimru_error_t **err);
+
+/**
+ * Add a square illustration of `side` pixels, stored at
+ * `M/Illustration_<side>x<side>@1`. `png` / `png_len` is copied — the
+ * caller retains ownership.
+ */
+
+bool zimru_creator_add_illustration(struct zimru_creator_t *c,
+                                    uint32_t side,
+                                    const uint8_t *png,
+                                    uintptr_t png_len,
+                                    struct zimru_error_t **err);
+
+/**
+ * Add a content-namespace redirect: `C/<path>` → `C/<target_path>`.
+ * The target is resolved at finalize time; an unresolved target is a
+ * hard failure of `zimru_creator_write_to`.
+ */
+
+bool zimru_creator_add_redirection(struct zimru_creator_t *c,
+                                   const char *path,
+                                   const char *title,
+                                   const char *target_path,
+                                   struct zimru_error_t **err);
+
+/**
+ * Add an alias entry. zimru does not yet implement true aliases (which
+ * would be a type-preserving copy of the target dirent under a new
+ * path/title); the implementation currently produces a redirect, which
+ * downstream readers handle gracefully. Callers that *require* alias
+ * semantics should test for a follow-up zimru release before relying
+ * on this.
+ */
+
+bool zimru_creator_add_alias(struct zimru_creator_t *c,
+                             const char *path,
+                             const char *title,
+                             const char *target_path,
+                             struct zimru_error_t **err);
+
+/**
+ * Materialize the archive at `path`. Consumes the buffered work — on
+ * success the only legal next call is `zimru_creator_free`. On failure
+ * `*err` is set; the creator's inner state has still been consumed
+ * (the partially-written file at `path` should be deleted by the
+ * caller if it exists).
+ */
+
+bool zimru_creator_write_to(struct zimru_creator_t *c,
+                            const char *path,
                             struct zimru_error_t **err);
 
 /**
