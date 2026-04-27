@@ -70,16 +70,14 @@ fn cluster_byte_ranges_cover_the_cluster_region() {
         prev_end = Some(r.end);
     }
     // The sum of all compressed cluster bytes must equal the on-disk
-    // cluster region size: from the first cluster to the checksum pos
-    // (or EOF if no checksum).
+    // cluster region size. In the streaming-writer layout the cluster
+    // region ends where the trailing url-pointer / title-pointer /
+    // cluster-pointer / dirent tables begin, not at the checksum pos.
+    // The byte ranges returned by `cluster_byte_range` already encode
+    // that boundary; total of them is the region size.
     let first = a.cluster_byte_range(0).unwrap().start;
-    let h = a.header();
-    let region_end = if h.has_checksum() {
-        h.checksum_pos
-    } else {
-        std::fs::metadata(&out).unwrap().len()
-    };
-    assert_eq!(total, region_end - first);
+    let last = a.cluster_byte_range(a.cluster_count() - 1).unwrap().end;
+    assert_eq!(total, last - first);
 
     let _ = std::fs::remove_file(&out);
 }

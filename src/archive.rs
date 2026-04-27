@@ -993,14 +993,46 @@ impl Archive {
         raw::u64_at(&self.core.mmap, off)
     }
 
-    /// End-of-cluster-region: where the last cluster ends. We use the checksum
-    /// position when present, otherwise the file length.
+    /// End-of-cluster-region: where the last cluster ends.
+    ///
+    /// In the legacy layout (mime + url_ptrs + title_ptrs +
+    /// cluster_ptrs + dirents come BEFORE clusters), the last
+    /// cluster ends at the MD5 trailer (checksum_pos).
+    ///
+    /// In the streaming-writer layout (mime list at offset 80, then
+    /// clusters, then url_ptrs / title_ptrs / cluster_ptrs / dirents,
+    /// then md5), the last cluster ends wherever the first table
+    /// region after the clusters begins. Compute that as the
+    /// minimum of every "post-cluster" header position that lies
+    /// after the start of the last cluster.
     fn cluster_region_end(&self) -> u64 {
-        if self.core.header.has_checksum() {
-            self.core.header.checksum_pos
+        let h = &self.core.header;
+        let last_cluster_start = if h.cluster_count > 0 {
+            // Read the last cluster pointer directly; if that fails
+            // (corruption?), fall back to the legacy assumption.
+            self.cluster_pointer(h.cluster_count - 1).unwrap_or(0)
         } else {
-            self.core.file_len
-        }
+            0
+        };
+        let candidates = [
+            h.url_ptr_pos,
+            h.title_ptr_pos,
+            h.cluster_ptr_pos,
+            if h.has_checksum() {
+                h.checksum_pos
+            } else {
+                self.core.file_len
+            },
+        ];
+        candidates
+            .into_iter()
+            .filter(|&p| p > last_cluster_start)
+            .min()
+            .unwrap_or(if h.has_checksum() {
+                h.checksum_pos
+            } else {
+                self.core.file_len
+            })
     }
 
     /// Public access to a decoded cluster by its index. The cluster is cached

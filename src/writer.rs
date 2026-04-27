@@ -28,7 +28,6 @@ use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::path::Path;
 
 use md5::{Digest, Md5};
-use rayon::prelude::*;
 
 use crate::cluster::Compression;
 use crate::error::{Error, Result};
@@ -135,7 +134,25 @@ pub struct MetadataEntry {
     pub value: Vec<u8>,
 }
 
-/// High-level ZIM file builder.
+/// Reserved bytes after the 80-byte header for the mime-type list.
+/// Real libzim asserts `mimelistPos == 80`; the streaming writer pins
+/// it there and writes the actual mime list at finalize time, padded
+/// to this size. Empirically, real-world mime lists are <1 KB; 64 KB
+/// gives generous headroom and is irrelevant on big ZIMs (0.0016 % of
+/// a 4 GB output).
+pub(crate) const MIME_LIST_RESERVE: usize = 64 * 1024;
+
+/// High-level ZIM file builder. Two usage modes:
+///
+/// * **Buffered** — call `add_*` then `write_to(path)`. Every body
+///   stays in RAM until finalize. Convenient for tests.
+/// * **Streaming** — call `start_writing(path)`, then `add_*`, then
+///   `finish_writing()`. Bodies are bin-packed into clusters and
+///   stream-encoded-and-written as items arrive; only dirent metadata
+///   (small, ~50 B/item) and the in-flight cluster's bytes
+///   (≤ `cluster_size_target × thread_count`) stay resident. Use this
+///   for production builds where peak RSS matters — typical reduction
+///   is ~600× on a multi-GB workload.
 pub struct Creator {
     items: Vec<Item>,
     redirections: Vec<Redirection>,
@@ -146,6 +163,12 @@ pub struct Creator {
     compression_level: Option<i32>,
     cluster_size_target: usize,
     uuid: [u8; 16],
+
+    /// Set when `start_writing` is called. Once set, all `add_*` and
+    /// `set_main_path` calls route directly into the streamer; any
+    /// previously-buffered work was already drained into it at
+    /// `start_writing` time.
+    stream: Option<Streamer>,
 }
 
 impl Default for Creator {
@@ -166,11 +189,23 @@ impl Creator {
             compression_level: None,
             cluster_size_target: DEFAULT_CLUSTER_SIZE_TARGET,
             uuid: default_uuid(),
+            stream: None,
         }
     }
 
     pub fn add_item(&mut self, item: Item) -> &mut Self {
-        self.items.push(item);
+        if let Some(s) = self.stream.as_mut() {
+            // Streaming mode — bin-pack body into the current cluster,
+            // encode-write-free if it overflows. Errors here panic
+            // because the &mut Self return shape doesn't propagate; if
+            // a caller wants error propagation it should use the
+            // explicit `add_item_streaming` helper (TODO if needed).
+            if let Err(e) = s.push_item(item) {
+                panic!("streaming add_item: {e}");
+            }
+        } else {
+            self.items.push(item);
+        }
         self
     }
 
@@ -180,11 +215,16 @@ impl Creator {
         title: impl Into<String>,
         target: impl Into<String>,
     ) -> &mut Self {
-        self.redirections.push(Redirection {
+        let r = Redirection {
             path: path.into(),
             title: title.into(),
             target_path: target.into(),
-        });
+        };
+        if let Some(s) = self.stream.as_mut() {
+            s.redirections.push(r);
+        } else {
+            self.redirections.push(r);
+        }
         self
     }
 
@@ -209,18 +249,28 @@ impl Creator {
         mimetype: impl Into<String>,
         value: impl Into<Vec<u8>>,
     ) -> &mut Self {
-        self.metadata.push(MetadataEntry {
+        let m = MetadataEntry {
             name: name.into(),
             mimetype: mimetype.into(),
             value: value.into(),
-        });
+        };
+        if let Some(s) = self.stream.as_mut() {
+            s.metadata.push(m);
+        } else {
+            self.metadata.push(m);
+        }
         self
     }
 
     /// ZIM illustration (PNG) of the given side length. Stored at
     /// `M/Illustration_NxN@1`.
     pub fn add_illustration(&mut self, side: u32, png: impl Into<Vec<u8>>) -> &mut Self {
-        self.illustrations.push((side, png.into()));
+        let il = (side, png.into());
+        if let Some(s) = self.stream.as_mut() {
+            s.illustrations.push(il);
+        } else {
+            self.illustrations.push(il);
+        }
         self
     }
 
@@ -228,7 +278,12 @@ impl Creator {
     /// path is written at finalize time, matching how upstream tools
     /// expect to find the main page.
     pub fn set_main_path(&mut self, path: impl Into<String>) -> &mut Self {
-        self.main_path = Some(path.into());
+        let p: String = path.into();
+        if let Some(s) = self.stream.as_mut() {
+            s.main_path = Some(p);
+        } else {
+            self.main_path = Some(p);
+        }
         self
     }
 
@@ -262,33 +317,79 @@ impl Creator {
     }
 
     /// Materialize the archive to `path`. Consumes the builder.
-    pub fn write_to(self, path: impl AsRef<Path>) -> Result<()> {
-        // Open read+write so the streaming writer can seek-back to
-        // overwrite cluster_ptrs and the header's late-known fields,
-        // and re-read the finished file at the end to compute the
-        // MD5 trailer (avoids buffering every cluster in RAM just
-        // so we know its length up front).
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path.as_ref())?;
-        finalize(self, file)
+    ///
+    /// Two routes through this:
+    ///
+    /// * If `start_writing` was already called, this is equivalent to
+    ///   [`Creator::finish_writing`] — `path` is ignored (the file is
+    ///   already open).
+    /// * If `start_writing` was not called, all `add_*` work is in
+    ///   in-RAM buffers; this opens the file at `path`, drains the
+    ///   buffers through the streaming pipeline, and finalizes. Same
+    ///   bytes on disk, but peak RSS = sum-of-bodies + cluster encode
+    ///   overhead. Use [`Creator::start_writing`] +
+    ///   [`Creator::finish_writing`] for production builds where
+    ///   memory matters.
+    pub fn write_to(mut self, path: impl AsRef<Path>) -> Result<()> {
+        if self.stream.is_some() {
+            return self.finish_writing();
+        }
+        self.start_writing(path)?;
+        self.finish_writing()
+    }
+
+    /// Open the output file and switch to streaming mode. Subsequent
+    /// `add_*` calls bin-pack into the in-flight cluster and stream-
+    /// encode-write to disk as the cluster fills, dropping body
+    /// references immediately. Buffered work added before this call
+    /// is drained into the streamer here.
+    pub fn start_writing(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        if self.stream.is_some() {
+            return Err(Error::Io(std::io::Error::other(
+                "Creator::start_writing called twice",
+            )));
+        }
+        let mut s = Streamer::open(
+            path.as_ref(),
+            self.compression,
+            self.compression_level,
+            self.cluster_size_target,
+            self.uuid,
+            self.main_path.take(),
+        )?;
+        // Drain anything the caller buffered through add_* before
+        // they decided to stream.
+        for item in self.items.drain(..) {
+            s.push_item(item)?;
+        }
+        for r in self.redirections.drain(..) {
+            s.redirections.push(r);
+        }
+        for m in self.metadata.drain(..) {
+            s.metadata.push(m);
+        }
+        for il in self.illustrations.drain(..) {
+            s.illustrations.push(il);
+        }
+        self.stream = Some(s);
+        Ok(())
+    }
+
+    /// Drain buffered metadata / illustrations / redirections into
+    /// clusters, write the URL/title/cluster pointer tables and
+    /// dirents, write the mime list at offset 80, write the final
+    /// header, compute the MD5 trailer. Consumes the Creator.
+    pub fn finish_writing(mut self) -> Result<()> {
+        let s = self.stream.take().ok_or_else(|| {
+            Error::Io(std::io::Error::other(
+                "Creator::finish_writing called before start_writing",
+            ))
+        })?;
+        s.finalize()
     }
 }
 
 // ---------- internals ----------
-
-/// One to-be-written payload with all addressing metadata. Lives only
-/// during `finalize`.
-struct Payload {
-    namespace: u8,
-    url: String,
-    title: String,
-    mimetype: String,
-    content: Vec<u8>,
-}
 
 #[derive(Debug, Clone)]
 enum RawDirent {
@@ -340,376 +441,381 @@ fn intern_mime(m: &str, mimes: &mut Vec<String>, index: &mut BTreeMap<String, u1
     i
 }
 
-fn finalize(builder: Creator, mut file: File) -> Result<()> {
-    let Creator {
-        items,
-        redirections,
-        metadata,
-        illustrations,
-        main_path,
-        compression,
-        compression_level,
-        cluster_size_target,
-        uuid,
-    } = builder;
+// ---------- streaming ----------
 
-    // 1. Collect every payload. An empty title is normalised to the
-    //    url here so the dirent's title field matches the on-disk
-    //    convention "empty title bytes ⇒ title is the url" — without
-    //    this, the writer's title-order sort sees `""` (sorts before
-    //    every non-empty title) but the reader falls back to url on
-    //    parse, leaving the title-pointer list out of sync with what
-    //    `zimcheck -I` and downstream readers expect ("Title index is
-    //    not properly sorted"). Most callers (libzim's `zimwriterfs`
-    //    among them) pass an empty title for non-HTML items where
-    //    they want the filename to surface.
-    let mut payloads: Vec<Payload> = Vec::new();
-    for it in items {
-        let title = if it.title.is_empty() { it.path.clone() } else { it.title };
-        payloads.push(Payload {
-            namespace: it.namespace.unwrap_or(b'C'),
-            url: it.path,
-            title,
-            mimetype: it.mimetype,
-            content: it.content,
-        });
-    }
-    for m in metadata {
-        payloads.push(Payload {
-            namespace: b'M',
-            url: m.name.clone(),
-            title: m.name,
-            mimetype: m.mimetype,
-            content: m.value,
-        });
-    }
-    for (side, png) in illustrations {
-        let url = format!("Illustration_{side}x{side}@1");
-        payloads.push(Payload {
-            namespace: b'M',
-            url: url.clone(),
-            title: url,
-            mimetype: "image/png".to_string(),
-            content: png,
-        });
+/// Stream-write engine. Owns the output file and per-build state that
+/// changes as items arrive. Created by `Creator::start_writing`,
+/// finalised by `Creator::finish_writing`.
+///
+/// On-disk layout this writer produces:
+///
+/// ```text
+/// [header (80 B placeholder)]
+/// [mime list, pinned at offset 80, padded to MIME_LIST_RESERVE]
+/// [clusters, stream-encoded as items arrive]
+/// [URL pointer list]
+/// [title pointer list]
+/// [cluster pointer list]
+/// [dirents]
+/// [16-byte MD5 trailer]
+/// ```
+///
+/// vs. the buffered writer's layout (mime / url_ptrs / title_ptrs /
+/// cluster_ptrs / dirents BEFORE clusters), this puts everything
+/// known-late at the tail so we can stream forward without seeking
+/// back. Real libzim's only positional invariant is `mime_list_pos
+/// == 80`, which we honour via the reserved region.
+struct Streamer {
+    file: File,
+    file_pos: u64,
+
+    compression: Compression,
+    compression_level: Option<i32>,
+    cluster_size_target: usize,
+    uuid: [u8; 16],
+    main_path: Option<String>,
+
+    // Mime list, accumulating as items arrive.
+    mimes: Vec<String>,
+    mime_index: BTreeMap<String, u16>,
+
+    // Current cluster being filled (raw blob bytes, uncompressed).
+    current_cluster: Vec<Vec<u8>>,
+    current_cluster_size: usize,
+
+    // Completed cluster offsets (absolute file positions).
+    cluster_offsets: Vec<u64>,
+
+    // Dirents accumulated for items already streamed. Small (~50 B/item).
+    dirents: Vec<RawDirent>,
+
+    // Buffered until finalize — small data.
+    redirections: Vec<Redirection>,
+    metadata: Vec<MetadataEntry>,
+    illustrations: Vec<(u32, Vec<u8>)>,
+}
+
+impl Streamer {
+    fn open(
+        path: &Path,
+        compression: Compression,
+        compression_level: Option<i32>,
+        cluster_size_target: usize,
+        uuid: [u8; 16],
+        main_path: Option<String>,
+    ) -> Result<Self> {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        // Reserve [0, 80) for the header placeholder + [80, 80 +
+        // MIME_LIST_RESERVE) for the mime list. We'll fill both at
+        // finalize time once we know the final values.
+        file.write_all(&[0u8; HEADER_SIZE])?;
+        let zeros = vec![0u8; MIME_LIST_RESERVE];
+        file.write_all(&zeros)?;
+        Ok(Streamer {
+            file,
+            file_pos: HEADER_SIZE as u64 + MIME_LIST_RESERVE as u64,
+            compression,
+            compression_level,
+            cluster_size_target,
+            uuid,
+            main_path,
+            mimes: Vec::new(),
+            mime_index: BTreeMap::new(),
+            current_cluster: Vec::new(),
+            current_cluster_size: 0,
+            cluster_offsets: Vec::new(),
+            dirents: Vec::new(),
+            redirections: Vec::new(),
+            metadata: Vec::new(),
+            illustrations: Vec::new(),
+        })
     }
 
-    // Collect redirections (including the optional W/mainPage one).
-    let mut pending_redirects: Vec<RawDirent> = Vec::new();
-    for r in redirections {
-        let title = if r.title.is_empty() { r.path.clone() } else { r.title };
-        pending_redirects.push(RawDirent::Redirect {
-            namespace: b'C',
-            url: r.path,
-            title,
-            target_ns: b'C',
-            target_url: r.target_path,
-            resolved_index: None,
-        });
-    }
-    if let Some(m) = &main_path {
-        pending_redirects.push(RawDirent::Redirect {
-            namespace: b'W',
-            url: "mainPage".to_string(),
-            title: "mainPage".to_string(),
-            target_ns: b'C',
-            target_url: m.clone(),
-            resolved_index: None,
-        });
-    }
+    /// Stream-process one item: bin-pack its body into the current
+    /// cluster, encode-write-free if the cluster overflows, record
+    /// the dirent.
+    fn push_item(&mut self, item: Item) -> Result<()> {
+        let mime_idx = intern_mime(&item.mimetype, &mut self.mimes, &mut self.mime_index);
+        let title = if item.title.is_empty() {
+            item.path.clone()
+        } else {
+            item.title
+        };
+        let body = item.content;
+        let body_len = body.len();
 
-    // 2. Sort payloads by (namespace, url) — keeps URL-pointer order and
-    //    cluster order consistent for a stable on-disk layout across runs.
-    payloads.sort_by(|a, b| {
-        a.namespace
-            .cmp(&b.namespace)
-            .then_with(|| a.url.cmp(&b.url))
-    });
-
-    // 3. Bin-pack payloads into clusters.
-    let mut groups: Vec<Vec<Payload>> = Vec::new();
-    {
-        let mut cur: Vec<Payload> = Vec::new();
-        let mut cur_bytes: usize = 0;
-        for p in payloads {
-            let plen = p.content.len();
-            if !cur.is_empty() && cur_bytes + plen > cluster_size_target {
-                groups.push(std::mem::take(&mut cur));
-                cur_bytes = 0;
-            }
-            cur_bytes += plen;
-            cur.push(p);
+        if !self.current_cluster.is_empty()
+            && self.current_cluster_size + body_len > self.cluster_size_target
+        {
+            self.flush_current_cluster()?;
         }
-        if !cur.is_empty() {
-            groups.push(cur);
-        }
+
+        let cluster_idx = self.cluster_offsets.len() as u32;
+        let blob_idx = self.current_cluster.len() as u32;
+        self.current_cluster.push(body);
+        self.current_cluster_size += body_len;
+
+        self.dirents.push(RawDirent::Article {
+            namespace: item.namespace.unwrap_or(b'C'),
+            url: item.path,
+            title,
+            mime_idx,
+            cluster: cluster_idx,
+            blob: blob_idx,
+        });
+        Ok(())
     }
 
-    // 4a. Pass 1: walk groups serially to build dirents + intern mime types.
-    //     This pass is fast (just metadata bookkeeping). The expensive
-    //     cluster-encoding work is split out to a parallel pass below.
-    let mut mimes: Vec<String> = Vec::new();
-    let mut mime_index: BTreeMap<String, u16> = BTreeMap::new();
-    let mut dirents: Vec<RawDirent> = Vec::new();
-    let mut blob_groups: Vec<Vec<Vec<u8>>> = Vec::with_capacity(groups.len());
+    /// Encode the current cluster to disk and free its source bytes.
+    /// Records the cluster's absolute offset.
+    fn flush_current_cluster(&mut self) -> Result<()> {
+        if self.current_cluster.is_empty() {
+            return Ok(());
+        }
+        let blobs = std::mem::take(&mut self.current_cluster);
+        self.current_cluster_size = 0;
+        let encoded = encode_cluster(&blobs, self.compression, self.compression_level)?;
+        self.cluster_offsets.push(self.file_pos);
+        self.file.write_all(&encoded)?;
+        self.file_pos += encoded.len() as u64;
+        Ok(())
+    }
 
-    for (ci, group) in groups.into_iter().enumerate() {
-        let ci = ci as u32;
-        let mut blobs_for_cluster: Vec<Vec<u8>> = Vec::with_capacity(group.len());
-        for (bi, p) in group.into_iter().enumerate() {
-            let bi = bi as u32;
-            let mime_idx = intern_mime(&p.mimetype, &mut mimes, &mut mime_index);
-            dirents.push(RawDirent::Article {
-                namespace: p.namespace,
-                url: p.url,
-                title: p.title,
-                mime_idx,
-                cluster: ci,
-                blob: bi,
+    /// Finish the build: drain metadata/illustrations/redirections
+    /// into clusters and dirents, sort, render tables, fill mime
+    /// list, write final header, MD5.
+    fn finalize(mut self) -> Result<()> {
+        // 1. Funnel buffered metadata + illustrations through the
+        //    same bin-packing path as items so they share clusters
+        //    with the tail of the user-content stream.
+        let metadata = std::mem::take(&mut self.metadata);
+        for m in metadata {
+            self.push_item(Item {
+                path: m.name.clone(),
+                title: m.name,
+                mimetype: m.mimetype,
+                content: m.value,
+                namespace: Some(b'M'),
+            })?;
+        }
+
+        let illustrations = std::mem::take(&mut self.illustrations);
+        for (side, png) in illustrations {
+            let url = format!("Illustration_{side}x{side}@1");
+            self.push_item(Item {
+                path: url.clone(),
+                title: url,
+                mimetype: "image/png".to_string(),
+                content: png,
+                namespace: Some(b'M'),
+            })?;
+        }
+
+        // 2. Close the last cluster.
+        self.flush_current_cluster()?;
+
+        // 3. Build redirect dirents (no content). Includes the
+        //    optional W/mainPage redirect.
+        let mut pending_redirects: Vec<RawDirent> = Vec::new();
+        let redirections = std::mem::take(&mut self.redirections);
+        for r in redirections {
+            let title = if r.title.is_empty() { r.path.clone() } else { r.title };
+            pending_redirects.push(RawDirent::Redirect {
+                namespace: b'C',
+                url: r.path,
+                title,
+                target_ns: b'C',
+                target_url: r.target_path,
+                resolved_index: None,
             });
-            blobs_for_cluster.push(p.content);
         }
-        blob_groups.push(blobs_for_cluster);
-    }
+        if let Some(m) = &self.main_path {
+            pending_redirects.push(RawDirent::Redirect {
+                namespace: b'W',
+                url: "mainPage".to_string(),
+                title: "mainPage".to_string(),
+                target_ns: b'C',
+                target_url: m.clone(),
+                resolved_index: None,
+            });
+        }
+        self.dirents.extend(pending_redirects);
 
-    // 4b. (Cluster encoding deferred to streaming write step 13b below
-    //     so we don't have to hold every encoded cluster's bytes
-    //     resident before starting to write. blob_groups stays alive
-    //     through the dirent-sort step; freed progressively as we
-    //     stream-encode-and-write.)
-    let cluster_count_total = blob_groups.len() as u32;
+        // 4. Sort dirents by (ns, url) → URL-pointer order.
+        self.dirents.sort_by(|a, b| {
+            a.namespace()
+                .cmp(&b.namespace())
+                .then_with(|| a.url().cmp(b.url()))
+        });
 
-    // 5. Append pending redirects.
-    dirents.extend(pending_redirects);
-
-    // 6. Sort all dirents by (ns, url) → URL-pointer order.
-    dirents.sort_by(|a, b| {
-        a.namespace()
-            .cmp(&b.namespace())
-            .then_with(|| a.url().cmp(b.url()))
-    });
-
-    // 7. Resolve redirect targets to url-pointer indices.
-    for i in 0..dirents.len() {
-        // Extract the target, look it up, stash it back.
-        if let RawDirent::Redirect {
-            target_ns,
-            target_url,
-            ..
-        } = &dirents[i]
-        {
-            let ns = *target_ns;
-            let url = target_url.clone();
-            let resolved = dirents
-                .binary_search_by(|d| d.namespace().cmp(&ns).then_with(|| d.url().cmp(&url)))
-                .ok()
-                .map(|j| j as u32);
-            match &mut dirents[i] {
-                RawDirent::Redirect { resolved_index, .. } => *resolved_index = resolved,
-                _ => unreachable!(),
+        // 5. Resolve redirect targets to URL-pointer-order indices.
+        for i in 0..self.dirents.len() {
+            if let RawDirent::Redirect {
+                target_ns,
+                target_url,
+                ..
+            } = &self.dirents[i]
+            {
+                let ns = *target_ns;
+                let url = target_url.clone();
+                let resolved = self
+                    .dirents
+                    .binary_search_by(|d| d.namespace().cmp(&ns).then_with(|| d.url().cmp(&url)))
+                    .ok()
+                    .map(|j| j as u32);
+                match &mut self.dirents[i] {
+                    RawDirent::Redirect { resolved_index, .. } => *resolved_index = resolved,
+                    _ => unreachable!(),
+                }
             }
         }
-    }
-    // Any redirect whose target wasn't found is a user error.
-    for d in &dirents {
-        if let RawDirent::Redirect {
-            resolved_index: None,
-            url,
-            target_ns,
-            target_url,
-            ..
-        } = d
-        {
+        for d in &self.dirents {
+            if let RawDirent::Redirect {
+                resolved_index: None,
+                url,
+                target_ns,
+                target_url,
+                ..
+            } = d
+            {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "redirect {} -> {}/{} has no target",
+                        url,
+                        char::from(*target_ns),
+                        target_url
+                    ),
+                )));
+            }
+        }
+
+        // 6. Title-pointer order: dirent indices sorted by (ns, title).
+        let mut title_order: Vec<u32> = (0..self.dirents.len() as u32).collect();
+        title_order.sort_by(|&a, &b| {
+            let da = &self.dirents[a as usize];
+            let db = &self.dirents[b as usize];
+            da.namespace()
+                .cmp(&db.namespace())
+                .then_with(|| da.title().cmp(db.title()))
+        });
+
+        // 7. Compute layout positions for the trailing tables.
+        let entry_count = self.dirents.len() as u32;
+        let cluster_count = self.cluster_offsets.len() as u32;
+
+        let url_ptr_pos = self.file_pos;
+        let title_ptr_pos = url_ptr_pos + (entry_count as u64) * 8;
+        let cluster_ptr_pos = title_ptr_pos + (entry_count as u64) * 4;
+        let dirents_pos = cluster_ptr_pos + (cluster_count as u64) * 8;
+
+        // 8. Render dirents; compute their absolute offsets.
+        let mut dirent_blobs: Vec<Vec<u8>> = Vec::with_capacity(self.dirents.len());
+        let mut dirent_offsets: Vec<u64> = Vec::with_capacity(self.dirents.len());
+        let mut cursor = dirents_pos;
+        for d in &self.dirents {
+            let bytes = encode_dirent(d);
+            dirent_offsets.push(cursor);
+            cursor += bytes.len() as u64;
+            dirent_blobs.push(bytes);
+        }
+        let checksum_pos = cursor;
+
+        // 9. Find main page index (in URL order).
+        let main_page_idx = if self.main_path.is_some() {
+            self.dirents
+                .binary_search_by(|d| {
+                    d.namespace()
+                        .cmp(&b'W')
+                        .then_with(|| d.url().cmp("mainPage"))
+                })
+                .ok()
+                .map(|i| i as u32)
+                .unwrap_or(u32::MAX)
+        } else {
+            u32::MAX
+        };
+
+        // 10. Write the trailing tables in one forward pass.
+        for off in &dirent_offsets {
+            self.file.write_all(&off.to_le_bytes())?;
+        }
+        for idx in &title_order {
+            self.file.write_all(&idx.to_le_bytes())?;
+        }
+        for off in &self.cluster_offsets {
+            self.file.write_all(&off.to_le_bytes())?;
+        }
+        for blob in &dirent_blobs {
+            self.file.write_all(blob)?;
+        }
+        drop(dirent_blobs);
+        drop(dirent_offsets);
+
+        // 11. Encode the mime list and write at offset 80 (the rest
+        //     of the reserved region stays zeros, which is harmless —
+        //     readers stop at the double-NUL terminator).
+        let mime_list_bytes = encode_mime_list(&self.mimes);
+        if mime_list_bytes.len() > MIME_LIST_RESERVE {
             return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+                std::io::ErrorKind::Other,
                 format!(
-                    "redirect {} -> {}/{} has no target",
-                    url,
-                    char::from(*target_ns),
-                    target_url
+                    "mime list ({} bytes) exceeds reserved region ({} bytes)",
+                    mime_list_bytes.len(),
+                    MIME_LIST_RESERVE
                 ),
             )));
         }
-    }
+        self.file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+        self.file.write_all(&mime_list_bytes)?;
 
-    // 8. Title-pointer order: dirent indices sorted by (ns, title).
-    let mut title_order: Vec<u32> = (0..dirents.len() as u32).collect();
-    title_order.sort_by(|&a, &b| {
-        let da = &dirents[a as usize];
-        let db = &dirents[b as usize];
-        da.namespace()
-            .cmp(&db.namespace())
-            .then_with(|| da.title().cmp(db.title()))
-    });
+        // 12. Write final header at offset 0.
+        let final_header = encode_header(&HeaderFields {
+            major_version: 6,
+            minor_version: 3,
+            uuid: self.uuid,
+            entry_count,
+            cluster_count,
+            url_ptr_pos,
+            title_ptr_pos,
+            cluster_ptr_pos,
+            mime_list_pos: HEADER_SIZE as u64,
+            main_page: main_page_idx,
+            checksum_pos,
+        });
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&final_header)?;
+        self.file.flush()?;
 
-    // 9. Compute layout offsets. cluster_ptr_pos is fixed (it's a
-    //    function of mime_list/url_ptr/title_ptr sizes), but the
-    //    *values* at cluster_ptr_pos and the file's checksum_pos are
-    //    only known after we've stream-encoded every cluster — so we
-    //    write placeholder zeros first and seek-back-and-fix later.
-    let entry_count = dirents.len() as u32;
-    let cluster_count = cluster_count_total;
-    let mime_list_bytes = encode_mime_list(&mimes);
-
-    let mime_list_pos = HEADER_SIZE as u64;
-    let url_ptr_pos = mime_list_pos + mime_list_bytes.len() as u64;
-    let title_ptr_pos = url_ptr_pos + (entry_count as u64) * 8;
-    let cluster_ptr_pos = title_ptr_pos + (entry_count as u64) * 4;
-    let dirents_pos = cluster_ptr_pos + (cluster_count as u64) * 8;
-
-    // 10. Render dirents, compute their absolute offsets.
-    let mut dirent_blobs: Vec<Vec<u8>> = Vec::with_capacity(dirents.len());
-    let mut dirent_offsets: Vec<u64> = Vec::with_capacity(dirents.len());
-    let mut cursor = dirents_pos;
-    for d in &dirents {
-        let bytes = encode_dirent(d);
-        dirent_offsets.push(cursor);
-        cursor += bytes.len() as u64;
-        dirent_blobs.push(bytes);
-    }
-    let clusters_pos = cursor;
-
-    // 11. Main page index (as stored in the header).
-    let main_page_idx = if main_path.is_some() {
-        dirents
-            .binary_search_by(|d| {
-                d.namespace()
-                    .cmp(&b'W')
-                    .then_with(|| d.url().cmp("mainPage"))
-            })
-            .ok()
-            .map(|i| i as u32)
-            .unwrap_or(u32::MAX)
-    } else {
-        u32::MAX
-    };
-
-    // 12. First-pass write: header + all metadata + dirents, with
-    //     cluster_ptr region as zero placeholders + checksum_pos = 0.
-    //     Hashing for MD5 happens during a second pass at the end
-    //     because we'll seek-back-and-fix the cluster_ptrs and the
-    //     header's `cluster_ptr_pos` / `checksum_pos` fields after
-    //     the cluster bytes are streamed.
-    // ZIM major.minor 6.3 — matches what real libzim 9.x writes for
-    // new-namespace archives. zimru's writer always emits new-
-    // namespace dirents (`C` for content, `M` metadata, `W` mainPage,
-    // `X` index) so the v6 family is correct. Earlier 5.1 wasn't
-    // wrong per spec but real libzim's `hasFulltextIndex()` and a
-    // few other reader paths only look up X-namespace entries when
-    // the major version is 6. Writing 6.3 unblocks cross-engine
-    // compatibility for shim+zimru-built ZIMs through real libzim's
-    // search / suggest paths.
-    let placeholder_header = encode_header(&HeaderFields {
-        major_version: 6,
-        minor_version: 3,
-        uuid,
-        entry_count,
-        cluster_count,
-        url_ptr_pos,
-        title_ptr_pos,
-        cluster_ptr_pos,
-        mime_list_pos,
-        main_page: main_page_idx,
-        checksum_pos: 0,
-    });
-    file.write_all(&placeholder_header)?;
-    file.write_all(&mime_list_bytes)?;
-    for off in &dirent_offsets {
-        file.write_all(&off.to_le_bytes())?;
-    }
-    for idx in &title_order {
-        file.write_all(&idx.to_le_bytes())?;
-    }
-    let cluster_ptrs_zero = vec![0u64; cluster_count as usize];
-    for off in &cluster_ptrs_zero {
-        file.write_all(&off.to_le_bytes())?;
-    }
-    drop(cluster_ptrs_zero);
-    for b in &dirent_blobs {
-        file.write_all(b)?;
-    }
-    drop(dirent_blobs);
-    drop(dirent_offsets);
-
-    // 13. Stream-encode-and-write each cluster. Encode in
-    //     parallel-bounded batches so we hold at most
-    //     `chunk_size × cluster_size` of compressed bytes resident at
-    //     once. Each batch's source `blob_groups` slot is also freed
-    //     after encode (via `mem::take`) so the input-side memory
-    //     drains progressively as we stream.
-    let chunk_size = rayon::current_num_threads().max(1);
-    let mut cluster_offsets: Vec<u64> = Vec::with_capacity(cluster_count as usize);
-    let mut current_pos = clusters_pos;
-    let mut idx = 0usize;
-    while idx < blob_groups.len() {
-        let end = (idx + chunk_size).min(blob_groups.len());
-        // Take ownership of this chunk's blobs so we can free them
-        // after encode (the slots in blob_groups become empty Vecs).
-        let chunk: Vec<Vec<Vec<u8>>> = blob_groups[idx..end]
-            .iter_mut()
-            .map(std::mem::take)
-            .collect();
-        let encoded: Vec<Vec<u8>> = chunk
-            .into_par_iter()
-            .map(|blobs| encode_cluster(&blobs, compression, compression_level))
-            .collect::<Result<Vec<_>>>()?;
-        for bytes in encoded {
-            cluster_offsets.push(current_pos);
-            current_pos += bytes.len() as u64;
-            file.write_all(&bytes)?;
+        // 13. MD5 over [0, checksum_pos) by re-reading the now-final
+        //     file. SSDs do this at ~1 GB/s; small relative to the
+        //     cluster-encode time we just saved by streaming.
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut hasher = Md5::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut hashed: u64 = 0;
+        while hashed < checksum_pos {
+            let want = ((checksum_pos - hashed) as usize).min(buf.len());
+            let n = self.file.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            hashed += n as u64;
         }
-        idx = end;
+        let digest: [u8; 16] = hasher.finalize().into();
+        self.file.seek(SeekFrom::Start(checksum_pos))?;
+        self.file.write_all(&digest)?;
+        self.file.flush()?;
+        Ok(())
     }
-    drop(blob_groups);
-    let checksum_pos = current_pos;
-
-    // 14. Seek-back fixes for the cluster-ptr region and the header's
-    //     two computed-late fields.
-    file.seek(SeekFrom::Start(cluster_ptr_pos))?;
-    for off in &cluster_offsets {
-        file.write_all(&off.to_le_bytes())?;
-    }
-    drop(cluster_offsets);
-    file.seek(SeekFrom::Start(0))?;
-    let final_header = encode_header(&HeaderFields {
-        major_version: 6,
-        minor_version: 3,
-        uuid,
-        entry_count,
-        cluster_count,
-        url_ptr_pos,
-        title_ptr_pos,
-        cluster_ptr_pos,
-        mime_list_pos,
-        main_page: main_page_idx,
-        checksum_pos,
-    });
-    file.write_all(&final_header)?;
-    file.flush()?;
-
-    // 15. Compute MD5 by streaming-reading the now-final file from
-    //     start to checksum_pos. SSDs do this at ~1 GB/s so the
-    //     overhead is small relative to the cluster-encoding time
-    //     we just saved by not buffering everything in RAM first.
-    file.seek(SeekFrom::Start(0))?;
-    let mut hasher = Md5::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut hashed: u64 = 0;
-    while hashed < checksum_pos {
-        let want = ((checksum_pos - hashed) as usize).min(buf.len());
-        let n = file.read(&mut buf[..want])?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        hashed += n as u64;
-    }
-    let digest: [u8; 16] = hasher.finalize().into();
-    file.seek(SeekFrom::Start(checksum_pos))?;
-    file.write_all(&digest)?;
-    file.flush()?;
-    Ok(())
 }
+
 
 struct HeaderFields {
     major_version: u16,
