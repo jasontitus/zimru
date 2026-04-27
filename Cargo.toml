@@ -70,7 +70,7 @@ test = false
 
 [dependencies]
 memmap2 = "0.9"
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.13", default-features = false, features = ["zstdmt"] }
 xz2 = "0.1"
 md-5 = { version = "0.10", features = ["asm"] }
 rayon = "1"
@@ -80,7 +80,7 @@ lru = "0.12"
 [dev-dependencies]
 hex = "0.4"
 md-5 = { version = "0.10", features = ["asm"] }
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.13", default-features = false, features = ["zstdmt"] }
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 
 [[bench]]

@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use md5::{Digest, Md5};
 use rayon::prelude::*;
@@ -133,6 +134,100 @@ pub struct MetadataEntry {
     pub name: String,
     pub mimetype: String,
     pub value: Vec<u8>,
+}
+
+/// Per-build statistics emitted by the streaming writer at finalize
+/// time. Held inside [`Streamer`] and printed to stderr if the
+/// `ZIMRU_STATS=1` env var is set, or always when the binary
+/// passed `--verbose`-style instrumentation is wired in. The user-
+/// visible breakdown lets us pin where wall-time and bytes-out are
+/// going on a multi-GB build:
+///
+/// * how many items took each routing path
+///   (`add_item` buffered, chunked-buffered, chunked-streamed),
+/// * how many clusters of each flavour ended up on disk
+///   (parallel-batch encoded buckets, streamed huge items),
+/// * total time spent in each phase
+///   (bucket flush + parallel encode, streaming-encode, table
+///   write, MD5 trailer, post-write verify),
+/// * raw input bytes vs compressed output bytes (compression
+///   ratio).
+#[derive(Default, Debug)]
+pub struct BuildStats {
+    pub items_buffered: u64,
+    pub items_streamed: u64,
+    pub raw_bytes_total: u64,
+    pub clusters_buffered: u64,
+    pub clusters_streamed: u64,
+    pub bytes_clusters_written: u64,
+    pub parallel_encode: Duration,
+    pub streaming_encode: Duration,
+    pub table_write: Duration,
+    pub md5_pass: Duration,
+    pub verify_pass: Duration,
+}
+
+impl BuildStats {
+    fn print_summary(&self, started: Instant, output_size: u64) {
+        let total = started.elapsed();
+        let pct = |d: Duration| -> f64 {
+            if total.is_zero() {
+                0.0
+            } else {
+                100.0 * d.as_secs_f64() / total.as_secs_f64()
+            }
+        };
+        let mb = |b: u64| -> f64 { b as f64 / (1024.0 * 1024.0) };
+        let ratio = if self.raw_bytes_total > 0 {
+            mb(self.bytes_clusters_written) / mb(self.raw_bytes_total)
+        } else {
+            0.0
+        };
+        eprintln!("--- zimru BuildStats ---");
+        eprintln!(
+            "  total wall:           {:>8.2}s",
+            total.as_secs_f64()
+        );
+        eprintln!(
+            "  parallel encode:      {:>8.2}s ({:.1}%)  buffered clusters: {}",
+            self.parallel_encode.as_secs_f64(),
+            pct(self.parallel_encode),
+            self.clusters_buffered
+        );
+        eprintln!(
+            "  streaming encode:     {:>8.2}s ({:.1}%)  streamed clusters: {}",
+            self.streaming_encode.as_secs_f64(),
+            pct(self.streaming_encode),
+            self.clusters_streamed
+        );
+        eprintln!(
+            "  table+dirent write:   {:>8.2}s ({:.1}%)",
+            self.table_write.as_secs_f64(),
+            pct(self.table_write)
+        );
+        eprintln!(
+            "  MD5 trailer:          {:>8.2}s ({:.1}%)",
+            self.md5_pass.as_secs_f64(),
+            pct(self.md5_pass)
+        );
+        eprintln!(
+            "  post-write verify:    {:>8.2}s ({:.1}%)",
+            self.verify_pass.as_secs_f64(),
+            pct(self.verify_pass)
+        );
+        eprintln!(
+            "  items: buffered={}  streamed={}  raw_input={:.1} MB",
+            self.items_buffered,
+            self.items_streamed,
+            mb(self.raw_bytes_total)
+        );
+        eprintln!(
+            "  output: file={:.1} MB  cluster_bytes={:.1} MB  ratio={:.3}",
+            mb(output_size),
+            mb(self.bytes_clusters_written),
+            ratio
+        );
+    }
 }
 
 /// Threshold for switching from buffered-chunked-item mode (which
@@ -779,6 +874,12 @@ struct Streamer {
     // streaming-encode variant can swap the file out while the
     // encoder owns it.
     in_flight: Option<ChunkedInFlight>,
+
+    // Per-build telemetry. Updated at every routing decision and
+    // every encode call. Printed to stderr at finalize time if
+    // `ZIMRU_STATS` is set in the environment.
+    started: Instant,
+    stats: BuildStats,
 }
 
 /// One in-flight cluster's worth of un-flushed work for a single
@@ -858,6 +959,8 @@ impl Streamer {
             metadata: Vec::new(),
             illustrations: Vec::new(),
             in_flight: None,
+            started: Instant::now(),
+            stats: BuildStats::default(),
         })
     }
 
@@ -880,6 +983,8 @@ impl Streamer {
 
         if use_streaming {
             let expected = expected_size.unwrap();
+            self.stats.items_streamed += 1;
+            self.stats.raw_bytes_total += expected;
             // Drain pending parallel-encode and flush every open
             // bucket. We must do this before taking the file because
             // those flushes write through `self.file_mut()`.
@@ -930,6 +1035,16 @@ impl Streamer {
             });
             let mut encoder = zstd::stream::Encoder::new(file, level)
                 .map_err(|e| Error::Decompression(format!("zstd init: {e}")))?;
+            // Enable zstd's internal multi-worker parallelism for the
+            // streaming-encode path. Single-threaded encode of a 1.7 GB
+            // file at zstd 19 takes ~10 minutes (~3 MB/s); with N
+            // workers it drops to ~10/N minutes. We use `rayon`'s
+            // worker count so the choice tracks `--threads N` /
+            // RAYON_NUM_THREADS / cpu count consistently. zstd
+            // gracefully degrades to single-thread if the binding
+            // wasn't compiled with multithreading.
+            let workers = rayon::current_num_threads().max(1) as u32;
+            let _ = encoder.multithread(workers);
             encoder
                 .write_all(&header)
                 .map_err(|e| Error::Decompression(format!("zstd header write: {e}")))?;
@@ -979,10 +1094,17 @@ impl Streamer {
                         *expected_size
                     ))));
                 }
-                encoder
+                let phase_start = Instant::now();
+                let r = encoder
                     .write_all(chunk)
-                    .map_err(|e| Error::Decompression(format!("zstd chunk write: {e}")))?;
-                *bytes_written += chunk.len() as u64;
+                    .map_err(|e| Error::Decompression(format!("zstd chunk write: {e}")));
+                self.stats.streaming_encode += phase_start.elapsed();
+                r?;
+                if let Some(ChunkedInFlight::StreamingZstd { bytes_written, .. }) =
+                    self.in_flight.as_mut()
+                {
+                    *bytes_written += chunk.len() as u64;
+                }
                 Ok(())
             }
         }
@@ -1017,9 +1139,11 @@ impl Streamer {
                         bytes_written, expected_size
                     ))));
                 }
+                let phase_start = Instant::now();
                 let mut file = encoder
                     .finish()
                     .map_err(|e| Error::Decompression(format!("zstd finish: {e}")))?;
+                self.stats.streaming_encode += phase_start.elapsed();
                 // The encoder advanced the OS file cursor by however
                 // many compressed bytes it wrote; recover the new
                 // position.
@@ -1028,6 +1152,8 @@ impl Streamer {
                 self.cluster_offsets[cluster_idx as usize] = cluster_start;
                 self.file_pos = new_pos;
                 self.file = Some(file);
+                self.stats.clusters_streamed += 1;
+                self.stats.bytes_clusters_written += written;
 
                 let title = if meta.title.is_empty() {
                     meta.path.clone()
@@ -1081,6 +1207,8 @@ impl Streamer {
         };
         let body = item.content;
         let body_len = body.len();
+        self.stats.items_buffered += 1;
+        self.stats.raw_bytes_total += body_len as u64;
         let key = self.bucket_key(&item.path, &item.mimetype);
 
         // Ensure the bucket exists, then check overflow against
@@ -1161,7 +1289,9 @@ impl Streamer {
         if self.pending_encode.is_empty() {
             return Ok(());
         }
+        let phase_start = Instant::now();
         let chunk = std::mem::take(&mut self.pending_encode);
+        let chunk_len = chunk.len() as u64;
         let comp = self.compression;
         let level = self.compression_level;
         let mut encoded: Vec<(u32, Vec<u8>)> = chunk
@@ -1171,11 +1301,16 @@ impl Streamer {
             })
             .collect::<Result<Vec<_>>>()?;
         encoded.sort_by_key(|(idx, _)| *idx);
+        let mut bytes_written = 0u64;
         for (idx, bytes) in encoded {
             self.cluster_offsets[idx as usize] = self.file_pos;
+            bytes_written += bytes.len() as u64;
             self.file_mut().write_all(&bytes)?;
             self.file_pos += bytes.len() as u64;
         }
+        self.stats.parallel_encode += phase_start.elapsed();
+        self.stats.clusters_buffered += chunk_len;
+        self.stats.bytes_clusters_written += bytes_written;
         Ok(())
     }
 
@@ -1353,6 +1488,7 @@ impl Streamer {
         };
 
         // 10. Write the trailing tables in one forward pass.
+        let table_phase = Instant::now();
         for off in &dirent_offsets {
             self.file_mut().write_all(&off.to_le_bytes())?;
         }
@@ -1368,6 +1504,7 @@ impl Streamer {
         }
         drop(dirent_blobs);
         drop(dirent_offsets);
+        self.stats.table_write += table_phase.elapsed();
 
         // 11. Encode the mime list and write at offset 80 (the rest
         //     of the reserved region stays zeros, which is harmless —
@@ -1407,6 +1544,7 @@ impl Streamer {
         // 13. MD5 over [0, checksum_pos) by re-reading the now-final
         //     file. SSDs do this at ~1 GB/s; small relative to the
         //     cluster-encode time we just saved by streaming.
+        let md5_phase = Instant::now();
         self.file_mut().seek(SeekFrom::Start(0))?;
         let mut hasher = Md5::new();
         let mut buf = vec![0u8; 64 * 1024];
@@ -1424,6 +1562,7 @@ impl Streamer {
         self.file_mut().seek(SeekFrom::Start(checksum_pos))?;
         self.file_mut().write_all(&digest)?;
         self.file_mut().flush()?;
+        self.stats.md5_pass += md5_phase.elapsed();
 
         // 14. Verify the just-written archive opens cleanly and
         //     passes every structural check we have. This is the
@@ -1438,11 +1577,23 @@ impl Streamer {
         //     file (mmap + zimru's checks); cost is sub-second on
         //     small ZIMs, ~1-2 s per GB on big ZIMs.
         let path = self.output_path.clone();
+        let started = self.started;
+        let mut stats = std::mem::take(&mut self.stats);
         // Drop our File handle before the Archive opens it — keeps
         // ownership clean and avoids the verify path racing on a
         // still-open writer fd.
         drop(self);
+
+        let verify_phase = Instant::now();
         verify_archive(&path)?;
+        stats.verify_pass += verify_phase.elapsed();
+
+        // Print only when the user explicitly asks via env var, so
+        // routine cargo-test runs stay quiet.
+        if std::env::var_os("ZIMRU_STATS").is_some() {
+            let output_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            stats.print_summary(started, output_size);
+        }
         Ok(())
     }
 }
