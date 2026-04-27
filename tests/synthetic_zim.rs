@@ -879,7 +879,10 @@ fn legacy_archive_media_count_includes_non_article_namespaces() {
     let path = write_temp("legacy_media_count", &zim);
     let arc = Archive::open(&path).unwrap();
 
-    assert!(!arc.header().uses_new_namespaces(), "legacy archive expected");
+    assert!(
+        !arc.header().uses_new_namespaces(),
+        "legacy archive expected"
+    );
     // Two text/html articles in `A/` (not counting the redirect).
     assert_eq!(arc.article_count().unwrap(), 2);
     // Two media items: `-/style.css` and `I/img.png`. The `M/Title` and

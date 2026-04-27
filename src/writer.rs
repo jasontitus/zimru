@@ -184,10 +184,7 @@ impl BuildStats {
             0.0
         };
         eprintln!("--- zimru BuildStats ---");
-        eprintln!(
-            "  total wall:           {:>8.2}s",
-            total.as_secs_f64()
-        );
+        eprintln!("  total wall:           {:>8.2}s", total.as_secs_f64());
         eprintln!(
             "  parallel encode:      {:>8.2}s ({:.1}%)  buffered clusters: {}",
             self.parallel_encode.as_secs_f64(),
@@ -320,10 +317,7 @@ pub(crate) enum ChunkedInFlight {
     /// Buffered: chunks append to `content`. At `finish` time the
     /// assembled body goes through `Streamer::push_item` like a
     /// regular `add_item` call.
-    Buffered {
-        meta: ChunkedMeta,
-        content: Vec<u8>,
-    },
+    Buffered { meta: ChunkedMeta, content: Vec<u8> },
     /// Streaming-encode: chunks feed a zstd encoder that writes to
     /// a per-item *temp file* (not the main output). At
     /// `end_chunked_item` we hand the encoder + temp-file path off
@@ -371,10 +365,11 @@ pub(crate) const MIME_LIST_RESERVE: usize = 64 * 1024;
 /// per-cluster averages (less dictionary warmup → worse
 /// compression on under-filled clusters). Empirically, gains are
 /// largest on ZIMs with non-trivial mime / extension diversity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterStrategy {
     /// One in-flight cluster, items packed in `add_item` order
     /// (URL-sort order if the caller is the buffered API). Default.
+    #[default]
     Single,
     /// One in-flight cluster per distinct mime type. HTML items go
     /// together, JSON items go together, PNG items go together, and
@@ -389,12 +384,6 @@ pub enum ClusterStrategy {
     /// Useful for ZIMs whose directory layout reflects content
     /// types (`wiki/...`, `maps/...`, `images/...`).
     ByFirstPathSegment,
-}
-
-impl Default for ClusterStrategy {
-    fn default() -> Self {
-        ClusterStrategy::Single
-    }
 }
 
 /// High-level ZIM file builder. Two usage modes:
@@ -534,7 +523,12 @@ impl Creator {
             ))
         })?;
         s.begin_chunked_item(
-            ChunkedMeta { namespace, path, title, mimetype },
+            ChunkedMeta {
+                namespace,
+                path,
+                title,
+                mimetype,
+            },
             expected_size,
         )
     }
@@ -1025,6 +1019,7 @@ impl Streamer {
             .expect("Streamer file was taken by streaming-encode and not yet returned")
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open(
         path: &Path,
         compression: Compression,
@@ -1079,11 +1074,7 @@ impl Streamer {
     /// AND compression is zstd, the body will be stream-encoded to its
     /// own cluster on disk; otherwise chunks accumulate in a `Vec<u8>`
     /// and the assembled item runs through the normal bin-packer.
-    fn begin_chunked_item(
-        &mut self,
-        meta: ChunkedMeta,
-        expected_size: Option<u64>,
-    ) -> Result<()> {
+    fn begin_chunked_item(&mut self, meta: ChunkedMeta, expected_size: Option<u64>) -> Result<()> {
         if self.in_flight.is_some() {
             return Err(Error::Io(std::io::Error::other(
                 "begin_chunked_item: another chunked item is already in flight",
@@ -1234,15 +1225,13 @@ impl Streamer {
             None => Err(Error::Io(std::io::Error::other(
                 "end_chunked_item: no item in flight",
             ))),
-            Some(ChunkedInFlight::Buffered { meta, content }) => {
-                self.push_item(Item {
-                    path: meta.path,
-                    title: meta.title,
-                    mimetype: meta.mimetype,
-                    content,
-                    namespace: meta.namespace,
-                })
-            }
+            Some(ChunkedInFlight::Buffered { meta, content }) => self.push_item(Item {
+                path: meta.path,
+                title: meta.title,
+                mimetype: meta.mimetype,
+                content,
+                namespace: meta.namespace,
+            }),
             Some(ChunkedInFlight::StreamingZstd {
                 meta,
                 encoder,
@@ -1316,9 +1305,7 @@ impl Streamer {
         for t in tasks {
             let cluster_idx = t.cluster_idx;
             let res = t.handle.join().map_err(|_| {
-                Error::Io(std::io::Error::other(
-                    "streaming-encode thread panicked",
-                ))
+                Error::Io(std::io::Error::other("streaming-encode thread panicked"))
             })?;
             let (temp_path, encoded_bytes) = res?;
             completed.push((cluster_idx, temp_path, encoded_bytes));
@@ -1366,12 +1353,10 @@ impl Streamer {
                 Some((_, ext)) if !ext.contains('/') => ext.to_string(),
                 _ => String::new(),
             },
-            ClusterStrategy::ByFirstPathSegment => {
-                match path.split_once('/') {
-                    Some((head, _)) => head.to_string(),
-                    None => path.to_string(),
-                }
-            }
+            ClusterStrategy::ByFirstPathSegment => match path.split_once('/') {
+                Some((head, _)) => head.to_string(),
+                None => path.to_string(),
+            },
         }
     }
 
@@ -1462,8 +1447,7 @@ impl Streamer {
         // it means smaller (fewer-thread) parallel batches.
         let threads = rayon::current_num_threads().max(1);
         let drain = if self.max_in_flight_bytes > 0 {
-            self.pending_bytes >= self.max_in_flight_bytes
-                || self.pending_encode.len() >= threads
+            self.pending_bytes >= self.max_in_flight_bytes || self.pending_encode.len() >= threads
         } else {
             self.pending_encode.len() >= threads
         };
@@ -1491,9 +1475,7 @@ impl Streamer {
         let level = self.compression_level;
         let mut encoded: Vec<(u32, Vec<u8>)> = chunk
             .into_par_iter()
-            .map(|(idx, blobs)| {
-                encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes))
-            })
+            .map(|(idx, blobs)| encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes)))
             .collect::<Result<Vec<_>>>()?;
         encoded.sort_by_key(|(idx, _)| *idx);
         let mut bytes_written = 0u64;
@@ -1592,7 +1574,11 @@ impl Streamer {
         let mut pending_redirects: Vec<RawDirent> = Vec::new();
         let redirections = std::mem::take(&mut self.redirections);
         for r in redirections {
-            let title = if r.title.is_empty() { r.path.clone() } else { r.title };
+            let title = if r.title.is_empty() {
+                r.path.clone()
+            } else {
+                r.title
+            };
             pending_redirects.push(RawDirent::Redirect {
                 namespace: b'C',
                 url: r.path,
@@ -1807,14 +1793,11 @@ impl Streamer {
         //     readers stop at the double-NUL terminator).
         let mime_list_bytes = encode_mime_list(&self.mimes);
         if mime_list_bytes.len() > MIME_LIST_RESERVE {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "mime list ({} bytes) exceeds reserved region ({} bytes)",
-                    mime_list_bytes.len(),
-                    MIME_LIST_RESERVE
-                ),
-            )));
+            return Err(Error::Io(std::io::Error::other(format!(
+                "mime list ({} bytes) exceeds reserved region ({} bytes)",
+                mime_list_bytes.len(),
+                MIME_LIST_RESERVE
+            ))));
         }
         self.file_mut().seek(SeekFrom::Start(HEADER_SIZE as u64))?;
         self.file_mut().write_all(&mime_list_bytes)?;
@@ -1898,7 +1881,8 @@ impl Streamer {
 /// Returns `Err` with a descriptive message on the first failure.
 fn verify_archive(path: &Path) -> Result<()> {
     let arc = crate::archive::Archive::open(path)?;
-    let checks: &[(&str, &dyn Fn(&crate::archive::Archive) -> Result<bool>)] = &[
+    type Check = dyn Fn(&crate::archive::Archive) -> Result<bool>;
+    let checks: &[(&str, &Check)] = &[
         ("dirent_ptrs", &|a| a.check_dirent_ptrs()),
         ("dirent_order", &|a| a.check_dirent_order()),
         ("title_index", &|a| a.check_title_index()),
@@ -1920,7 +1904,6 @@ fn verify_archive(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-
 
 struct HeaderFields {
     major_version: u16,
@@ -2043,7 +2026,9 @@ fn encode_cluster(
     // and zimru with the same one-liner. Falls back to a fast level
     // 3 default for zstd / 3 for xz when no env var is set.
     fn env_zstd_level() -> Option<i32> {
-        std::env::var("ZSTD_CLEVEL").ok().and_then(|v| v.parse().ok())
+        std::env::var("ZSTD_CLEVEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
     }
     let (compression_id, body) = match compression {
         Compression::None => (1u8, payload),

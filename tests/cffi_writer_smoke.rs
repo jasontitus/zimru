@@ -48,10 +48,7 @@ fn unique_tmp(prefix: &str, suffix: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "{prefix}-{}-{ns}{suffix}",
-        std::process::id(),
-    ))
+    std::env::temp_dir().join(format!("{prefix}-{}-{ns}{suffix}", std::process::id(),))
 }
 
 /// Compile `src` with `compiler`, link against `libzimru` from

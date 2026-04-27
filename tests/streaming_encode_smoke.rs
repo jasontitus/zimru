@@ -12,6 +12,8 @@
 //! - The auto-`finish_writing` integrity gate passed (no panic, no Err).
 //! - The mix of small items + huge items doesn't break dirent ordering.
 
+#![cfg(feature = "writer")]
+
 use zimru::writer::{Creator, Item};
 use zimru::Compression;
 
@@ -20,10 +22,7 @@ fn tmp_path(prefix: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!(
-        "zimru-{prefix}-{}-{ns}.zim",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("zimru-{prefix}-{}-{ns}.zim", std::process::id()))
 }
 
 #[test]
@@ -83,14 +82,17 @@ fn huge_item_streams_through_zstd_encoder_without_buffering() {
     c.add_metadata("Title", "stream-encode smoke");
     c.add_metadata("Language", "eng");
 
-    c.finish_writing().expect("finish_writing (includes auto zimcheck)");
+    c.finish_writing()
+        .expect("finish_writing (includes auto zimcheck)");
 
     // ---- Read back and verify ----
     let arc = zimru::Archive::open(&out).expect("reopen");
     assert!(arc.has_main_entry());
-    assert!(arc.cluster_count() >= 2,
+    assert!(
+        arc.cluster_count() >= 2,
         "expected ≥2 clusters (small bucket + huge-item-only), got {}",
-        arc.cluster_count());
+        arc.cluster_count()
+    );
 
     // Find huge.bin and confirm its body matches.
     let huge = arc
@@ -106,13 +108,17 @@ fn huge_item_streams_through_zstd_encoder_without_buffering() {
         .get_entry_by_path("home")
         .expect("get_entry_by_path home");
     let home_body = home.get_item(true).unwrap().bytes().unwrap();
-    assert!(std::str::from_utf8(&home_body).unwrap().contains("Home page"));
+    assert!(std::str::from_utf8(&home_body)
+        .unwrap()
+        .contains("Home page"));
 
     let after = arc
         .get_entry_by_path("after")
         .expect("get_entry_by_path after");
     let after_body = after.get_item(true).unwrap().bytes().unwrap();
-    assert!(std::str::from_utf8(&after_body).unwrap().contains("Item after"));
+    assert!(std::str::from_utf8(&after_body)
+        .unwrap()
+        .contains("Item after"));
 
     // Sanity-check: the auto-verify gate inside finish_writing
     // already passed every check (Pass on dirent_ptrs, dirent_order,
@@ -136,7 +142,11 @@ fn small_chunked_item_uses_buffered_path_and_bin_packs() {
     c.set_main_path("home");
     c.start_writing(&out).expect("start_writing");
 
-    c.add_item(Item::html("home", "Home", "<!doctype html><body>home</body>"));
+    c.add_item(Item::html(
+        "home",
+        "Home",
+        "<!doctype html><body>home</body>",
+    ));
 
     // 1 KiB chunked item — definitely buffered path.
     let body = vec![b'X'; 1024];

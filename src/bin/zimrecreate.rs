@@ -82,9 +82,7 @@ fn main() -> ExitCode {
                     Some("single") | Some("") => ClusterStrategy::Single,
                     Some("mime") => ClusterStrategy::ByMime,
                     Some("extension") | Some("ext") => ClusterStrategy::ByExtension,
-                    Some("path") | Some("path-segment") => {
-                        ClusterStrategy::ByFirstPathSegment
-                    }
+                    Some("path") | Some("path-segment") => ClusterStrategy::ByFirstPathSegment,
                     other => {
                         eprintln!(
                             "zimrecreate: --cluster-by must be one of single|mime|extension|path; got `{other:?}`"

@@ -468,11 +468,7 @@ fn empty_title_normalises_to_url_for_correct_title_sort() {
     // Independent validation: real zimcheck -I must report Pass on the
     // produced ZIM. The previous bug surfaced as "Title index is not
     // properly sorted" — that's the symptom we're guarding against.
-    if let Ok(out_bin) = Command::new("zimcheck")
-        .args(["-I"])
-        .arg(&out)
-        .output()
-    {
+    if let Ok(out_bin) = Command::new("zimcheck").args(["-I"]).arg(&out).output() {
         let stdout = String::from_utf8_lossy(&out_bin.stdout);
         assert!(
             stdout.contains("Status: Pass"),

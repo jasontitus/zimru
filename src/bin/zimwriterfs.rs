@@ -112,9 +112,7 @@ fn main() -> ExitCode {
             ("-o", v) | ("--flavour", v) => o.flavour = Some(value_or_next(v, &args, &mut i)),
             ("-s", v) | ("--scraper", v) => o.scraper = Some(value_or_next(v, &args, &mut i)),
             ("--cluster-by", v) => o.cluster_by = Some(value_or_next(v, &args, &mut i)),
-            ("--max-memory", v) => {
-                o.max_memory_mb = value_or_next(v, &args, &mut i).parse().ok()
-            }
+            ("--max-memory", v) => o.max_memory_mb = value_or_next(v, &args, &mut i).parse().ok(),
             (other, _) if other.starts_with('-') => {
                 eprintln!("zimwriterfs: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -266,10 +264,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     // own version string here ("zimwriterfs-3.x.x"); we emit the
     // user-provided value if any, otherwise fall back to our own
     // identifier so downstream tooling has something to read.
-    let scraper = o
-        .scraper
-        .clone()
-        .unwrap_or_else(|| VERSION.to_string());
+    let scraper = o.scraper.clone().unwrap_or_else(|| VERSION.to_string());
     creator.add_metadata("Scraper", scraper);
 
     // Illustration (must exist; mandatory upstream).
@@ -323,7 +318,12 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
             let size = p.metadata().map(|m| m.len()).unwrap_or(0);
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
             let is_html = ext == "html" || ext == "htm";
-            PrepEntry { path: p, rel_str, size, is_html }
+            PrepEntry {
+                path: p,
+                rel_str,
+                size,
+                is_html,
+            }
         })
         .collect();
 

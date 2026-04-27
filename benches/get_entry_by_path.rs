@@ -103,18 +103,16 @@ fn bench_get_entry_by_path(c: &mut Criterion) {
             );
             continue;
         }
-        group.bench_with_input(
-            BenchmarkId::new("rotating_paths", n),
-            &paths,
-            |b, paths| {
-                let mut idx = 0usize;
-                b.iter(|| {
-                    let p = unsafe { paths.get_unchecked(idx) };
-                    idx = (idx + 1) % paths.len();
-                    let _ = arc.get_entry_by_path(black_box(p.as_str())).expect("lookup");
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("rotating_paths", n), &paths, |b, paths| {
+            let mut idx = 0usize;
+            b.iter(|| {
+                let p = unsafe { paths.get_unchecked(idx) };
+                idx = (idx + 1) % paths.len();
+                let _ = arc
+                    .get_entry_by_path(black_box(p.as_str()))
+                    .expect("lookup");
+            });
+        });
     }
 
     group.finish();
