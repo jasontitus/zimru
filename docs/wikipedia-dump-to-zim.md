@@ -311,6 +311,31 @@ local thumbnail server amortises across all languages.
 This is a 1–2 month project on its own, only worth it once we
 have multi-language production traffic.
 
+## Licensing
+
+**mwoffliner is GPL-3.0** (per its `LICENSE` file). zimru is
+MIT. This rules out copying mwoffliner code into the zimru
+tree. Two options for a new dump-to-ZIM tool:
+
+- **MIT clean-room.** Re-implement the HTML transform pass
+  from scratch, treating mwoffliner only as an algorithm
+  reference (the same rule we already follow for libzim).
+  Slower, but the result can be statically linked into
+  anything downstream.
+- **GPL-3.0 standalone binary.** Port mwoffliner's HTML
+  transforms directly into a separate binary that links
+  *against* zimru as a library. zimru stays MIT (GPL is
+  one-way compatible: GPL programs can use MIT libs); the
+  new binary inherits GPL-3.0. Reuses years of edge-case
+  work, at the cost of restricting the binary's own
+  redistribution.
+
+The architecture in this doc points naturally at the second
+option: `wikidumpzim` is a separate binary, zimru is its
+library dependency. The license of the binary is an
+independent decision that doesn't infect the zimru crate
+either way.
+
 ## Risks and mitigations
 
 | risk | likelihood | impact | mitigation |
