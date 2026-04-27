@@ -234,15 +234,33 @@ impl BuildStats {
 /// accumulates chunks into a single `Vec<u8>`, then runs the normal
 /// bin-packer) to streaming-encode mode (which dedicates a fresh
 /// cluster to the item and streams its bytes through a zstd encoder
-/// straight to disk). Items bigger than this benefit hugely from
-/// streaming — peak RAM goes from O(item size) down to a few MB of
-/// encoder state regardless of how big the body is. Items smaller
-/// than this are better off bin-packed alongside their neighbours.
+/// straight to disk).
 ///
-/// Set to twice the default cluster size target so any item that
-/// would have busted the bin-packer's 2 MiB target on its own goes
-/// down the streaming path.
-pub(crate) const STREAMING_ENCODE_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Trade-off (measured on `texas-unpacked` at zstd 19):
+///
+/// * **Buffered path**: each item gets its own cluster (since it
+///   busts the 2 MiB bin-pack target), enters the
+///   `pending_encode` queue, and is encoded in a parallel batch
+///   of `rayon::current_num_threads()` clusters. Peak memory is
+///   `threads × max_item_size + encoded_output`. Wall-time is
+///   excellent — 8 cores compress 8 clusters simultaneously at
+///   full speed.
+/// * **Streaming-encode path**: zstd encoder owns the file across
+///   chunked feeds; uses zstdmt internally to parallelise within
+///   one frame. Memory is bounded at ~zstd-encoder-state (~50 MB)
+///   regardless of item size. But streaming-encodes are
+///   **serial across items** — only one in flight at a time —
+///   so 534 medium-large items end up encoded sequentially, which
+///   dominated 76% of total wall on the texas run.
+///
+/// Conclusion: streaming-encode is only worth its serialising
+/// cost on items so big that buffering them would blow the memory
+/// budget. We pick 256 MiB as the cutoff: items below that go
+/// through the parallel-batch path (memory peak ~`8 × 256 MiB =
+/// 2 GiB` during encode bursts, totally fine), only truly huge
+/// items (e.g. texas's 1.74 GB `addr.json` and 516 MB `poi.json`)
+/// take the slow-but-low-memory streaming path.
+pub(crate) const STREAMING_ENCODE_THRESHOLD: usize = 256 * 1024 * 1024;
 
 /// Builder for a chunked-input item — see [`Creator::begin_item`].
 /// Holds the partially-accumulated body until `finish()` is called,
