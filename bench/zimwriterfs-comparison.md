@@ -1,5 +1,69 @@
 # zimwriterfs head-to-head: real libzim vs libzim-shim+zimru vs zimru native
 
+## Latest results (2026-04-27, post 256 MiB threshold + parallel reads + auto-emit metadata)
+
+zimru native at zstd 19 with the full optimisation stack
+(streaming Creator with 256 MiB streaming-encode threshold,
+parallel `rayon` file reads, parallel-batch cluster encode,
+auto-emitted `M/Counter` / `M/Scraper` /
+`X/listing/titleOrdered/v1` for byte-comparable output, and
+post-write integrity verify):
+
+| workload | wall | RSS peak | output | entries | zimcheck |
+|---|---:|---:|---:|---:|:---:|
+| sv-unpacked (zimwriterfs, 17 K files) | 144 s | 2.0 GB | 209 MB | 16 916 | Pass |
+| **texas-unpacked (zimwriterfs, 1.08 M files)** | **640 s** | **5.3 GB** | **3.74 GB** | 1 080 097 | Pass |
+| wiki_top_nopic via zimrecreate (923 K entries) | 389 s | 3.9 GB | 1.71 GB | 923 593 | Pass |
+| _texas via real libzim baseline_ | 1 331 s | 0.96 GB | 5.22 GB | 1 080 102 | Pass |
+
+zimru native on texas: **2.08 × faster than real libzim** with
+**28 % smaller output** at zstd 19. Output is structurally
+byte-comparable now (`M/Counter`, `X/listing/titleOrdered/v1`,
+`M/Scraper` all present and well-formed).
+
+Texas ratio vs the original Kiwix-shipped `osm-texas-2026-04-24.zim`
+(3.96 GB, also built at zstd 19 by mwoffliner): zimru native at
+3.74 GB is 6 % *smaller* than what Kiwix actually distributes —
+the remaining gap is small system metadata (e.g. no
+`X/title/xapian` suggestion DB yet) plus the 64 KB mime-list
+reserve we use to keep `mimelistPos == 80`.
+
+### Phase breakdown on texas (`ZIMRU_STATS=1`):
+
+```
+total wall:              640 s
+parallel-batch encode:   486 s (76 %)   8 cores at saturation
+streaming encode:         80 s (12 %)   2 huge items (addr.json 1.74 GB, poi.json 516 MB)
+table+dirent write:        5 s ( 1 %)
+MD5 trailer:               6 s ( 1 %)
+post-write verify:         6 s ( 1 %)
+producer + bookkeeping:   57 s ( 9 %)   FS walk + parallel reads + push_item
+```
+
+Cores avg = 5.64 of 8. Streaming-encode of the 2 huge items is
+serial across them (each uses zstdmt internally); parallelizing
+that path across items would buy ~3 % wall (~30 s) — filed as
+"Idea C" follow-up.
+
+### What changed since the historical numbers below
+
+| commit (most recent first) | what |
+|---|---|
+| `2cd83d1` | dup-emit guard so caller-supplied `M/Counter` etc. wins over auto-emit (zimrecreate forwarding) |
+| `1ae1deb` | parallel `fs::read` via rayon batches in `zimwriterfs` (texas 717 → 640 s) |
+| `04fefee` | auto-emit `M/Counter`, `X/listing/titleOrdered/v1`, default `M/Scraper` |
+| `2e84a6d` | streaming-encode threshold 4 MiB → 256 MiB, HTML single-read (texas 1462 → 717 s) |
+| `672073c` | `BuildStats` instrumentation (`ZIMRU_STATS=1`) |
+| `f34a8c0` | streaming zstd encode for huge items + auto-verify integrity gate |
+| `2cb807b` | chunked-input C ABI (`zimru_creator_begin_item / _item_chunk / _end_item`) |
+| `ed95233` | streaming `Creator` with `start_writing` / `finish_writing` |
+
+---
+
+## Historical comparison (from earlier runs)
+
+
+
 Comparison of how long it takes to build a ZIM file from a directory
 tree on disk, across three implementations:
 
