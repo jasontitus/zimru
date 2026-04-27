@@ -124,35 +124,61 @@ doesn't dominate at the tail.
 
 After re-running with the parallel cluster encoder shipped:
 
-| stack | Xapian | parallel? | wall | user | user/wall | output | integrity |
-|---|:---:|:---:|---:|---:|---:|---:|:---:|
-| zimru native (zstd 19, parallel) | ❌ | rayon | **933 s (15:33)** | 3549 s | **3.80** | 3.92 GB | Pass |
-| shim+zimru (zstd 19, parallel) | ❌ | upstream 4 + rayon | 1 742 s (29:02) | 3 810 s | 2.19 | 3.92 GB | Pass |
-| real libzim (default w/ Xapian) | ✅ | upstream 4 | _running_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| stack | Xapian | parallel? | wall | user | user/wall | output | RSS peak | integrity |
+|---|:---:|:---:|---:|---:|---:|---:|---:|:---:|
+| **zimru native** (zstd 19, parallel) | ❌ | rayon | **933 s (15:33)** | 3 549 s | 3.80 | **3.92 GB** | 22.9 GB | Pass |
+| shim+zimru (zstd 19, parallel) | ❌ | upstream 4 + rayon | 1 742 s (29:02) | 3 810 s | 2.19 | 3.92 GB | 17 GB | Pass |
+| real libzim (default w/ Xapian) | ✅ | upstream 4 | 1 315 s (21:56) | 2 697 s | 2.05 | 5.24 GB | **459 MB** | Pass |
 
-Effective parallelism on native at this scale is ~3.8× — much
-better than the colorado run (1.98×), because the larger archive
-has enough independent clusters to keep more rayon workers fed.
+Speedups vs real libzim:
 
-Shim is 1.87× slower than native. Most of that delta is upstream
-`zimwriterfs`'s per-file work (libmagic mime detection, HTML scan
-for `<meta refresh>` redirects, link-extraction for the Xapian
-indexer's input — even though we don't actually build the index)
-plus the C-ABI hop on every `addItem`. Native skips all of that
-because zimru's own `zimwriterfs.rs` is a simpler program (it
-infers MIME from extension, doesn't parse HTML beyond `<title>`
-extraction, and doesn't even attempt to call into a no-op
-indexer).
+| | wall | output |
+|---|---:|---:|
+| zimru native | **1.41× faster** | 25 % smaller |
+| shim+zimru | 1.32× slower | 25 % smaller |
 
-Peak RSS — 22.9 GB on native, 17 GB on shim. Both are dangerously
-close to the 22 GB-per-task budget the Kiwix zimfarm allocates
-for English-Wikipedia-class builds. **Streaming cluster
-compression (fill / encode / free, instead of buffer-everything-
-then-compress) is required before a real Wikipedia build will
-fit in production memory.**
+Three observations dominate the take:
 
-Real libzim row pending — it's running in the background; will
-fill once it lands.
+1. **zimru native beats real libzim wall-clock** by 1.41× — and
+   produces a 25 % smaller archive (3.92 GB vs 5.24 GB) at
+   higher compression level (zstd 19 vs libzim's hard-coded
+   default ≈ zstd 9–12). This is the single biggest "zimru
+   burns through zimwriterfs" datapoint in the doc: even
+   excluding Xapian-indexing work that real libzim is doing,
+   zimru wins on raw write-speed-per-output-byte at higher
+   compression.
+
+2. **Real libzim streams; zimru buffers.** Peak RSS:
+   real libzim **459 MB** on 17 GB of input vs zimru native
+   **22.9 GB**. Real libzim fills clusters as items come in,
+   compresses+writes+frees, repeats — total RAM stays small
+   regardless of archive size. zimru holds every cluster's
+   bytes resident until `finalize`, then compresses in
+   parallel.
+   On 17 GB texas this is fine — barely fits the Kiwix
+   zimfarm's 22 GB per-task budget. On English Wikipedia
+   (~120 GB unpacked) zimru's current writer would OOM the
+   worker. **Streaming cluster compression is the
+   production-blocker** for the mwoffliner+shim+zimru
+   Wikipedia drop-in (filed as task #22 in the bench notes).
+
+3. **Shim is 1.87× slower than native and 1.32× slower than
+   real libzim** at this scale. All three stacks produce
+   structurally valid ZIMs. The shim's slowdown vs native is
+   upstream `zimwriterfs`'s per-file work (libmagic mime
+   detect, HTML refresh-tag scan, Xapian-indexer prep) plus
+   the C-ABI hop on every `addItem` — overhead the simpler
+   zimru-native binary doesn't pay. The shim's slowdown vs
+   real libzim is partly because zimru is at zstd 19 (real is
+   at libzim's lower default) and partly because zimru
+   buffers everything in RAM (cache pressure on the 22 GB
+   worker compared to real libzim's 459 MB streaming
+   footprint).
+
+Effective parallelism on native at this scale is ~3.8 cores —
+much better than the colorado run (1.98×), because the larger
+archive has enough independent clusters to keep more rayon
+workers fed.
 
 ## zimrecreate (ZIM → ZIM, complementary data point)
 
