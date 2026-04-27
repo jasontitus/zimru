@@ -49,6 +49,11 @@ struct Opts {
     /// Cluster routing strategy: "single" (default), "mime",
     /// "extension", or "path".
     cluster_by: Option<String>,
+    /// Soft cap on parallel-batch in-flight bytes (MiB). Zero (the
+    /// default) means "saturate cores", trading higher peak RSS
+    /// for higher CPU utilisation. Non-zero forces an early drain
+    /// so the parallel-batch buffer stays under the cap.
+    max_memory_mb: Option<usize>,
 
     html_dir: Option<PathBuf>,
     zim_file: Option<PathBuf>,
@@ -107,6 +112,9 @@ fn main() -> ExitCode {
             ("-o", v) | ("--flavour", v) => o.flavour = Some(value_or_next(v, &args, &mut i)),
             ("-s", v) | ("--scraper", v) => o.scraper = Some(value_or_next(v, &args, &mut i)),
             ("--cluster-by", v) => o.cluster_by = Some(value_or_next(v, &args, &mut i)),
+            ("--max-memory", v) => {
+                o.max_memory_mb = value_or_next(v, &args, &mut i).parse().ok()
+            }
             (other, _) if other.starts_with('-') => {
                 eprintln!("zimwriterfs: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -201,6 +209,9 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     }
     if let Some(kb) = o.cluster_size_kb {
         creator.set_cluster_size_target(kb * 1024);
+    }
+    if let Some(mb) = o.max_memory_mb {
+        creator.set_max_in_flight_bytes(mb * 1024 * 1024);
     }
     if let Some(strategy) = o.cluster_by.as_deref() {
         let s = match strategy {

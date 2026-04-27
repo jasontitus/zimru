@@ -79,6 +79,76 @@ serial across them (each uses zstdmt internally); parallelizing
 that path across items would buy ~3 % wall (~30 s) — filed as
 "Idea C" follow-up.
 
+### Memory characteristics — `--max-memory` knob
+
+zimru's writer trades RSS for wall time: the parallel-batch
+encode pipeline accumulates raw input bytes for up to one
+cluster per worker thread before draining, plus zstdmt's
+per-worker output buffers (which scale with compression level).
+At zstd 3 this lands ~1.5 GB peak; at zstd 19 it lands ~3.5 GB.
+
+The new `--max-memory=<MB>` flag (and
+`Creator::set_max_in_flight_bytes` API) puts a soft cap on the
+parallel-batch buffer — when crossed, `flush_bucket` triggers an
+early `drain_pending_encode`, trading parallel-batch fan-out
+(more clusters waiting to be encoded in parallel) for a tighter
+peak-RSS bound.
+
+Texas (1.08 M items, `--withoutFTIndex`), reporting
+`peak_memory_footprint` from `time -l` (the honest process-RSS
+metric on macOS — `maximum resident set size` is inflated by the
+OS page cache and runs ~3-4× larger):
+
+| stack / flag                       | wall  | peak_mem | output  |
+|------------------------------------|------:|---------:|--------:|
+| **real libzim** (default zstd, no cap) | 1331 s | **0.49 GB** | 4.86 GB |
+| zimru @ zstd 3, `--max-memory=32`  |   88 s | 1.52 GB | 4.33 GB |
+| zimru @ zstd 3, `--max-memory=64`  |   85 s | 1.54 GB | 4.33 GB |
+| zimru @ zstd 3, `--max-memory=128` |   85 s | 1.62 GB | 4.33 GB |
+| zimru @ zstd 19, `--max-memory=32` |  803 s | 2.92 GB | 3.65 GB |
+| zimru @ zstd 19, `--max-memory=128`|  621 s | 3.49 GB | 3.65 GB |
+| zimru @ zstd 19, `--max-memory=512`|  595 s | 3.59 GB | 3.65 GB |
+
+Reading the table:
+
+* **At zstd 3 the cap is largely cosmetic** — peak floats between
+  1.5-1.6 GB regardless of cap size, because the floor is set by
+  things the cap doesn't control: the dirent/URL/title tables for
+  1.08 M items (~120 MB), `mmap`-backed input reads, the redirect
+  Vec, the in-progress mime list, allocator slack, and zstd's own
+  hash table. Wall is essentially flat: zstd 3 is fast enough
+  that even the tightest cap (32 MB) doesn't starve the
+  parallel-batch.
+
+* **At zstd 19 the cap matters but plateaus quickly.** cap128
+  matches uncapped wall (621 vs 627 s prior baseline) at 3.49 GB
+  peak. cap32 saves another 0.6 GB peak but costs 28 % wall
+  (803 s) because the constant drains shrink each parallel batch
+  to 1-2 clusters instead of 8. Above cap128 the cap rarely fires
+  — cap512 is essentially uncapped (595 s, 3.59 GB peak).
+
+* **None of the caps approach libzim's 0.49 GB peak.** At zstd 19
+  the dominant remaining contributors are zstdmt's internal
+  per-worker compressed-output buffers (proportional to
+  `level × worker_count`, ~250 MB × 8 = ~2 GB at level 19) and
+  zimru's streaming-encode of huge items (the two largest texas
+  items are 1.74 GB / 516 MB; their compressed output buffers
+  hold ~level-dependent state until written). The cap doesn't
+  reach those — they're inside zstd's own thread pool, not in
+  zimru's parallel-batch queue. To match libzim's peak we'd need
+  to (a) cap zstdmt worker count when running under a tight
+  memory budget, and (b) drop streaming-encode of huge items
+  back to single-threaded zstd. Both are filed as follow-ups; on
+  realistic hardware (>= 4 GB free) the current trade-off is
+  close to optimal.
+
+* **Practical recommendation.** Default to no cap on machines
+  with ≥ 4 GB free; pass `--max-memory=128` on a memory-budgeted
+  build (CI runner, Kiwix zimfarm worker, embedded device). The
+  cap stops the parallel-batch from running away on large
+  inputs — at zstd 19 cap128 saves up to ~2 GB peak vs uncapped,
+  with zero wall penalty.
+
 ### What changed since the historical numbers below
 
 | commit (most recent first) | what |

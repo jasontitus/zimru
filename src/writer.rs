@@ -417,6 +417,13 @@ pub struct Creator {
     compression: Compression,
     compression_level: Option<i32>,
     cluster_size_target: usize,
+    /// Soft cap on bytes queued for parallel-batch encode at any
+    /// time. `0` means "unlimited" (drain only when the queue hits
+    /// `rayon::current_num_threads()` clusters, the default).
+    /// Setting a non-zero value forces an early drain whenever the
+    /// queue's running total exceeds the cap — trades wall-time
+    /// parallelism for a tighter peak-RSS bound.
+    max_in_flight_bytes: usize,
     uuid: [u8; 16],
     cluster_strategy: ClusterStrategy,
 
@@ -444,6 +451,7 @@ impl Creator {
             compression: Compression::Zstd,
             compression_level: None,
             cluster_size_target: DEFAULT_CLUSTER_SIZE_TARGET,
+            max_in_flight_bytes: 0,
             uuid: default_uuid(),
             cluster_strategy: ClusterStrategy::Single,
             stream: None,
@@ -696,6 +704,25 @@ impl Creator {
         self
     }
 
+    /// Soft cap on the number of raw bytes queued in the
+    /// parallel-batch encode pipeline at any time. Zero (the
+    /// default) means "drain only when the queue hits
+    /// `rayon::current_num_threads()` clusters" — i.e. saturate
+    /// CPU at the cost of a wider memory footprint.
+    ///
+    /// A non-zero value forces an early drain whenever the
+    /// queue's accumulated bytes cross the cap, trading
+    /// parallel-batch CPU saturation for a tighter peak RSS.
+    /// Useful in memory-constrained environments (Kiwix
+    /// zimfarm worker, embedded builds): for example pass
+    /// `512 * 1024 * 1024` to keep the parallel-batch buffer
+    /// under ~512 MiB on top of zimru's other in-process state
+    /// (~few hundred MB).
+    pub fn set_max_in_flight_bytes(&mut self, bytes: usize) -> &mut Self {
+        self.max_in_flight_bytes = bytes;
+        self
+    }
+
     pub fn set_uuid(&mut self, uuid: impl Into<crate::Uuid>) -> &mut Self {
         self.uuid = uuid.into().into_bytes();
         self
@@ -739,6 +766,7 @@ impl Creator {
             self.compression,
             self.compression_level,
             self.cluster_size_target,
+            self.max_in_flight_bytes,
             self.uuid,
             self.main_path.take(),
             self.cluster_strategy,
@@ -895,6 +923,13 @@ struct Streamer {
     compression: Compression,
     compression_level: Option<i32>,
     cluster_size_target: usize,
+    /// Soft cap on raw bytes queued in `pending_encode` (see
+    /// [`Creator::set_max_in_flight_bytes`]). 0 = unlimited.
+    max_in_flight_bytes: usize,
+    /// Running total of raw bytes currently in `pending_encode`,
+    /// kept incrementally so flush_bucket doesn't have to walk
+    /// every queued cluster on every push.
+    pending_bytes: usize,
     uuid: [u8; 16],
     main_path: Option<String>,
     cluster_strategy: ClusterStrategy,
@@ -995,6 +1030,7 @@ impl Streamer {
         compression: Compression,
         compression_level: Option<i32>,
         cluster_size_target: usize,
+        max_in_flight_bytes: usize,
         uuid: [u8; 16],
         main_path: Option<String>,
         cluster_strategy: ClusterStrategy,
@@ -1018,6 +1054,8 @@ impl Streamer {
             compression,
             compression_level,
             cluster_size_target,
+            max_in_flight_bytes,
+            pending_bytes: 0,
             uuid,
             main_path,
             cluster_strategy,
@@ -1409,15 +1447,27 @@ impl Streamer {
                 blob: pa.blob_idx,
             });
         }
+        // Track bytes incrementally; the cap-driven drain check
+        // doesn't have to walk every queued cluster.
+        let added_bytes: usize = bucket.blobs.iter().map(|b| b.len()).sum();
+        self.pending_bytes += added_bytes;
         self.pending_encode.push((cluster_idx, bucket.blobs));
         // Reinsert empty bucket for reuse without map churn.
         self.buckets.insert(key.to_string(), Bucket::default());
 
-        // If the queue is at thread-pool size, drain it: parallel
-        // encode + sequential write keeps cluster bytes contiguous
-        // and matches `cluster_offsets[i]` to file position.
+        // Drain trigger: either we hit thread-pool size (CPU-
+        // saturation default) OR the byte-cap is non-zero and the
+        // queue's running total exceeded it. Cap takes priority —
+        // a memory-conscious user wants a tight RSS bound even if
+        // it means smaller (fewer-thread) parallel batches.
         let threads = rayon::current_num_threads().max(1);
-        if self.pending_encode.len() >= threads {
+        let drain = if self.max_in_flight_bytes > 0 {
+            self.pending_bytes >= self.max_in_flight_bytes
+                || self.pending_encode.len() >= threads
+        } else {
+            self.pending_encode.len() >= threads
+        };
+        if drain {
             self.drain_pending_encode()?;
         }
         Ok(())
@@ -1433,6 +1483,9 @@ impl Streamer {
         }
         let phase_start = Instant::now();
         let chunk = std::mem::take(&mut self.pending_encode);
+        // Queue is empty after the take — reset the running byte
+        // total so subsequent flushes start from zero.
+        self.pending_bytes = 0;
         let chunk_len = chunk.len() as u64;
         let comp = self.compression;
         let level = self.compression_level;
