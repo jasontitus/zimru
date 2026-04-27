@@ -251,9 +251,15 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     if let Some(s) = &o.flavour {
         creator.add_metadata("Flavour", s.clone());
     }
-    if let Some(s) = &o.scraper {
-        creator.add_metadata("Scraper", s.clone());
-    }
+    // Always emit M/Scraper. Real libzim's zimwriterfs writes its
+    // own version string here ("zimwriterfs-3.x.x"); we emit the
+    // user-provided value if any, otherwise fall back to our own
+    // identifier so downstream tooling has something to read.
+    let scraper = o
+        .scraper
+        .clone()
+        .unwrap_or_else(|| VERSION.to_string());
+    creator.add_metadata("Scraper", scraper);
 
     // Illustration (must exist; mandatory upstream).
     let illu_path = html_dir.join(o.illustration.as_ref().unwrap());

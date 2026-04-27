@@ -812,6 +812,38 @@ fn intern_mime(m: &str, mimes: &mut Vec<String>, index: &mut BTreeMap<String, u1
     i
 }
 
+/// Build the `M/Counter` body: `mime=count;mime=count;…`. Counts
+/// only `Article` dirents (redirect dirents have no body / no
+/// mime). Returned in the order mimes were interned, which is
+/// also the order they appear in the trailing mime list — so
+/// `Counter` parses one-pass alongside the mime list.
+fn build_counter_string(mimes: &[String], dirents: &[RawDirent]) -> String {
+    let mut counts: Vec<u64> = vec![0; mimes.len()];
+    for d in dirents {
+        if let RawDirent::Article { mime_idx, .. } = d {
+            let i = *mime_idx as usize;
+            if i < counts.len() {
+                counts[i] += 1;
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut first = true;
+    for (i, m) in mimes.iter().enumerate() {
+        if counts[i] == 0 {
+            continue;
+        }
+        if !first {
+            out.push(';');
+        }
+        first = false;
+        out.push_str(m);
+        out.push('=');
+        out.push_str(&counts[i].to_string());
+    }
+    out
+}
+
 // ---------- streaming ----------
 
 /// Stream-write engine. Owns the output file and per-build state that
@@ -1379,8 +1411,24 @@ impl Streamer {
             })?;
         }
 
-        // 2. Close every still-open bucket — one cluster per
-        //    non-empty bucket, in deterministic key order.
+        // 2a. Auto-emit `M/Counter` (mime histogram) before the
+        //     final flush so it bin-packs into the same trailing
+        //     cluster as other small metadata. Format matches
+        //     real libzim: `mime=count;mime=count;…` (semicolon-
+        //     separated, no trailing semicolon, mimes in mime-list
+        //     index order). zimcheck consumes this for its mime
+        //     report and some kiwix tooling reads it for stats.
+        let counter_str = build_counter_string(&self.mimes, &self.dirents);
+        self.push_item(Item {
+            path: "Counter".to_string(),
+            title: "Counter".to_string(),
+            mimetype: "text/plain;charset=utf-8".to_string(),
+            content: counter_str.into_bytes(),
+            namespace: Some(b'M'),
+        })?;
+
+        // 2b. Close every still-open bucket — one cluster per
+        //     non-empty bucket, in deterministic key order.
         self.flush_all_buckets()?;
 
         // 3. Build redirect dirents (no content). Includes the
@@ -1459,7 +1507,63 @@ impl Streamer {
             }
         }
 
-        // 6. Title-pointer order: dirent indices sorted by (ns, title).
+        // 6a. Compute the title-pointer order for the dirents we
+        //     have so far. This becomes the body of the
+        //     `X/listing/titleOrdered/v1` listing entry we're
+        //     about to emit. The listing entry itself isn't in
+        //     this snapshot — its content lists every other
+        //     entry's URL-pointer index in title order, but not
+        //     its own. Real libzim's reader doesn't need the
+        //     listing entry to refer to itself, so this is fine.
+        let title_order_snapshot: Vec<u32> = {
+            let mut t: Vec<u32> = (0..self.dirents.len() as u32).collect();
+            t.sort_by(|&a, &b| {
+                let da = &self.dirents[a as usize];
+                let db = &self.dirents[b as usize];
+                da.namespace()
+                    .cmp(&db.namespace())
+                    .then_with(|| da.title().cmp(db.title()))
+            });
+            t
+        };
+
+        // 6b. Emit `X/listing/titleOrdered/v1`. Its body is the
+        //     `title_order_snapshot` serialised as little-endian
+        //     u32s (4 bytes per entry). Real libzim writes this
+        //     entry uncompressed; ours goes through the same zstd
+        //     path as everything else, which is fine — the
+        //     reader-side just zstd-decodes and indexes into the
+        //     resulting bytes. Mimetype matches real libzim's so
+        //     `zimcheck -A` is happy.
+        let mut listing_bytes: Vec<u8> = Vec::with_capacity(title_order_snapshot.len() * 4);
+        for idx in &title_order_snapshot {
+            listing_bytes.extend_from_slice(&idx.to_le_bytes());
+        }
+        self.push_item(Item {
+            path: "listing/titleOrdered/v1".to_string(),
+            title: "listing/titleOrdered/v1".to_string(),
+            mimetype: "application/octet-stream+zimlisting".to_string(),
+            content: listing_bytes,
+            namespace: Some(b'X'),
+        })?;
+        // Flush so the listing's cluster commits and its dirent
+        // lands in `self.dirents` for the final sort below.
+        self.flush_all_buckets()?;
+
+        // 6c. Re-sort dirents with the new listing entry in place.
+        //     Adding an X-namespace entry doesn't shift C-, M-, or
+        //     W-namespace URL-pointer indices, so resolved redirect
+        //     targets (always C in our pipeline) stay valid — no
+        //     re-resolution needed.
+        self.dirents.sort_by(|a, b| {
+            a.namespace()
+                .cmp(&b.namespace())
+                .then_with(|| a.url().cmp(b.url()))
+        });
+
+        // 6d. Final title-pointer order — over all dirents
+        //     including the listing entry. This is what gets
+        //     written to the title pointer table.
         let mut title_order: Vec<u32> = (0..self.dirents.len() as u32).collect();
         title_order.sort_by(|&a, &b| {
             let da = &self.dirents[a as usize];
