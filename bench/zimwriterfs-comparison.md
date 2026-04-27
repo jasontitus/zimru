@@ -128,14 +128,20 @@ After re-running with the parallel cluster encoder shipped:
 |---|:---:|:---:|---:|---:|---:|---:|---:|:---:|
 | **zimru native** (zstd 19, parallel) | ❌ | rayon | **933 s (15:33)** | 3 549 s | 3.80 | **3.92 GB** | 22.9 GB | Pass |
 | shim+zimru (zstd 19, parallel) | ❌ | upstream 4 + rayon | 1 742 s (29:02) | 3 810 s | 2.19 | 3.92 GB | 17 GB | Pass |
-| real libzim (default w/ Xapian) | ✅ | upstream 4 | 1 315 s (21:56) | 2 697 s | 2.05 | 5.24 GB | **459 MB** | Pass |
+| real libzim (`--withoutFTIndex`) | ❌ | upstream 4 | _running_ (re-run pending) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| ~~real libzim (default w/ Xapian)~~ | ✅ | upstream 4 | 1 315 s (21:56) | 2 697 s | 2.05 | 5.24 GB | 459 MB | Pass |
 
-Speedups vs real libzim:
-
-| | wall | output |
-|---|---:|---:|
-| zimru native | **1.41× faster** | 25 % smaller |
-| shim+zimru | 1.32× slower | 25 % smaller |
+**Apples-to-apples note.** The first published version of this
+table compared zimru-without-Xapian against real-libzim-WITH-
+Xapian. That's not a fair comparison — real libzim was building
+an `X/fulltextIndex/xapian` over every `text/html` item (extra
+work, extra output bytes), while the zimru rows weren't. The
+right comparison is real-libzim `--withoutFTIndex` against
+the zimru rows, since neither side then has a fulltext index;
+that re-run is in flight as of this edit and the table will be
+finalised when it lands. The strikethrough row is kept here for
+historical context but should not be used for either timing or
+size claims.
 
 Three observations dominate the take:
 
