@@ -122,26 +122,49 @@ doesn't dominate at the tail.
 
 ### Texas-unpacked (17 GB / 1.08 M files) — measured numbers
 
-After re-running with the parallel cluster encoder shipped:
+All zimru/shim rows are at zstd 19 with the parallel cluster
+encoder + streaming writer (commits `1aeedf7` + `7695429`).
+Real libzim is at its hard-coded default level (zimwriterfs CLI
+doesn't expose level; libzim ignores `ZSTD_CLEVEL`). The
+**`--withoutFTIndex` row is the apples-to-apples engine
+comparison** — both real libzim and the zimru paths skip the
+Xapian fulltext index, so the per-file work and output entries
+are equivalent (modulo a few small `M/` differences we still
+have to fix; see "Output equivalence" earlier in this doc):
 
 | stack | Xapian | parallel? | wall | user | user/wall | output | RSS peak | integrity |
 |---|:---:|:---:|---:|---:|---:|---:|---:|:---:|
-| **zimru native** (zstd 19, parallel) | ❌ | rayon | **933 s (15:33)** | 3 549 s | 3.80 | **3.92 GB** | 22.9 GB | Pass |
-| shim+zimru (zstd 19, parallel) | ❌ | upstream 4 + rayon | 1 742 s (29:02) | 3 810 s | 2.19 | 3.92 GB | 17 GB | Pass |
-| real libzim (`--withoutFTIndex`) | ❌ | upstream 4 | _running_ (re-run pending) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| ~~real libzim (default w/ Xapian)~~ | ✅ | upstream 4 | 1 315 s (21:56) | 2 697 s | 2.05 | 5.24 GB | 459 MB | Pass |
+| zimru native (zstd 19, par) | ❌ | rayon | _streaming re-run pending_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| shim+zimru (zstd 19, par) | ❌ | upstream 4 + rayon | _pending_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| **real libzim (`--withoutFTIndex`)** | ❌ | upstream 4 | **1 342 s (22:22)** | 2 727 s | 2.03 | **5.22 GB** | ~840 MB | Pass |
+
+For reference, the older runs:
+
+| historical row | wall | output | note |
+|---|---:|---:|---|
+| zimru native (pre-streaming, parallel) | 933 s | 3.92 GB | RSS peaked at 22.9 GB — buffered everything |
+| shim+zimru (pre-streaming, parallel) | 1 742 s | 3.92 GB | same; 17 GB peak RSS |
+| real libzim (default w/ Xapian) | 1 315 s | 5.24 GB | extra work building `X/fulltextIndex/xapian`; not a fair comparison to the no-Xapian zimru rows |
 
 **Apples-to-apples note.** The first published version of this
 table compared zimru-without-Xapian against real-libzim-WITH-
-Xapian. That's not a fair comparison — real libzim was building
-an `X/fulltextIndex/xapian` over every `text/html` item (extra
-work, extra output bytes), while the zimru rows weren't. The
-right comparison is real-libzim `--withoutFTIndex` against
-the zimru rows, since neither side then has a fulltext index;
-that re-run is in flight as of this edit and the table will be
-finalised when it lands. The strikethrough row is kept here for
-historical context but should not be used for either timing or
-size claims.
+Xapian. That was wrong — real libzim was building an
+`X/fulltextIndex/xapian` over every `text/html` item (extra
+work, extra output bytes), and "we're faster because we skip
+the work" is not a meaningful claim. The right comparison
+is real-libzim `--withoutFTIndex` against the zimru rows; the
+former is now measured (1 342 s / 5.22 GB), the latter is
+re-running with the streaming writer.
+
+**Output is still not fully equivalent even with `--withoutFTIndex`.**
+zimru-side ZIMs are missing a few entries that real libzim
+emits: `M/Counter` (auto-generated mime histogram),
+`X/listing/titleOrdered/v1` (explicit title-order listing
+entry), and the upstream zimwriterfs binary unconditionally
+emits `M/Scraper` and `M/Tags` placeholders that zimru-native
+omits. Final equivalence claim has to wait until those land
+on the zimru side too; for now the comparison covers the
+content (`C/`) namespace and the major `M/` metadata items.
 
 Three observations dominate the take:
 
