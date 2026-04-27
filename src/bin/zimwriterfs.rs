@@ -275,70 +275,72 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     // as a regular C entry so links from inside the archive that reference
     // it directly (e.g. `<link rel="icon" href="icon48.png">`) still
     // resolve — matches upstream zimwriterfs behavior.
+    //
+    // Two-tier processing:
+    // - Small files (< STREAMING_THRESHOLD_BIN): read in parallel
+    //   batches via rayon, push to creator in walk-order. Overlaps
+    //   disk-wait across cores; the writer's per-item bookkeeping
+    //   stays serial.
+    // - Large files (>= threshold): processed one at a time via the
+    //   chunked-streaming path. Don't bother batching — they
+    //   already engage zstdmt internally.
+    use rayon::prelude::*;
+    use std::io::Read as _;
+    const STREAMING_THRESHOLD_BIN: u64 = 4 * 1024 * 1024;
+    const READ_BATCH: usize = 64;
     let mut count = 0usize;
-    for entry in walk_dir(html_dir)? {
-        let path = entry;
-        let rel = path.strip_prefix(html_dir).unwrap();
-        // On Windows, Path components are joined with '\\' — convert
-        // those to '/' so the URL inside the ZIM is portable. On Unix,
-        // '\\' is a *literal* character in filenames (Wikipedia has
-        // articles like "AC\\DC", "Acid\\Base_chemistry") and must NOT
-        // be rewritten — doing so would alias them onto unrelated
-        // directory-traversal paths and produce duplicate dirents.
-        let rel_str = if cfg!(windows) {
-            rel.to_string_lossy().replace('\\', "/")
-        } else {
-            rel.to_string_lossy().into_owned()
-        };
-        let mime = mime_for_path(&path);
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let is_html = ext == "html" || ext == "htm";
 
-        // HTML / inflate-needed files: read fully so we can extract
-        // the <title> tag (or gunzip). Bodies for these are small
-        // (Wikipedia articles are ~tens of KB), so the buffered
-        // path is fine.
-        //
-        // Everything else: stream-feed the body through zimru's
-        // chunked C-ABI-shape path. For files >
-        // STREAMING_ENCODE_THRESHOLD (4 MiB) zimru's writer takes
-        // the streaming-zstd-encode branch — peak RAM stays bounded
-        // regardless of file size. The big OSM tile JSONs (texas's
-        // 1.74 GB addr.json) are the textbook case.
-        let needs_full_read = is_html || o.inflate_html;
-        if needs_full_read {
-            let mut content = fs::read(&path)?;
-            if o.inflate_html && is_html {
-                if content.starts_with(&[0x1f, 0x8b]) {
-                    use std::io::Read as _;
-                    if let Ok(mut dec) = flate2_decoder(&content) {
-                        let mut out = Vec::new();
-                        if dec.read_to_end(&mut out).is_ok() {
-                            content = out;
-                        }
-                    }
-                }
-            }
-            let title = if is_html {
-                derive_title_from_bytes(&content).unwrap_or_else(|| rel_str.clone())
+    // Build the (path, relpath, size, is_html) list once. metadata()
+    // is one stat call per file — comparable to the old walk_dir's
+    // `entry.file_type()` call, so no extra cost.
+    struct PrepEntry {
+        path: PathBuf,
+        rel_str: String,
+        size: u64,
+        is_html: bool,
+    }
+    let entries = walk_dir(html_dir)?;
+    let prepped: Vec<PrepEntry> = entries
+        .into_iter()
+        .map(|p| {
+            let rel = p.strip_prefix(html_dir).unwrap();
+            let rel_str = if cfg!(windows) {
+                rel.to_string_lossy().replace('\\', "/")
             } else {
-                rel_str.clone()
+                rel.to_string_lossy().into_owned()
             };
-            creator.add_item(Item::new(rel_str.clone(), title, mime, content));
-        } else {
-            use std::io::Read as _;
-            let mut f = fs::File::open(&path)?;
-            let size = f.metadata()?.len();
+            let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let is_html = ext == "html" || ext == "htm";
+            PrepEntry { path: p, rel_str, size, is_html }
+        })
+        .collect();
+
+    let needs_full_read = |e: &PrepEntry| e.is_html || o.inflate_html;
+
+    // Processed payload after parallel read.
+    struct ReadyItem {
+        rel_str: String,
+        title: String,
+        mime: String,
+        content: Vec<u8>,
+    }
+
+    let mut idx = 0usize;
+    while idx < prepped.len() {
+        let e = &prepped[idx];
+
+        // Big non-HTML file → chunked-streaming path one-at-a-time.
+        if !needs_full_read(e) && e.size >= STREAMING_THRESHOLD_BIN {
+            let mime = mime_for_path(&e.path);
+            let mut f = fs::File::open(&e.path)?;
             creator.begin_chunked_item(
                 None,
-                rel_str.clone(),
-                rel_str.clone(),
+                e.rel_str.clone(),
+                e.rel_str.clone(),
                 mime,
-                Some(size),
+                Some(e.size),
             )?;
-            // 64 KiB chunks — large enough that per-chunk overhead
-            // is negligible, small enough that we don't burn RAM
-            // on the in-flight buffer.
             let mut buf = vec![0u8; 64 * 1024];
             loop {
                 let n = f.read(&mut buf)?;
@@ -348,12 +350,68 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                 creator.chunked_item_chunk(&buf[..n])?;
             }
             creator.end_chunked_item()?;
+            count += 1;
+            idx += 1;
+            if o.verbose && count.is_multiple_of(100) {
+                eprintln!("[zimwriterfs] {count} items");
+            }
+            continue;
         }
-        count += 1;
-        if o.verbose && count.is_multiple_of(100) {
-            eprintln!("[zimwriterfs] {count} items");
+
+        // Walk forward collecting a batch of small files (stop at
+        // the next big file or end-of-list). Keep the batch all
+        // either small-or-HTML so they share the parallel-read fate.
+        let batch_start = idx;
+        while idx < prepped.len()
+            && (idx - batch_start) < READ_BATCH
+            && (needs_full_read(&prepped[idx]) || prepped[idx].size < STREAMING_THRESHOLD_BIN)
+        {
+            idx += 1;
+        }
+        let batch = &prepped[batch_start..idx];
+
+        // Parallel-read the batch into per-item contents. Errors
+        // surface with the path so they're actionable.
+        let items: Vec<ReadyItem> = batch
+            .par_iter()
+            .map(|e| -> Result<ReadyItem, zimru::Error> {
+                let mut content = fs::read(&e.path)?;
+                if o.inflate_html && e.is_html && content.starts_with(&[0x1f, 0x8b]) {
+                    if let Ok(mut dec) = flate2_decoder(&content) {
+                        let mut out = Vec::new();
+                        if dec.read_to_end(&mut out).is_ok() {
+                            content = out;
+                        }
+                    }
+                }
+                let title = if e.is_html {
+                    derive_title_from_bytes(&content).unwrap_or_else(|| e.rel_str.clone())
+                } else {
+                    e.rel_str.clone()
+                };
+                let mime = mime_for_path(&e.path);
+                Ok(ReadyItem {
+                    rel_str: e.rel_str.clone(),
+                    title,
+                    mime,
+                    content,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Push to creator in walk-order so bin-packing stays
+        // deterministic.
+        for it in items {
+            creator.add_item(Item::new(it.rel_str, it.title, it.mime, it.content));
+            count += 1;
+            if o.verbose && count.is_multiple_of(100) {
+                eprintln!("[zimwriterfs] {count} items");
+            }
         }
     }
+
+    // Drop the prepped list now that we're done with it.
+    drop(prepped);
 
     // Optional redirects file (TSV: url \t title \t target_url).
     if let Some(rfile) = &o.redirects_file {
