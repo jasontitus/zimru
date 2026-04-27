@@ -120,25 +120,39 @@ wins would require either zstd's own multi-worker mode inside
 big clusters or balancing cluster sizes so the long-pole cluster
 doesn't dominate at the tail.
 
-### Texas-unpacked (17 GB / 1.08 M files) — single-thread baseline only
+### Texas-unpacked (17 GB / 1.08 M files) — measured numbers
 
-We started a `texas-unpacked` run at zstd 19 single-threaded;
-killed at 33 min still grinding (RSS draining from 14.7 → 11 GB,
-0 byte output). Single-thread zstd 19 on 17 GB is roughly 6× the
-work of the colorado run; with the parallelism now in place a
-re-run at million-file scale is reasonable but wasn't repeated
-within the session. Extrapolating from colorado at zstd 19
-parallel:
+After re-running with the parallel cluster encoder shipped:
 
-  zimru native parallel: 65 s × 6 = ~6.5 minutes
-  shim+zimru parallel:   99 s × 6 = ~10 minutes
-  real libzim:           80 s × 6 = ~8 minutes (at libzim's
-                                                 lower default level)
+| stack | Xapian | parallel? | wall | user | user/wall | output | integrity |
+|---|:---:|:---:|---:|---:|---:|---:|:---:|
+| zimru native (zstd 19, parallel) | ❌ | rayon | **933 s (15:33)** | 3549 s | **3.80** | 3.92 GB | Pass |
+| shim+zimru (zstd 19, parallel) | ❌ | upstream 4 + rayon | 1 742 s (29:02) | 3 810 s | 2.19 | 3.92 GB | Pass |
+| real libzim (default w/ Xapian) | ✅ | upstream 4 | _running_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
 
-Real libzim at the same effective compression level as zimru
-(zstd 19) would take longer; libzim doesn't expose the level via
-zimwriterfs CLI so testing that requires patching libzim source,
-which is out of scope under the clean-room policy.
+Effective parallelism on native at this scale is ~3.8× — much
+better than the colorado run (1.98×), because the larger archive
+has enough independent clusters to keep more rayon workers fed.
+
+Shim is 1.87× slower than native. Most of that delta is upstream
+`zimwriterfs`'s per-file work (libmagic mime detection, HTML scan
+for `<meta refresh>` redirects, link-extraction for the Xapian
+indexer's input — even though we don't actually build the index)
+plus the C-ABI hop on every `addItem`. Native skips all of that
+because zimru's own `zimwriterfs.rs` is a simpler program (it
+infers MIME from extension, doesn't parse HTML beyond `<title>`
+extraction, and doesn't even attempt to call into a no-op
+indexer).
+
+Peak RSS — 22.9 GB on native, 17 GB on shim. Both are dangerously
+close to the 22 GB-per-task budget the Kiwix zimfarm allocates
+for English-Wikipedia-class builds. **Streaming cluster
+compression (fill / encode / free, instead of buffer-everything-
+then-compress) is required before a real Wikipedia build will
+fit in production memory.**
+
+Real libzim row pending — it's running in the background; will
+fill once it lands.
 
 ## zimrecreate (ZIM → ZIM, complementary data point)
 
