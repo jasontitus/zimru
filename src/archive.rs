@@ -495,11 +495,20 @@ impl Archive {
         // namespaces. The mixer's avalanche means each retry probes a
         // different bucket, so even on adversarial archives where M/X
         // occupy a high fraction we converge in O(N) worst case.
+        //
+        // Retry budget: `max(n, 64)`. On small archives (e.g. n=5 in
+        // tests with 2/5 entries in M/X) `x % n` only ranges over 5
+        // values, so 5 mixed-state probes can collide and yield false
+        // EntryNotFound at ~1 % per call. Bumping the floor to 64
+        // drives that to (2/5)^64 ≈ 10⁻²⁵ without affecting large-
+        // archive cost (where the M/X fraction is << 1 % and the very
+        // first probe almost always succeeds).
         let n = self.core.header.entry_count;
         if n == 0 {
             return Err(Error::EntryNotFound);
         }
-        for _ in 0..n {
+        let attempts = (n as u64).max(64);
+        for _ in 0..attempts {
             let pick = (x % n as u64) as u32;
             let off = self.url_pointer(pick)? as usize;
             let ns_byte = raw::u8_at(&self.core.mmap, off + 3)?;
