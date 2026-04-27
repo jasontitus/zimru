@@ -136,6 +136,18 @@ fn main() -> ExitCode {
         }
     }
 
+    // Configure rayon's global thread pool from -J/--threads if the
+    // user specified it. Default (no flag) leaves rayon to size by
+    // num_cpus(), which is the right thing on most hosts. We
+    // intentionally don't error if the global pool was already
+    // initialised — that just means the user invoked us in a
+    // context where rayon was already set up.
+    if let Some(n) = o.threads {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global();
+    }
+
     match run(&o) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -164,7 +176,7 @@ fn value_or_next(v: Option<&str>, args: &[String], i: &mut usize) -> String {
 
 fn print_help() {
     println!(
-        "Usage: zimwriterfs [mandatory arguments] [optional arguments] HTML_DIR ZIM_FILE\n\nMandatory:\n  -w/--welcome PATH      main HTML page (relative to HTML_DIR)\n  -I/--illustration PATH 48×48 PNG illustration (relative)\n  -l/--language LANG     ISO639-3 language code (e.g. eng)\n  -n/--name NAME         version-independent identifier\n  -t/--title TITLE       ZIM title\n  -d/--description TEXT  short description\n  -c/--creator AUTHOR    content creator\n  -p/--publisher PUB     ZIM creator/publisher\n\nOptional:\n  -L/--longDescription TEXT\n  -m/--clusterSize KB    cluster size in KiB (default 2048)\n  --compression-level N  compression level (zstd: 1..=22, xz: 0..=9)\n  -J/--threads N         number of threads (default 4) — currently no-op\n  -x/--inflateHtml       gunzip *.html files before packing\n  -j/--withoutFTIndex    don't build fulltext index (always)\n  -r/--redirects PATH    TSV file: url\\ttitle\\ttarget_url\n  -a/--tags TAGS         semicolon-separated tags\n  -e/--source URL        source URL\n  -o/--flavour NAME      content flavour\n  -s/--scraper NAME      scraper tool name+version\n  --skip-libmagic-check  ignore libmagic; use file-extension mime detection (default in zimru)\n  -v/--verbose           print processing details\n  -V/--version           print version\n"
+        "Usage: zimwriterfs [mandatory arguments] [optional arguments] HTML_DIR ZIM_FILE\n\nMandatory:\n  -w/--welcome PATH      main HTML page (relative to HTML_DIR)\n  -I/--illustration PATH 48×48 PNG illustration (relative)\n  -l/--language LANG     ISO639-3 language code (e.g. eng)\n  -n/--name NAME         version-independent identifier\n  -t/--title TITLE       ZIM title\n  -d/--description TEXT  short description\n  -c/--creator AUTHOR    content creator\n  -p/--publisher PUB     ZIM creator/publisher\n\nOptional:\n  -L/--longDescription TEXT\n  -m/--clusterSize KB    cluster size in KiB (default 2048)\n  --compression-level N  compression level (zstd: 1..=22, xz: 0..=9)\n  -J/--threads N         rayon thread-pool size (default num_cpus)\n  -x/--inflateHtml       gunzip *.html files before packing\n  -j/--withoutFTIndex    don't build fulltext index (always)\n  -r/--redirects PATH    TSV file: url\\ttitle\\ttarget_url\n  -a/--tags TAGS         semicolon-separated tags\n  -e/--source URL        source URL\n  -o/--flavour NAME      content flavour\n  -s/--scraper NAME      scraper tool name+version\n  --skip-libmagic-check  ignore libmagic; use file-extension mime detection (default in zimru)\n  -v/--verbose           print processing details\n  -V/--version           print version\n"
     );
 }
 

@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::path::Path;
 
 use md5::{Digest, Md5};
@@ -237,7 +237,17 @@ impl Creator {
 
     /// Materialize the archive to `path`. Consumes the builder.
     pub fn write_to(self, path: impl AsRef<Path>) -> Result<()> {
-        let file = File::create(path.as_ref())?;
+        // Open read+write so the streaming writer can seek-back to
+        // overwrite cluster_ptrs and the header's late-known fields,
+        // and re-read the finished file at the end to compute the
+        // MD5 trailer (avoids buffering every cluster in RAM just
+        // so we know its length up front).
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path.as_ref())?;
         finalize(self, file)
     }
 }
@@ -436,17 +446,12 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
         blob_groups.push(blobs_for_cluster);
     }
 
-    // 4b. Pass 2: encode every cluster in parallel via rayon. Each
-    //     cluster is independent — its bytes go into its own slot in
-    //     the output Vec, and the output index is stable so the
-    //     cluster-pointer list still reflects URL-pointer order.
-    //     On a multi-core host this turns single-threaded zstd 19/22
-    //     compression into N-way parallel; on smaller archives the
-    //     rayon scheduler will just run the work serially.
-    let cluster_bytes: Vec<Vec<u8>> = blob_groups
-        .par_iter()
-        .map(|blobs| encode_cluster(blobs, compression, compression_level))
-        .collect::<Result<Vec<_>>>()?;
+    // 4b. (Cluster encoding deferred to streaming write step 13b below
+    //     so we don't have to hold every encoded cluster's bytes
+    //     resident before starting to write. blob_groups stays alive
+    //     through the dirent-sort step; freed progressively as we
+    //     stream-encode-and-write.)
+    let cluster_count_total = blob_groups.len() as u32;
 
     // 5. Append pending redirects.
     dirents.extend(pending_redirects);
@@ -511,9 +516,13 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
             .then_with(|| da.title().cmp(db.title()))
     });
 
-    // 9. Compute layout offsets.
+    // 9. Compute layout offsets. cluster_ptr_pos is fixed (it's a
+    //    function of mime_list/url_ptr/title_ptr sizes), but the
+    //    *values* at cluster_ptr_pos and the file's checksum_pos are
+    //    only known after we've stream-encoded every cluster — so we
+    //    write placeholder zeros first and seek-back-and-fix later.
     let entry_count = dirents.len() as u32;
-    let cluster_count = cluster_bytes.len() as u32;
+    let cluster_count = cluster_count_total;
     let mime_list_bytes = encode_mime_list(&mimes);
 
     let mime_list_pos = HEADER_SIZE as u64;
@@ -534,16 +543,7 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
     }
     let clusters_pos = cursor;
 
-    // 11. Cluster offsets.
-    let mut cluster_offsets: Vec<u64> = Vec::with_capacity(cluster_bytes.len());
-    let mut cursor = clusters_pos;
-    for c in &cluster_bytes {
-        cluster_offsets.push(cursor);
-        cursor += c.len() as u64;
-    }
-    let checksum_pos = cursor;
-
-    // 12. Main page index (as stored in the header).
+    // 11. Main page index (as stored in the header).
     let main_page_idx = if main_path.is_some() {
         dirents
             .binary_search_by(|d| {
@@ -558,52 +558,121 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
         u32::MAX
     };
 
-    // 13. Write everything, hashing as we go.
-    let mut hasher = Md5::new();
-    write_all(
-        &mut file,
-        &mut hasher,
-        &encode_header(&HeaderFields {
-            major_version: 5,
-            minor_version: 1,
-            uuid,
-            entry_count,
-            cluster_count,
-            url_ptr_pos,
-            title_ptr_pos,
-            cluster_ptr_pos,
-            mime_list_pos,
-            main_page: main_page_idx,
-            checksum_pos,
-        }),
-    )?;
-    write_all(&mut file, &mut hasher, &mime_list_bytes)?;
+    // 12. First-pass write: header + all metadata + dirents, with
+    //     cluster_ptr region as zero placeholders + checksum_pos = 0.
+    //     Hashing for MD5 happens during a second pass at the end
+    //     because we'll seek-back-and-fix the cluster_ptrs and the
+    //     header's `cluster_ptr_pos` / `checksum_pos` fields after
+    //     the cluster bytes are streamed.
+    let placeholder_header = encode_header(&HeaderFields {
+        major_version: 5,
+        minor_version: 1,
+        uuid,
+        entry_count,
+        cluster_count,
+        url_ptr_pos,
+        title_ptr_pos,
+        cluster_ptr_pos,
+        mime_list_pos,
+        main_page: main_page_idx,
+        checksum_pos: 0,
+    });
+    file.write_all(&placeholder_header)?;
+    file.write_all(&mime_list_bytes)?;
     for off in &dirent_offsets {
-        write_all(&mut file, &mut hasher, &off.to_le_bytes())?;
+        file.write_all(&off.to_le_bytes())?;
     }
     for idx in &title_order {
-        write_all(&mut file, &mut hasher, &idx.to_le_bytes())?;
+        file.write_all(&idx.to_le_bytes())?;
     }
-    for off in &cluster_offsets {
-        write_all(&mut file, &mut hasher, &off.to_le_bytes())?;
+    let cluster_ptrs_zero = vec![0u64; cluster_count as usize];
+    for off in &cluster_ptrs_zero {
+        file.write_all(&off.to_le_bytes())?;
     }
+    drop(cluster_ptrs_zero);
     for b in &dirent_blobs {
-        write_all(&mut file, &mut hasher, b)?;
+        file.write_all(b)?;
     }
-    for c in &cluster_bytes {
-        write_all(&mut file, &mut hasher, c)?;
-    }
+    drop(dirent_blobs);
+    drop(dirent_offsets);
 
-    // 14. Append MD5 trailer.
+    // 13. Stream-encode-and-write each cluster. Encode in
+    //     parallel-bounded batches so we hold at most
+    //     `chunk_size × cluster_size` of compressed bytes resident at
+    //     once. Each batch's source `blob_groups` slot is also freed
+    //     after encode (via `mem::take`) so the input-side memory
+    //     drains progressively as we stream.
+    let chunk_size = rayon::current_num_threads().max(1);
+    let mut cluster_offsets: Vec<u64> = Vec::with_capacity(cluster_count as usize);
+    let mut current_pos = clusters_pos;
+    let mut idx = 0usize;
+    while idx < blob_groups.len() {
+        let end = (idx + chunk_size).min(blob_groups.len());
+        // Take ownership of this chunk's blobs so we can free them
+        // after encode (the slots in blob_groups become empty Vecs).
+        let chunk: Vec<Vec<Vec<u8>>> = blob_groups[idx..end]
+            .iter_mut()
+            .map(std::mem::take)
+            .collect();
+        let encoded: Vec<Vec<u8>> = chunk
+            .into_par_iter()
+            .map(|blobs| encode_cluster(&blobs, compression, compression_level))
+            .collect::<Result<Vec<_>>>()?;
+        for bytes in encoded {
+            cluster_offsets.push(current_pos);
+            current_pos += bytes.len() as u64;
+            file.write_all(&bytes)?;
+        }
+        idx = end;
+    }
+    drop(blob_groups);
+    let checksum_pos = current_pos;
+
+    // 14. Seek-back fixes for the cluster-ptr region and the header's
+    //     two computed-late fields.
+    file.seek(SeekFrom::Start(cluster_ptr_pos))?;
+    for off in &cluster_offsets {
+        file.write_all(&off.to_le_bytes())?;
+    }
+    drop(cluster_offsets);
+    file.seek(SeekFrom::Start(0))?;
+    let final_header = encode_header(&HeaderFields {
+        major_version: 5,
+        minor_version: 1,
+        uuid,
+        entry_count,
+        cluster_count,
+        url_ptr_pos,
+        title_ptr_pos,
+        cluster_ptr_pos,
+        mime_list_pos,
+        main_page: main_page_idx,
+        checksum_pos,
+    });
+    file.write_all(&final_header)?;
+    file.flush()?;
+
+    // 15. Compute MD5 by streaming-reading the now-final file from
+    //     start to checksum_pos. SSDs do this at ~1 GB/s so the
+    //     overhead is small relative to the cluster-encoding time
+    //     we just saved by not buffering everything in RAM first.
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Md5::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut hashed: u64 = 0;
+    while hashed < checksum_pos {
+        let want = ((checksum_pos - hashed) as usize).min(buf.len());
+        let n = file.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        hashed += n as u64;
+    }
     let digest: [u8; 16] = hasher.finalize().into();
+    file.seek(SeekFrom::Start(checksum_pos))?;
     file.write_all(&digest)?;
     file.flush()?;
-    Ok(())
-}
-
-fn write_all(file: &mut File, hasher: &mut Md5, bytes: &[u8]) -> Result<()> {
-    hasher.update(bytes);
-    file.write_all(bytes)?;
     Ok(())
 }
 
