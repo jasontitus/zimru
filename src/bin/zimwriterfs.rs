@@ -285,21 +285,60 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
             rel.to_string_lossy().into_owned()
         };
         let mime = mime_for_path(&path);
-        let mut content = fs::read(&path)?;
-        if o.inflate_html && (path.extension().is_some_and(|e| e == "html" || e == "htm")) {
-            // Try gzip-decompress; if it doesn't look like gzip, leave as-is.
-            if content.starts_with(&[0x1f, 0x8b]) {
-                use std::io::Read as _;
-                if let Ok(mut dec) = flate2_decoder(&content) {
-                    let mut out = Vec::new();
-                    if dec.read_to_end(&mut out).is_ok() {
-                        content = out;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let is_html = ext == "html" || ext == "htm";
+
+        // HTML / inflate-needed files: read fully so we can extract
+        // the <title> tag (or gunzip). Bodies for these are small
+        // (Wikipedia articles are ~tens of KB), so the buffered
+        // path is fine.
+        //
+        // Everything else: stream-feed the body through zimru's
+        // chunked C-ABI-shape path. For files >
+        // STREAMING_ENCODE_THRESHOLD (4 MiB) zimru's writer takes
+        // the streaming-zstd-encode branch — peak RAM stays bounded
+        // regardless of file size. The big OSM tile JSONs (texas's
+        // 1.74 GB addr.json) are the textbook case.
+        let needs_full_read = is_html || o.inflate_html;
+        if needs_full_read {
+            let mut content = fs::read(&path)?;
+            if o.inflate_html && is_html {
+                if content.starts_with(&[0x1f, 0x8b]) {
+                    use std::io::Read as _;
+                    if let Ok(mut dec) = flate2_decoder(&content) {
+                        let mut out = Vec::new();
+                        if dec.read_to_end(&mut out).is_ok() {
+                            content = out;
+                        }
                     }
                 }
             }
+            let title = derive_title(&path).unwrap_or_else(|| rel_str.clone());
+            creator.add_item(Item::new(rel_str.clone(), title, mime, content));
+        } else {
+            use std::io::Read as _;
+            let mut f = fs::File::open(&path)?;
+            let size = f.metadata()?.len();
+            creator.begin_chunked_item(
+                None,
+                rel_str.clone(),
+                rel_str.clone(),
+                mime,
+                Some(size),
+            )?;
+            // 64 KiB chunks — large enough that per-chunk overhead
+            // is negligible, small enough that we don't burn RAM
+            // on the in-flight buffer.
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                creator.chunked_item_chunk(&buf[..n])?;
+            }
+            creator.end_chunked_item()?;
         }
-        let title = derive_title(&path).unwrap_or_else(|| rel_str.clone());
-        creator.add_item(Item::new(rel_str.clone(), title, mime, content));
         count += 1;
         if o.verbose && count.is_multiple_of(100) {
             eprintln!("[zimwriterfs] {count} items");
