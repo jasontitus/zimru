@@ -590,9 +590,18 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
     //     because we'll seek-back-and-fix the cluster_ptrs and the
     //     header's `cluster_ptr_pos` / `checksum_pos` fields after
     //     the cluster bytes are streamed.
+    // ZIM major.minor 6.3 — matches what real libzim 9.x writes for
+    // new-namespace archives. zimru's writer always emits new-
+    // namespace dirents (`C` for content, `M` metadata, `W` mainPage,
+    // `X` index) so the v6 family is correct. Earlier 5.1 wasn't
+    // wrong per spec but real libzim's `hasFulltextIndex()` and a
+    // few other reader paths only look up X-namespace entries when
+    // the major version is 6. Writing 6.3 unblocks cross-engine
+    // compatibility for shim+zimru-built ZIMs through real libzim's
+    // search / suggest paths.
     let placeholder_header = encode_header(&HeaderFields {
-        major_version: 5,
-        minor_version: 1,
+        major_version: 6,
+        minor_version: 3,
         uuid,
         entry_count,
         cluster_count,
@@ -663,8 +672,8 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
     drop(cluster_offsets);
     file.seek(SeekFrom::Start(0))?;
     let final_header = encode_header(&HeaderFields {
-        major_version: 5,
-        minor_version: 1,
+        major_version: 6,
+        minor_version: 3,
         uuid,
         entry_count,
         cluster_count,
