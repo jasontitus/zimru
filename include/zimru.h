@@ -747,6 +747,52 @@ bool zimru_creator_write_to(struct zimru_creator_t *c,
                             struct zimru_error_t **err);
 
 /**
+ * Open `path` for streaming output and switch the creator to
+ * streaming mode. After this call returns true, every
+ * `add_item` / `add_metadata` / `add_redirection` /
+ * `add_illustration` call bin-packs the content into the in-flight
+ * cluster and stream-encodes-and-writes to disk as the cluster
+ * fills, dropping the source bytes immediately. Peak RSS is
+ * bounded by `cluster_size_target × thread_count` plus the small
+ * per-item dirent metadata, regardless of the total archive size.
+ *
+ * Any work already added via the buffered path before this call
+ * is drained into the stream here.
+ *
+ * After `start_writing` succeeds, call `add_*` and friends as
+ * usual, then call [`zimru_creator_finish_writing`] (NOT
+ * `write_to`) to produce the final archive.
+ *
+ * Errors:
+ *
+ * * `path` is unreadable as UTF-8 → `*err` set, returns `false`.
+ * * Output file can't be created → `*err` set, returns `false`.
+ * * Already in streaming mode → `*err` set, returns `false`.
+ */
+
+bool zimru_creator_start_writing(struct zimru_creator_t *c,
+                                 const char *path,
+                                 struct zimru_error_t **err);
+
+/**
+ * Finalize a streaming-mode creator: encode the last cluster,
+ * write the URL / title / cluster pointer tables and the dirent
+ * region, fill the mime list at offset 80, write the final
+ * header, append the MD5 trailer. Consumes the creator on
+ * success.
+ *
+ * Errors:
+ *
+ * * Creator was never started via `start_writing` → `*err` set,
+ *   returns `false`. The creator handle remains valid; caller can
+ *   either `start_writing` it now or `free` it.
+ * * Mid-finalize I/O failure or unresolved redirect → `*err` set,
+ *   returns `false`. Inner creator is consumed; only legal next
+ *   call is `free`.
+ */
+ bool zimru_creator_finish_writing(struct zimru_creator_t *c, struct zimru_error_t **err);
+
+/**
  * Free a `zimru_entry_t` previously returned by an Archive lookup.
  */
  void zimru_entry_free(struct zimru_entry_t *e);

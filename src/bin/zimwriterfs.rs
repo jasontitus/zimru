@@ -200,6 +200,13 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     }
     creator.set_main_path(o.welcome.as_deref().unwrap());
 
+    // Switch to streaming mode now so each subsequent add_item /
+    // add_metadata / add_illustration call bin-packs into the
+    // in-flight cluster and stream-encodes-and-writes when the
+    // cluster overflows. Peak RSS becomes O(cluster_size_target ×
+    // thread_count) instead of O(total input size).
+    creator.start_writing(zim_file)?;
+
     // Mandatory metadata.
     creator.add_metadata("Title", o.title.clone().unwrap());
     creator.add_metadata("Description", o.description.clone().unwrap());
@@ -286,7 +293,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     if o.verbose {
         eprintln!("[zimwriterfs] {count} items collected; finalising…");
     }
-    creator.write_to(zim_file)?;
+    creator.finish_writing()?;
     if o.verbose {
         eprintln!("[zimwriterfs] wrote {}", zim_file.display());
     }

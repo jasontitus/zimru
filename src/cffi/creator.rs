@@ -465,3 +465,87 @@ pub unsafe extern "C" fn zimru_creator_write_to(
         }
     }
 }
+
+/// Open `path` for streaming output and switch the creator to
+/// streaming mode. After this call returns true, every
+/// `add_item` / `add_metadata` / `add_redirection` /
+/// `add_illustration` call bin-packs the content into the in-flight
+/// cluster and stream-encodes-and-writes to disk as the cluster
+/// fills, dropping the source bytes immediately. Peak RSS is
+/// bounded by `cluster_size_target × thread_count` plus the small
+/// per-item dirent metadata, regardless of the total archive size.
+///
+/// Any work already added via the buffered path before this call
+/// is drained into the stream here.
+///
+/// After `start_writing` succeeds, call `add_*` and friends as
+/// usual, then call [`zimru_creator_finish_writing`] (NOT
+/// `write_to`) to produce the final archive.
+///
+/// Errors:
+///
+/// * `path` is unreadable as UTF-8 → `*err` set, returns `false`.
+/// * Output file can't be created → `*err` set, returns `false`.
+/// * Already in streaming mode → `*err` set, returns `false`.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_creator_start_writing(
+    c: *mut zimru_creator_t,
+    path: *const c_char,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    let Some(path_str) = cstr_to_string(path, err) else {
+        return false;
+    };
+    let inner = inner_mut(c, err);
+    if inner.is_null() {
+        return false;
+    }
+    match (*inner).start_writing(std::path::PathBuf::from(path_str)) {
+        Ok(()) => true,
+        Err(e) => {
+            set_err(err, e);
+            false
+        }
+    }
+}
+
+/// Finalize a streaming-mode creator: encode the last cluster,
+/// write the URL / title / cluster pointer tables and the dirent
+/// region, fill the mime list at offset 80, write the final
+/// header, append the MD5 trailer. Consumes the creator on
+/// success.
+///
+/// Errors:
+///
+/// * Creator was never started via `start_writing` → `*err` set,
+///   returns `false`. The creator handle remains valid; caller can
+///   either `start_writing` it now or `free` it.
+/// * Mid-finalize I/O failure or unresolved redirect → `*err` set,
+///   returns `false`. Inner creator is consumed; only legal next
+///   call is `free`.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_creator_finish_writing(
+    c: *mut zimru_creator_t,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if c.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return false;
+    }
+    let Some(creator) = (*c).inner.take() else {
+        set_err(
+            err,
+            crate::Error::Io(std::io::Error::other(
+                "zimru_creator: already finalized — call free, not finish_writing",
+            )),
+        );
+        return false;
+    };
+    match creator.finish_writing() {
+        Ok(()) => true,
+        Err(e) => {
+            set_err(err, e);
+            false
+        }
+    }
+}
