@@ -231,6 +231,15 @@ pub unsafe extern "C" fn zimru_creator_set_main_path(
 ///
 /// Duplicate paths are not detected here; the duplicate surfaces as a
 /// dirent-order failure at finalize time.
+///
+/// **Namespace-prefix shortcut.** A `path` of the form `"X/<rest>"`
+/// (with non-empty `<rest>`) is routed to the `X` namespace with the
+/// dirent URL set to `<rest>`. This is the surface the libzim-shim's
+/// fulltext-index emission uses — `"X/fulltext/xapian"` becomes
+/// `{ns:'X', url:"fulltext/xapian"}` so reader-side
+/// `xapian_loader.cpp` finds it. Other namespaces (M, W, Z, …) are
+/// **not** peeled here; use [`zimru_creator_add_item_in_namespace`]
+/// for those.
 #[no_mangle]
 pub unsafe extern "C" fn zimru_creator_add_item(
     c: *mut zimru_creator_t,
@@ -257,7 +266,70 @@ pub unsafe extern "C" fn zimru_creator_add_item(
     if inner.is_null() {
         return false;
     }
-    (*inner).add_item(Item::new(path_str, title_str, mime_str, bytes));
+    let item = if let Some(rest) = path_str.strip_prefix("X/") {
+        if rest.is_empty() {
+            // "X/" alone is degenerate — fall through to default 'C'.
+            Item::new(path_str, title_str, mime_str, bytes)
+        } else {
+            Item::in_namespace(b'X', rest.to_string(), title_str, mime_str, bytes)
+        }
+    } else {
+        Item::new(path_str, title_str, mime_str, bytes)
+    };
+    (*inner).add_item(item);
+    true
+}
+
+/// Add an item under an explicit namespace. `namespace` is the
+/// single-byte ZIM namespace identifier (`'C'`, `'M'`, `'W'`, `'X'`,
+/// `'Z'`, …); `url` is used verbatim as the dirent URL — no prefix
+/// peeling. Use this when the caller already knows the target
+/// namespace and wants to bypass [`zimru_creator_add_item`]'s
+/// `"X/<rest>"` shortcut (or needs to write into a namespace other
+/// than `C` or `X`).
+///
+/// Routing semantics:
+///
+/// * `'C'` (`0x43`) — same as [`zimru_creator_add_item`] without a
+///   prefix. The default content namespace.
+/// * `'M'` (`0x4D`) — metadata. [`zimru_creator_add_metadata`] is the
+///   normal entry point but explicit-namespace works for callers that
+///   need a non-default mimetype outside the metadata pipeline.
+/// * `'X'` (`0x58`) — fulltext / title indexes (`X/fulltext/xapian`,
+///   `X/title/xapian`). The libzim-shim writer uses this on
+///   `finishZimCreation` after compacting its in-memory Glass DB.
+/// * Other namespaces — accepted; the writer emits the dirent under
+///   the requested namespace without further validation.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_creator_add_item_in_namespace(
+    c: *mut zimru_creator_t,
+    namespace: u8,
+    url: *const c_char,
+    title: *const c_char,
+    mimetype: *const c_char,
+    content: *const u8,
+    content_len: usize,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    let Some(url_str) = cstr_to_string(url, err) else {
+        return false;
+    };
+    let Some(title_str) = cstr_to_string(title, err) else {
+        return false;
+    };
+    let Some(mime_str) = cstr_to_string(mimetype, err) else {
+        return false;
+    };
+    let Some(bytes) = ptr_to_vec(content, content_len, err) else {
+        return false;
+    };
+    let inner = inner_mut(c, err);
+    if inner.is_null() {
+        return false;
+    }
+    (*inner).add_item(Item::in_namespace(
+        namespace, url_str, title_str, mime_str, bytes,
+    ));
     true
 }
 

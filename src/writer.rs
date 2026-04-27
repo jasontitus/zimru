@@ -52,6 +52,12 @@ pub struct Item {
     pub title: String,
     pub mimetype: String,
     pub content: Vec<u8>,
+    /// Override the on-disk namespace. `None` = content namespace `'C'`,
+    /// which is what every existing call site uses. `Some(ns)` routes the
+    /// item to a non-default namespace — the current consumer is the
+    /// libzim-shim's fulltext-index emission, which writes
+    /// `{ns:'X', url:"fulltext/xapian"}`.
+    pub namespace: Option<u8>,
 }
 
 impl Item {
@@ -66,6 +72,26 @@ impl Item {
             title: title.into(),
             mimetype: mimetype.into(),
             content: content.into(),
+            namespace: None,
+        }
+    }
+    /// Construct an item that lands in `namespace` rather than `'C'`.
+    /// `path` is used as the dirent URL (no prefix peeling — pass the
+    /// raw URL the reader will look up). Same content semantics as
+    /// [`Item::new`] otherwise.
+    pub fn in_namespace(
+        namespace: u8,
+        path: impl Into<String>,
+        title: impl Into<String>,
+        mimetype: impl Into<String>,
+        content: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            title: title.into(),
+            mimetype: mimetype.into(),
+            content: content.into(),
+            namespace: Some(namespace),
         }
     }
     pub fn html(
@@ -341,7 +367,7 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
     for it in items {
         let title = if it.title.is_empty() { it.path.clone() } else { it.title };
         payloads.push(Payload {
-            namespace: b'C',
+            namespace: it.namespace.unwrap_or(b'C'),
             url: it.path,
             title,
             mimetype: it.mimetype,

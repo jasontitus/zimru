@@ -62,12 +62,18 @@ bool zimru_creator_set_main_path(zimru_creator_t*,
 // Writes a W/mainPage redirect to C/<main_path> at finalize time.
 ```
 
-Configurations the shim swallows (no zimru primitive — match libzim's
-shape with a no-op):
+Configurations handled at the shim layer (no zimru primitive needed —
+zimru exposes the surface the shim builds on, and the shim does the
+domain work):
 
-* `configIndexing(bool, lang)` — no Xapian writer integration. Items
-  still write; just no `X/fulltext/xapian` index.
-* `configNbWorkers(unsigned)` — zimru's writer ignores the hint.
+* `configIndexing(bool, lang)` — implemented shim-side via
+  `src/text_indexer.{h,cpp}` (Xapian writer + compact-to-single-file
+  Glass). On `finishZimCreation` the shim emits the compacted blob as
+  a single ZIM entry at `X/fulltext/xapian` via
+  `zimru_creator_add_item` — see the X/ prefix shortcut below.
+* `configNbWorkers(unsigned)` — zimru's writer-side parallelism is
+  governed by `--threads N` / `RAYON_NUM_THREADS` rather than this
+  hint; the shim swallows it.
 * `configVerbose(bool)` — zimru's writer doesn't emit progress.
 
 ### Adding content
@@ -80,9 +86,31 @@ bool zimru_creator_add_item(zimru_creator_t*,
                             const uint8_t* content,
                             uintptr_t content_len,
                             zimru_error_t** err);
-// User-content namespace (C/). Bytes are copied. Empty payloads
-// (content_len == 0, content can be NULL) are permitted. Duplicate
+// User-content namespace (C/) by default. Bytes are copied. Empty
+// payloads (content_len == 0, content can be NULL) are permitted.
+//
+// Namespace-prefix shortcut: a path of the form "X/<rest>" (with
+// non-empty <rest>) routes the item to the X namespace with the
+// dirent URL set to <rest>. This is the surface the shim's fulltext-
+// index emission uses — "X/fulltext/xapian" becomes
+// {ns:'X', url:"fulltext/xapian"} so reader-side xapian_loader.cpp
+// finds it. Duplicate
 // paths surface as a dirent-order failure at write_to time.
+
+bool zimru_creator_add_item_in_namespace(zimru_creator_t*,
+                                         uint8_t namespace,
+                                         const char* url,
+                                         const char* title,
+                                         const char* mimetype,
+                                         const uint8_t* content,
+                                         uintptr_t content_len,
+                                         zimru_error_t** err);
+// Explicit-namespace variant. `namespace` is the single-byte ZIM
+// namespace identifier ('C', 'M', 'W', 'X', 'Z', …); `url` is used
+// verbatim as the dirent URL — no prefix peeling. Use this when the
+// caller already knows the target namespace (e.g. a future title-
+// suggestion DB at X/title/xapian) or needs to write into a namespace
+// other than C/X.
 
 bool zimru_creator_add_metadata(zimru_creator_t*,
                                 const char* name,
@@ -194,10 +222,14 @@ writer-side zim-tools binaries don't need a rebuild.
   zimru issue. Until then, callers see a redirect — readable, just
   not byte-identical to libzim's behaviour.
 
-* **No fulltext / title Xapian index at write time.** The shim's
-  `configIndexing` should no-op. zim-tools' `zimrecreate` calls it
-  unconditionally, so this can't error out. Resulting ZIM has no
-  `X/fulltext/xapian` entry; everything else round-trips.
+* **Fulltext / title Xapian index at write time** — implemented
+  shim-side via `text_indexer.{h,cpp}` (Xapian writer + compact-to-
+  single-file Glass), emitted through `zimru_creator_add_item` with
+  the `"X/fulltext/xapian"` prefix shortcut. See the configuration
+  notes earlier in this doc. Title-suggestion DB
+  (`X/title/xapian`) is the next follow-up — same path through
+  `zimru_creator_add_item_in_namespace('X', "title/xapian", …)`
+  once the shim grows that emission.
 
 * **Streaming `ContentProvider` handoff is not implemented.** The
   shim should slurp each `ContentProvider` into a single `Vec<u8>`

@@ -89,16 +89,21 @@ writer-side API. At minimum:
      (frontArticle / etc.) — partially covered.
    - `Creator::Status` / progress callbacks if mwoffliner reads
      them.
-   - `setIndexing(true, lang)` — currently a no-op on the shim
-     (zimru doesn't index). Wikipedia builds will produce
-     unsearchable archives until this is real.
-2. **Xapian writer-side integration in the shim.** mwoffliner
-   expects `X/fulltextIndex/xapian` populated. The shim is GPL
-   and can link `libxapian` directly to build the index in C++
-   during `addItem`, then ship the finished DB as an entry via
-   `zimru_creator_add_item("X/fulltextIndex/xapian", …)`. zimru
-   itself stays Xapian-free (and MIT) — the index lives in the
-   shim layer. This is the headline missing piece.
+   - `setIndexing(true, lang)` — implemented shim-side (see #2).
+2. **Xapian writer-side integration in the shim.** ✅ Done. The
+   shim links `libxapian` to build the index in C++ during
+   `addItem` (`src/text_indexer.{h,cpp}`), then ships the
+   compacted single-file Glass blob as a ZIM entry via
+   `zimru_creator_add_item("X/fulltext/xapian", …)`. zimru's
+   writer C ABI peels the `X/<rest>` prefix to route the item to
+   the X namespace at `{ns:'X', url:"fulltext/xapian"}`, where
+   reader-side `xapian_loader.cpp` finds it. zimru itself stays
+   Xapian-free (and MIT) — the index lives in the shim layer.
+   Validated by `tests/writer_round_trip.cpp` in the shim repo:
+   addItem with HTML body, configIndexing(true,"eng"),
+   finishZimCreation, reopen → `hasFulltextIndex()` is true and a
+   query against an indexed marker word resolves to the indexed
+   item.
 3. **Streaming cluster compression on the zimru side.** The 22 GB
    RAM budget per task is exactly what `zimru native` hit on the
    17 GB osm-texas test (22.9 GB RSS peak, OOM-adjacent).

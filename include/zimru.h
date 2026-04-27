@@ -630,6 +630,15 @@ bool zimru_creator_set_main_path(struct zimru_creator_t *c,
  *
  * Duplicate paths are not detected here; the duplicate surfaces as a
  * dirent-order failure at finalize time.
+ *
+ * **Namespace-prefix shortcut.** A `path` of the form `"X/<rest>"`
+ * (with non-empty `<rest>`) is routed to the `X` namespace with the
+ * dirent URL set to `<rest>`. This is the surface the libzim-shim's
+ * fulltext-index emission uses — `"X/fulltext/xapian"` becomes
+ * `{ns:'X', url:"fulltext/xapian"}` so reader-side
+ * `xapian_loader.cpp` finds it. Other namespaces (M, W, Z, …) are
+ * **not** peeled here; use [`zimru_creator_add_item_in_namespace`]
+ * for those.
  */
 
 bool zimru_creator_add_item(struct zimru_creator_t *c,
@@ -639,6 +648,38 @@ bool zimru_creator_add_item(struct zimru_creator_t *c,
                             const uint8_t *content,
                             uintptr_t content_len,
                             struct zimru_error_t **err);
+
+/**
+ * Add an item under an explicit namespace. `namespace` is the
+ * single-byte ZIM namespace identifier (`'C'`, `'M'`, `'W'`, `'X'`,
+ * `'Z'`, …); `url` is used verbatim as the dirent URL — no prefix
+ * peeling. Use this when the caller already knows the target
+ * namespace and wants to bypass [`zimru_creator_add_item`]'s
+ * `"X/<rest>"` shortcut (or needs to write into a namespace other
+ * than `C` or `X`).
+ *
+ * Routing semantics:
+ *
+ * * `'C'` (`0x43`) — same as [`zimru_creator_add_item`] without a
+ *   prefix. The default content namespace.
+ * * `'M'` (`0x4D`) — metadata. [`zimru_creator_add_metadata`] is the
+ *   normal entry point but explicit-namespace works for callers that
+ *   need a non-default mimetype outside the metadata pipeline.
+ * * `'X'` (`0x58`) — fulltext / title indexes (`X/fulltext/xapian`,
+ *   `X/title/xapian`). The libzim-shim writer uses this on
+ *   `finishZimCreation` after compacting its in-memory Glass DB.
+ * * Other namespaces — accepted; the writer emits the dirent under
+ *   the requested namespace without further validation.
+ */
+
+bool zimru_creator_add_item_in_namespace(struct zimru_creator_t *c,
+                                         uint8_t namespace_,
+                                         const char *url,
+                                         const char *title,
+                                         const char *mimetype,
+                                         const uint8_t *content,
+                                         uintptr_t content_len,
+                                         struct zimru_error_t **err);
 
 /**
  * Add a metadata entry under `M/<name>`. `mimetype` is recorded

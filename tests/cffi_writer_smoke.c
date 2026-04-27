@@ -109,6 +109,29 @@ int main(int argc, char **argv) {
                                 NULL, 0, &err))
         DIE("add_item empty: %s", err ? zimru_error_message(err) : "?");
 
+    /* X-namespace item via the path-prefix shortcut. The libzim-shim's
+     * Xapian writer emits its compacted Glass blob this way, expecting
+     * it to land at {ns:'X', url:"fulltext/xapian"} so reader-side
+     * xapian_loader.cpp finds it. */
+    const char fulltext_blob[] = "X-FT-MARKER";
+    if (!zimru_creator_add_item(c, "X/fulltext/xapian", "",
+                                "application/octet-stream+xapian",
+                                (const uint8_t *)fulltext_blob,
+                                sizeof(fulltext_blob) - 1, &err))
+        DIE("add_item X/fulltext/xapian: %s",
+            err ? zimru_error_message(err) : "?");
+
+    /* X-namespace item via the explicit primitive. URL is taken
+     * verbatim — no prefix peeling — so we pass "title/xapian" not
+     * "X/title/xapian" here. */
+    const char titlex_blob[] = "X-TITLE-MARKER";
+    if (!zimru_creator_add_item_in_namespace(c, 'X', "title/xapian", "",
+                                             "application/octet-stream+xapian",
+                                             (const uint8_t *)titlex_blob,
+                                             sizeof(titlex_blob) - 1, &err))
+        DIE("add_item_in_namespace X/title/xapian: %s",
+            err ? zimru_error_message(err) : "?");
+
     /* Metadata with the default text mime. */
     if (!zimru_creator_add_metadata(c, "Title", "text/plain;charset=utf-8",
                                     (const uint8_t *)"Writer Smoke", 12, &err))
@@ -225,6 +248,60 @@ int main(int argc, char **argv) {
     if (!zimru_entry_is_redirect(alias))
         DIE("alias 'start' should be a redirect today");
     zimru_entry_free(alias);
+
+    /* X-namespace items round-trip at their expected (ns, url):
+     *   - X/fulltext/xapian via the prefix shortcut → ns='X',
+     *     url='fulltext/xapian'.
+     *   - X/title/xapian via the explicit primitive → ns='X',
+     *     url='title/xapian'.
+     * Both must be reachable through get_entry_by_ns_path('X', …). */
+    zimru_entry_t *xfx = zimru_archive_get_entry_by_ns_path(
+        a, 'X', "fulltext/xapian", &err);
+    if (!xfx)
+        DIE("X/fulltext/xapian lookup: %s",
+            err ? zimru_error_message(err) : "?");
+    zimru_item_t *xfi = zimru_entry_get_item(xfx, false, &err);
+    if (!xfi)
+        DIE("X/fulltext/xapian get_item: %s",
+            err ? zimru_error_message(err) : "?");
+    zimru_blob_t *xfb = zimru_item_get_data(xfi, &err);
+    if (!xfb)
+        DIE("X/fulltext/xapian get_data: %s",
+            err ? zimru_error_message(err) : "?");
+    if (memmem(zimru_blob_data(xfb), zimru_blob_size(xfb), "X-FT-MARKER", 11) == NULL)
+        DIE("X/fulltext/xapian body missing X-FT-MARKER");
+    zimru_blob_free(xfb);
+    zimru_item_free(xfi);
+    zimru_entry_free(xfx);
+
+    zimru_entry_t *xtx = zimru_archive_get_entry_by_ns_path(
+        a, 'X', "title/xapian", &err);
+    if (!xtx)
+        DIE("X/title/xapian lookup: %s",
+            err ? zimru_error_message(err) : "?");
+    zimru_item_t *xti = zimru_entry_get_item(xtx, false, &err);
+    if (!xti)
+        DIE("X/title/xapian get_item: %s",
+            err ? zimru_error_message(err) : "?");
+    zimru_blob_t *xtb = zimru_item_get_data(xti, &err);
+    if (!xtb)
+        DIE("X/title/xapian get_data: %s",
+            err ? zimru_error_message(err) : "?");
+    if (memmem(zimru_blob_data(xtb), zimru_blob_size(xtb), "X-TITLE-MARKER", 14) == NULL)
+        DIE("X/title/xapian body missing X-TITLE-MARKER");
+    zimru_blob_free(xtb);
+    zimru_item_free(xti);
+    zimru_entry_free(xtx);
+
+    /* Confirm the prefix shortcut did NOT also create a C/X/fulltext/xapian
+     * entry — that's the bug this primitive was added to fix. */
+    zimru_error_t *neg_err = NULL;
+    zimru_entry_t *bogus = zimru_archive_get_entry_by_path(
+        a, "X/fulltext/xapian", &neg_err);
+    if (bogus) {
+        DIE("regression: C/X/fulltext/xapian exists; prefix-peel must route to X namespace");
+    }
+    if (neg_err) zimru_error_free(neg_err);
 
     /* The empty-payload item round-trips with zero bytes. */
     zimru_entry_t *ee = zimru_archive_get_entry_by_path(a, "empty", &err);
