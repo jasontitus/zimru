@@ -184,10 +184,7 @@ impl BuildStats {
             0.0
         };
         eprintln!("--- zimru BuildStats ---");
-        eprintln!(
-            "  total wall:           {:>8.2}s",
-            total.as_secs_f64()
-        );
+        eprintln!("  total wall:           {:>8.2}s", total.as_secs_f64());
         eprintln!(
             "  parallel encode:      {:>8.2}s ({:.1}%)  buffered clusters: {}",
             self.parallel_encode.as_secs_f64(),
@@ -320,10 +317,7 @@ pub(crate) enum ChunkedInFlight {
     /// Buffered: chunks append to `content`. At `finish` time the
     /// assembled body goes through `Streamer::push_item` like a
     /// regular `add_item` call.
-    Buffered {
-        meta: ChunkedMeta,
-        content: Vec<u8>,
-    },
+    Buffered { meta: ChunkedMeta, content: Vec<u8> },
     /// Streaming-encode: chunks feed a zstd encoder that writes to
     /// a per-item *temp file* (not the main output). At
     /// `end_chunked_item` we hand the encoder + temp-file path off
@@ -371,10 +365,11 @@ pub(crate) const MIME_LIST_RESERVE: usize = 64 * 1024;
 /// per-cluster averages (less dictionary warmup → worse
 /// compression on under-filled clusters). Empirically, gains are
 /// largest on ZIMs with non-trivial mime / extension diversity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterStrategy {
     /// One in-flight cluster, items packed in `add_item` order
     /// (URL-sort order if the caller is the buffered API). Default.
+    #[default]
     Single,
     /// One in-flight cluster per distinct mime type. HTML items go
     /// together, JSON items go together, PNG items go together, and
@@ -389,12 +384,6 @@ pub enum ClusterStrategy {
     /// Useful for ZIMs whose directory layout reflects content
     /// types (`wiki/...`, `maps/...`, `images/...`).
     ByFirstPathSegment,
-}
-
-impl Default for ClusterStrategy {
-    fn default() -> Self {
-        ClusterStrategy::Single
-    }
 }
 
 /// High-level ZIM file builder. Two usage modes:
@@ -417,6 +406,13 @@ pub struct Creator {
     compression: Compression,
     compression_level: Option<i32>,
     cluster_size_target: usize,
+    /// Soft cap on bytes queued for parallel-batch encode at any
+    /// time. `0` means "unlimited" (drain only when the queue hits
+    /// `rayon::current_num_threads()` clusters, the default).
+    /// Setting a non-zero value forces an early drain whenever the
+    /// queue's running total exceeds the cap — trades wall-time
+    /// parallelism for a tighter peak-RSS bound.
+    max_in_flight_bytes: usize,
     uuid: [u8; 16],
     cluster_strategy: ClusterStrategy,
 
@@ -444,6 +440,7 @@ impl Creator {
             compression: Compression::Zstd,
             compression_level: None,
             cluster_size_target: DEFAULT_CLUSTER_SIZE_TARGET,
+            max_in_flight_bytes: 0,
             uuid: default_uuid(),
             cluster_strategy: ClusterStrategy::Single,
             stream: None,
@@ -526,7 +523,12 @@ impl Creator {
             ))
         })?;
         s.begin_chunked_item(
-            ChunkedMeta { namespace, path, title, mimetype },
+            ChunkedMeta {
+                namespace,
+                path,
+                title,
+                mimetype,
+            },
             expected_size,
         )
     }
@@ -696,6 +698,25 @@ impl Creator {
         self
     }
 
+    /// Soft cap on the number of raw bytes queued in the
+    /// parallel-batch encode pipeline at any time. Zero (the
+    /// default) means "drain only when the queue hits
+    /// `rayon::current_num_threads()` clusters" — i.e. saturate
+    /// CPU at the cost of a wider memory footprint.
+    ///
+    /// A non-zero value forces an early drain whenever the
+    /// queue's accumulated bytes cross the cap, trading
+    /// parallel-batch CPU saturation for a tighter peak RSS.
+    /// Useful in memory-constrained environments (Kiwix
+    /// zimfarm worker, embedded builds): for example pass
+    /// `512 * 1024 * 1024` to keep the parallel-batch buffer
+    /// under ~512 MiB on top of zimru's other in-process state
+    /// (~few hundred MB).
+    pub fn set_max_in_flight_bytes(&mut self, bytes: usize) -> &mut Self {
+        self.max_in_flight_bytes = bytes;
+        self
+    }
+
     pub fn set_uuid(&mut self, uuid: impl Into<crate::Uuid>) -> &mut Self {
         self.uuid = uuid.into().into_bytes();
         self
@@ -739,6 +760,7 @@ impl Creator {
             self.compression,
             self.compression_level,
             self.cluster_size_target,
+            self.max_in_flight_bytes,
             self.uuid,
             self.main_path.take(),
             self.cluster_strategy,
@@ -895,6 +917,13 @@ struct Streamer {
     compression: Compression,
     compression_level: Option<i32>,
     cluster_size_target: usize,
+    /// Soft cap on raw bytes queued in `pending_encode` (see
+    /// [`Creator::set_max_in_flight_bytes`]). 0 = unlimited.
+    max_in_flight_bytes: usize,
+    /// Running total of raw bytes currently in `pending_encode`,
+    /// kept incrementally so flush_bucket doesn't have to walk
+    /// every queued cluster on every push.
+    pending_bytes: usize,
     uuid: [u8; 16],
     main_path: Option<String>,
     cluster_strategy: ClusterStrategy,
@@ -990,11 +1019,13 @@ impl Streamer {
             .expect("Streamer file was taken by streaming-encode and not yet returned")
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open(
         path: &Path,
         compression: Compression,
         compression_level: Option<i32>,
         cluster_size_target: usize,
+        max_in_flight_bytes: usize,
         uuid: [u8; 16],
         main_path: Option<String>,
         cluster_strategy: ClusterStrategy,
@@ -1018,6 +1049,8 @@ impl Streamer {
             compression,
             compression_level,
             cluster_size_target,
+            max_in_flight_bytes,
+            pending_bytes: 0,
             uuid,
             main_path,
             cluster_strategy,
@@ -1041,11 +1074,7 @@ impl Streamer {
     /// AND compression is zstd, the body will be stream-encoded to its
     /// own cluster on disk; otherwise chunks accumulate in a `Vec<u8>`
     /// and the assembled item runs through the normal bin-packer.
-    fn begin_chunked_item(
-        &mut self,
-        meta: ChunkedMeta,
-        expected_size: Option<u64>,
-    ) -> Result<()> {
+    fn begin_chunked_item(&mut self, meta: ChunkedMeta, expected_size: Option<u64>) -> Result<()> {
         if self.in_flight.is_some() {
             return Err(Error::Io(std::io::Error::other(
                 "begin_chunked_item: another chunked item is already in flight",
@@ -1196,15 +1225,13 @@ impl Streamer {
             None => Err(Error::Io(std::io::Error::other(
                 "end_chunked_item: no item in flight",
             ))),
-            Some(ChunkedInFlight::Buffered { meta, content }) => {
-                self.push_item(Item {
-                    path: meta.path,
-                    title: meta.title,
-                    mimetype: meta.mimetype,
-                    content,
-                    namespace: meta.namespace,
-                })
-            }
+            Some(ChunkedInFlight::Buffered { meta, content }) => self.push_item(Item {
+                path: meta.path,
+                title: meta.title,
+                mimetype: meta.mimetype,
+                content,
+                namespace: meta.namespace,
+            }),
             Some(ChunkedInFlight::StreamingZstd {
                 meta,
                 encoder,
@@ -1278,9 +1305,7 @@ impl Streamer {
         for t in tasks {
             let cluster_idx = t.cluster_idx;
             let res = t.handle.join().map_err(|_| {
-                Error::Io(std::io::Error::other(
-                    "streaming-encode thread panicked",
-                ))
+                Error::Io(std::io::Error::other("streaming-encode thread panicked"))
             })?;
             let (temp_path, encoded_bytes) = res?;
             completed.push((cluster_idx, temp_path, encoded_bytes));
@@ -1289,22 +1314,19 @@ impl Streamer {
         // cluster_ptrs by cluster_idx, so the on-disk byte order
         // doesn't matter, but smaller cluster_idx values having
         // smaller offsets is nicer for sequential reads.
+        //
+        // `std::io::copy` between two `&mut File`s picks the most
+        // efficient kernel primitive available: `copy_file_range(2)`
+        // on Linux (in-kernel page-cache-aware copy, no userspace
+        // bounce buffer), `fcopyfile(2)` on macOS, falling back to
+        // a read/write loop only on platforms without either. This
+        // captures the io_uring-style "skip user-space copies" win
+        // without depending on io_uring itself.
         completed.sort_by_key(|(idx, _, _)| *idx);
-        let mut buf = vec![0u8; 1 << 20];
         for (cluster_idx, temp_path, bytes) in completed {
             self.cluster_offsets[cluster_idx as usize] = self.file_pos;
-            // Stream-copy temp → main. read+write loop on a 1 MiB
-            // buffer, no full-file slurp.
             let mut tf = std::fs::File::open(&temp_path)?;
-            let mut copied: u64 = 0;
-            loop {
-                let n = tf.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                self.file_mut().write_all(&buf[..n])?;
-                copied += n as u64;
-            }
+            let copied = std::io::copy(&mut tf, self.file_mut())?;
             drop(tf);
             // Best-effort cleanup; non-fatal if it fails.
             let _ = std::fs::remove_file(&temp_path);
@@ -1328,12 +1350,10 @@ impl Streamer {
                 Some((_, ext)) if !ext.contains('/') => ext.to_string(),
                 _ => String::new(),
             },
-            ClusterStrategy::ByFirstPathSegment => {
-                match path.split_once('/') {
-                    Some((head, _)) => head.to_string(),
-                    None => path.to_string(),
-                }
-            }
+            ClusterStrategy::ByFirstPathSegment => match path.split_once('/') {
+                Some((head, _)) => head.to_string(),
+                None => path.to_string(),
+            },
         }
     }
 
@@ -1409,15 +1429,26 @@ impl Streamer {
                 blob: pa.blob_idx,
             });
         }
+        // Track bytes incrementally; the cap-driven drain check
+        // doesn't have to walk every queued cluster.
+        let added_bytes: usize = bucket.blobs.iter().map(|b| b.len()).sum();
+        self.pending_bytes += added_bytes;
         self.pending_encode.push((cluster_idx, bucket.blobs));
         // Reinsert empty bucket for reuse without map churn.
         self.buckets.insert(key.to_string(), Bucket::default());
 
-        // If the queue is at thread-pool size, drain it: parallel
-        // encode + sequential write keeps cluster bytes contiguous
-        // and matches `cluster_offsets[i]` to file position.
+        // Drain trigger: either we hit thread-pool size (CPU-
+        // saturation default) OR the byte-cap is non-zero and the
+        // queue's running total exceeded it. Cap takes priority —
+        // a memory-conscious user wants a tight RSS bound even if
+        // it means smaller (fewer-thread) parallel batches.
         let threads = rayon::current_num_threads().max(1);
-        if self.pending_encode.len() >= threads {
+        let drain = if self.max_in_flight_bytes > 0 {
+            self.pending_bytes >= self.max_in_flight_bytes || self.pending_encode.len() >= threads
+        } else {
+            self.pending_encode.len() >= threads
+        };
+        if drain {
             self.drain_pending_encode()?;
         }
         Ok(())
@@ -1433,14 +1464,15 @@ impl Streamer {
         }
         let phase_start = Instant::now();
         let chunk = std::mem::take(&mut self.pending_encode);
+        // Queue is empty after the take — reset the running byte
+        // total so subsequent flushes start from zero.
+        self.pending_bytes = 0;
         let chunk_len = chunk.len() as u64;
         let comp = self.compression;
         let level = self.compression_level;
         let mut encoded: Vec<(u32, Vec<u8>)> = chunk
             .into_par_iter()
-            .map(|(idx, blobs)| {
-                encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes))
-            })
+            .map(|(idx, blobs)| encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes)))
             .collect::<Result<Vec<_>>>()?;
         encoded.sort_by_key(|(idx, _)| *idx);
         let mut bytes_written = 0u64;
@@ -1539,7 +1571,11 @@ impl Streamer {
         let mut pending_redirects: Vec<RawDirent> = Vec::new();
         let redirections = std::mem::take(&mut self.redirections);
         for r in redirections {
-            let title = if r.title.is_empty() { r.path.clone() } else { r.title };
+            let title = if r.title.is_empty() {
+                r.path.clone()
+            } else {
+                r.title
+            };
             pending_redirects.push(RawDirent::Redirect {
                 namespace: b'C',
                 url: r.path,
@@ -1731,20 +1767,35 @@ impl Streamer {
         };
 
         // 10. Write the trailing tables in one forward pass.
+        //
+        // The naïve form is one `write_all` per element, which on
+        // texas (1.08 M dirents) is ~3 M syscalls. We stage every
+        // table into a single `Vec<u8>` and emit one `write_all`
+        // (which on Linux/macOS turns into a small handful of
+        // kernel `write(2)` syscalls amortised over MB-sized
+        // chunks). Same kernel-syscall reduction io_uring's
+        // batched-submission would buy here, without io_uring.
         let table_phase = Instant::now();
+        let cluster_offsets = std::mem::take(&mut self.cluster_offsets);
+        let total_table_bytes = dirent_offsets.len() * 8
+            + title_order.len() * 4
+            + cluster_offsets.len() * 8
+            + dirent_blobs.iter().map(|b| b.len()).sum::<usize>();
+        let mut staging = Vec::with_capacity(total_table_bytes);
         for off in &dirent_offsets {
-            self.file_mut().write_all(&off.to_le_bytes())?;
+            staging.extend_from_slice(&off.to_le_bytes());
         }
         for idx in &title_order {
-            self.file_mut().write_all(&idx.to_le_bytes())?;
+            staging.extend_from_slice(&idx.to_le_bytes());
         }
-        let cluster_offsets = std::mem::take(&mut self.cluster_offsets);
         for off in &cluster_offsets {
-            self.file_mut().write_all(&off.to_le_bytes())?;
+            staging.extend_from_slice(&off.to_le_bytes());
         }
         for blob in &dirent_blobs {
-            self.file_mut().write_all(blob)?;
+            staging.extend_from_slice(blob);
         }
+        self.file_mut().write_all(&staging)?;
+        drop(staging);
         drop(dirent_blobs);
         drop(dirent_offsets);
         self.stats.table_write += table_phase.elapsed();
@@ -1754,14 +1805,11 @@ impl Streamer {
         //     readers stop at the double-NUL terminator).
         let mime_list_bytes = encode_mime_list(&self.mimes);
         if mime_list_bytes.len() > MIME_LIST_RESERVE {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "mime list ({} bytes) exceeds reserved region ({} bytes)",
-                    mime_list_bytes.len(),
-                    MIME_LIST_RESERVE
-                ),
-            )));
+            return Err(Error::Io(std::io::Error::other(format!(
+                "mime list ({} bytes) exceeds reserved region ({} bytes)",
+                mime_list_bytes.len(),
+                MIME_LIST_RESERVE
+            ))));
         }
         self.file_mut().seek(SeekFrom::Start(HEADER_SIZE as u64))?;
         self.file_mut().write_all(&mime_list_bytes)?;
@@ -1845,7 +1893,8 @@ impl Streamer {
 /// Returns `Err` with a descriptive message on the first failure.
 fn verify_archive(path: &Path) -> Result<()> {
     let arc = crate::archive::Archive::open(path)?;
-    let checks: &[(&str, &dyn Fn(&crate::archive::Archive) -> Result<bool>)] = &[
+    type Check = dyn Fn(&crate::archive::Archive) -> Result<bool>;
+    let checks: &[(&str, &Check)] = &[
         ("dirent_ptrs", &|a| a.check_dirent_ptrs()),
         ("dirent_order", &|a| a.check_dirent_order()),
         ("title_index", &|a| a.check_title_index()),
@@ -1867,7 +1916,6 @@ fn verify_archive(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-
 
 struct HeaderFields {
     major_version: u16,
@@ -1990,7 +2038,9 @@ fn encode_cluster(
     // and zimru with the same one-liner. Falls back to a fast level
     // 3 default for zstd / 3 for xz when no env var is set.
     fn env_zstd_level() -> Option<i32> {
-        std::env::var("ZSTD_CLEVEL").ok().and_then(|v| v.parse().ok())
+        std::env::var("ZSTD_CLEVEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
     }
     let (compression_id, body) = match compression {
         Compression::None => (1u8, payload),

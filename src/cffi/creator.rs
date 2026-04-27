@@ -40,10 +40,7 @@ pub struct zimru_creator_t {
 /// Resolve `c` to a `&mut Creator` or set `*err` and return `null_mut()`.
 /// Centralises the NULL-check + already-finalized check that every
 /// `set_*` / `add_*` entry point performs.
-unsafe fn inner_mut(
-    c: *mut zimru_creator_t,
-    err: *mut *mut zimru_error_t,
-) -> *mut Creator {
+unsafe fn inner_mut(c: *mut zimru_creator_t, err: *mut *mut zimru_error_t) -> *mut Creator {
     if c.is_null() {
         set_err(err, crate::Error::EntryNotFound);
         return std::ptr::null_mut();
@@ -64,10 +61,7 @@ unsafe fn inner_mut(
 
 /// Convert a NUL-terminated C string to an owned `String`. Sets `*err`
 /// on bad UTF-8 and returns `None`.
-unsafe fn cstr_to_string(
-    s: *const c_char,
-    err: *mut *mut zimru_error_t,
-) -> Option<String> {
+unsafe fn cstr_to_string(s: *const c_char, err: *mut *mut zimru_error_t) -> Option<String> {
     if s.is_null() {
         set_err(err, crate::Error::EntryNotFound);
         return None;
@@ -83,11 +77,7 @@ unsafe fn cstr_to_string(
 
 /// Copy `len` bytes from `data` into an owned `Vec<u8>`. Treats NULL +
 /// zero-length as an empty vec; NULL + non-zero length is an error.
-unsafe fn ptr_to_vec(
-    data: *const u8,
-    len: usize,
-    err: *mut *mut zimru_error_t,
-) -> Option<Vec<u8>> {
+unsafe fn ptr_to_vec(data: *const u8, len: usize, err: *mut *mut zimru_error_t) -> Option<Vec<u8>> {
     if len == 0 {
         return Some(Vec::new());
     }

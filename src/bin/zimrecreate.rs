@@ -82,9 +82,7 @@ fn main() -> ExitCode {
                     Some("single") | Some("") => ClusterStrategy::Single,
                     Some("mime") => ClusterStrategy::ByMime,
                     Some("extension") | Some("ext") => ClusterStrategy::ByExtension,
-                    Some("path") | Some("path-segment") => {
-                        ClusterStrategy::ByFirstPathSegment
-                    }
+                    Some("path") | Some("path-segment") => ClusterStrategy::ByFirstPathSegment,
                     other => {
                         eprintln!(
                             "zimrecreate: --cluster-by must be one of single|mime|extension|path; got `{other:?}`"
@@ -147,6 +145,9 @@ fn run(
     cluster_strategy: ClusterStrategy,
 ) -> Result<(), zimru::Error> {
     let source = Archive::open(src)?;
+    // We're about to walk every entry + every cluster end-to-end,
+    // so hint the kernel to prefetch sequentially.
+    source.advise_sequential_scan();
     let mut creator = Creator::new();
     creator.set_compression(compression);
     if let Some(level) = compression_level {

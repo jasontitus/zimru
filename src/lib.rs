@@ -64,6 +64,7 @@ pub mod cluster;
 pub mod dirent;
 pub mod error;
 pub mod header;
+pub mod io_hints;
 pub mod mime;
 mod raw;
 pub mod uuid;

@@ -49,6 +49,11 @@ struct Opts {
     /// Cluster routing strategy: "single" (default), "mime",
     /// "extension", or "path".
     cluster_by: Option<String>,
+    /// Soft cap on parallel-batch in-flight bytes (MiB). Zero (the
+    /// default) means "saturate cores", trading higher peak RSS
+    /// for higher CPU utilisation. Non-zero forces an early drain
+    /// so the parallel-batch buffer stays under the cap.
+    max_memory_mb: Option<usize>,
 
     html_dir: Option<PathBuf>,
     zim_file: Option<PathBuf>,
@@ -107,6 +112,7 @@ fn main() -> ExitCode {
             ("-o", v) | ("--flavour", v) => o.flavour = Some(value_or_next(v, &args, &mut i)),
             ("-s", v) | ("--scraper", v) => o.scraper = Some(value_or_next(v, &args, &mut i)),
             ("--cluster-by", v) => o.cluster_by = Some(value_or_next(v, &args, &mut i)),
+            ("--max-memory", v) => o.max_memory_mb = value_or_next(v, &args, &mut i).parse().ok(),
             (other, _) if other.starts_with('-') => {
                 eprintln!("zimwriterfs: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -202,6 +208,9 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     if let Some(kb) = o.cluster_size_kb {
         creator.set_cluster_size_target(kb * 1024);
     }
+    if let Some(mb) = o.max_memory_mb {
+        creator.set_max_in_flight_bytes(mb * 1024 * 1024);
+    }
     if let Some(strategy) = o.cluster_by.as_deref() {
         let s = match strategy {
             "single" | "" => zimru::writer::ClusterStrategy::Single,
@@ -255,10 +264,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     // own version string here ("zimwriterfs-3.x.x"); we emit the
     // user-provided value if any, otherwise fall back to our own
     // identifier so downstream tooling has something to read.
-    let scraper = o
-        .scraper
-        .clone()
-        .unwrap_or_else(|| VERSION.to_string());
+    let scraper = o.scraper.clone().unwrap_or_else(|| VERSION.to_string());
     creator.add_metadata("Scraper", scraper);
 
     // Illustration (must exist; mandatory upstream).
@@ -287,7 +293,13 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     use rayon::prelude::*;
     use std::io::Read as _;
     const STREAMING_THRESHOLD_BIN: u64 = 4 * 1024 * 1024;
-    const READ_BATCH: usize = 64;
+    // Bumped from 64 to 256: more files queued in flight per
+    // rayon batch keeps the disk queue deeper, capturing some of
+    // io_uring's submission-batching win on spinning rust + NVMe
+    // alike. The peak in-batch memory is `READ_BATCH × avg_size`,
+    // a few tens of MB on typical inputs — well under the
+    // parallel-batch encode buffer.
+    const READ_BATCH: usize = 256;
     let mut count = 0usize;
 
     // Build the (path, relpath, size, is_html) list once. metadata()
@@ -312,7 +324,12 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
             let size = p.metadata().map(|m| m.len()).unwrap_or(0);
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
             let is_html = ext == "html" || ext == "htm";
-            PrepEntry { path: p, rel_str, size, is_html }
+            PrepEntry {
+                path: p,
+                rel_str,
+                size,
+                is_html,
+            }
         })
         .collect();
 
@@ -334,6 +351,12 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
         if !needs_full_read(e) && e.size >= STREAMING_THRESHOLD_BIN {
             let mime = mime_for_path(&e.path);
             let mut f = fs::File::open(&e.path)?;
+            // Hint the kernel: we're about to read this whole
+            // file sequentially. On Linux this turns on aggressive
+            // readahead and drops pages behind us; on macOS it
+            // enables F_RDAHEAD. Either way the next read() call
+            // tends to find its bytes already warm in cache.
+            zimru::io_hints::hint_sequential(&f);
             creator.begin_chunked_item(
                 None,
                 e.rel_str.clone(),

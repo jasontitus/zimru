@@ -33,7 +33,10 @@ use std::time::Instant;
 use zimru::{Archive, Item};
 
 fn bench_zim() -> Option<PathBuf> {
-    std::env::var("ZIMRU_BENCH_ZIM").ok().map(PathBuf::from).filter(|p| p.exists())
+    std::env::var("ZIMRU_BENCH_ZIM")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
 }
 
 fn pick_item(arc: &Archive) -> Option<Item> {

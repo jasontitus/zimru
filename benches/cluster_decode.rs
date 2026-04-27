@@ -44,9 +44,7 @@
 use std::cell::RefCell;
 use std::time::Duration;
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 const PAYLOAD_SIZE: usize = 2 * 1024 * 1024;
 
@@ -79,7 +77,9 @@ fn synth_payload(target_size: usize) -> Vec<u8> {
     // Linear-congruential PRNG for deterministic-but-unpredictable noise.
     let mut state: u64 = 0xCAFEBABED00DBEEF;
     let mut step = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
     while out.len() < target_size {
@@ -120,7 +120,9 @@ fn decompress_pooled(body: &[u8]) -> Vec<u8> {
         }
         let dec = opt.as_mut().unwrap();
         let mut out = vec![0u8; size];
-        let n = dec.decompress_to_buffer(body, &mut out).expect("decompress");
+        let n = dec
+            .decompress_to_buffer(body, &mut out)
+            .expect("decompress");
         out.truncate(n);
         out
     })
@@ -142,12 +144,18 @@ fn bench_cluster_decode(c: &mut Criterion) {
         // `get_frame_content_size` returns the exact value.
         let compressed = zstd::bulk::compress(&payload, level).expect("compress");
         let ratio = payload.len() as f64 / compressed.len() as f64;
-        eprintln!("level {level:>2}: compressed {} → {} bytes (×{:.2})",
-                  payload.len(), compressed.len(), ratio);
+        eprintln!(
+            "level {level:>2}: compressed {} → {} bytes (×{:.2})",
+            payload.len(),
+            compressed.len(),
+            ratio
+        );
 
         // Reset the thread-local DCtx so the "cold" measurement at this
         // level isn't pre-warmed by a prior level's window buffer.
-        REUSABLE_DCTX.with(|c| { *c.borrow_mut() = None; });
+        REUSABLE_DCTX.with(|c| {
+            *c.borrow_mut() = None;
+        });
 
         group.bench_with_input(
             BenchmarkId::new("fresh_dctx", level),
