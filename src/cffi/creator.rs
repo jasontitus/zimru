@@ -30,9 +30,25 @@ use crate::writer::{Creator, Item};
 use crate::Compression;
 
 /// Opaque writer handle. Owns a [`Creator`] until `zimru_creator_write_to`
-/// consumes it.
+/// consumes it. May also hold a single in-flight chunked item between
+/// `begin_item` and `end_item` calls.
 pub struct zimru_creator_t {
     inner: Option<Creator>,
+    /// Set between `zimru_creator_begin_item` and `zimru_creator_end_item`.
+    /// Holds the metadata + accumulated chunks. We don't use the borrowed
+    /// `ItemBuilder` here because lifetime-tying to `inner` would require
+    /// self-referential storage; instead we replicate its state and call
+    /// `Creator::begin_item().write_chunk(...).finish()` synthetically at
+    /// `end_item` time.
+    in_flight: Option<InFlightItem>,
+}
+
+struct InFlightItem {
+    namespace: Option<u8>,
+    path: String,
+    title: String,
+    mimetype: String,
+    content: Vec<u8>,
 }
 
 /// Resolve `c` to a `&mut Creator` or set `*err` and return `null_mut()`.
@@ -102,6 +118,7 @@ unsafe fn ptr_to_vec(
 pub unsafe extern "C" fn zimru_creator_new() -> *mut zimru_creator_t {
     Box::into_raw(Box::new(zimru_creator_t {
         inner: Some(Creator::new()),
+        in_flight: None,
     }))
 }
 
@@ -542,6 +559,197 @@ pub unsafe extern "C" fn zimru_creator_finish_writing(
         return false;
     };
     match creator.finish_writing() {
+        Ok(()) => true,
+        Err(e) => {
+            set_err(err, e);
+            false
+        }
+    }
+}
+
+/// Begin a chunked item — the caller will follow up with one or
+/// more [`zimru_creator_item_chunk`] calls and a single
+/// [`zimru_creator_end_item`] call to finalise. Useful for callers
+/// with streaming content sources (e.g. libzim's
+/// `ContentProvider::feed()`) that want to avoid slurping the
+/// entire body into one buffer before handing it to zimru.
+///
+/// `path` honours the same `X/<rest>` namespace-prefix shortcut as
+/// [`zimru_creator_add_item`]; pass `'X'` (or any single-byte
+/// namespace) explicitly via `namespace` to bypass the prefix logic.
+/// Pass `0` for `namespace` to use the default routing
+/// (`X/...` peel, otherwise `'C'`).
+///
+/// `size_hint` is a non-binding capacity hint used to pre-allocate
+/// the in-flight buffer. Pass `0` to skip.
+///
+/// Errors:
+///
+/// * Creator not in streaming mode → `*err` set, returns `false`.
+///   Call `start_writing` first.
+/// * Another chunked item is already in flight → `*err` set,
+///   returns `false`. Call `end_item` (or `cancel_item` — TODO if
+///   needed) before starting a new one.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_creator_begin_item(
+    c: *mut zimru_creator_t,
+    namespace: u8,
+    path: *const c_char,
+    title: *const c_char,
+    mimetype: *const c_char,
+    size_hint: usize,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if c.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return false;
+    }
+    if (*c).in_flight.is_some() {
+        set_err(
+            err,
+            crate::Error::Io(std::io::Error::other(
+                "zimru_creator: another chunked item is already in flight",
+            )),
+        );
+        return false;
+    }
+    let Some(path_str) = cstr_to_string(path, err) else {
+        return false;
+    };
+    let Some(title_str) = cstr_to_string(title, err) else {
+        return false;
+    };
+    let Some(mime_str) = cstr_to_string(mimetype, err) else {
+        return false;
+    };
+    let inner = inner_mut(c, err);
+    if inner.is_null() {
+        return false;
+    }
+    let creator: &mut Creator = &mut *inner;
+    // Resolve namespace: explicit `namespace` wins; if 0, fall back
+    // to the X/ prefix shortcut to match zimru_creator_add_item.
+    let (resolved_ns, resolved_path) = if namespace == 0 {
+        if let Some(rest) = path_str.strip_prefix("X/") {
+            if rest.is_empty() {
+                (None, path_str)
+            } else {
+                (Some(b'X'), rest.to_string())
+            }
+        } else {
+            (None, path_str)
+        }
+    } else {
+        (Some(namespace), path_str)
+    };
+
+    // Validate that the creator is in streaming mode; reuse the
+    // exact same check Creator::begin_item performs.
+    if creator.peek_streaming().is_none() {
+        set_err(
+            err,
+            crate::Error::Io(std::io::Error::other(
+                "zimru_creator_begin_item requires start_writing first",
+            )),
+        );
+        return false;
+    }
+
+    let mut content = Vec::new();
+    if size_hint > 0 {
+        content.reserve(size_hint);
+    }
+    (*c).in_flight = Some(InFlightItem {
+        namespace: resolved_ns,
+        path: resolved_path,
+        title: title_str,
+        mimetype: mime_str,
+        content,
+    });
+    true
+}
+
+/// Append a chunk of body bytes to the in-flight chunked item.
+/// Cheap — copies `len` bytes into the in-flight buffer. Empty
+/// chunks (`len == 0`, `chunk` may be NULL) are no-ops.
+///
+/// Errors:
+///
+/// * No item in flight → `*err` set, returns `false`. Call
+///   `begin_item` first.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_creator_item_chunk(
+    c: *mut zimru_creator_t,
+    chunk: *const u8,
+    len: usize,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if c.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return false;
+    }
+    let Some(in_flight) = (*c).in_flight.as_mut() else {
+        set_err(
+            err,
+            crate::Error::Io(std::io::Error::other(
+                "zimru_creator_item_chunk: no item in flight (call begin_item first)",
+            )),
+        );
+        return false;
+    };
+    if len == 0 {
+        return true;
+    }
+    if chunk.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return false;
+    }
+    let slice = std::slice::from_raw_parts(chunk, len);
+    in_flight.content.extend_from_slice(slice);
+    true
+}
+
+/// Finalise the in-flight chunked item — pushes it through the
+/// streaming bin-packer (same path as `add_item`). After this
+/// returns successfully, no item is in flight; the caller can
+/// `begin_item` again or proceed to `finish_writing`.
+///
+/// Errors:
+///
+/// * No item in flight → `*err` set, returns `false`.
+/// * Internal write/encode error during the (potentially
+///   triggered) cluster flush → `*err` set, returns `false`.
+#[no_mangle]
+pub unsafe extern "C" fn zimru_creator_end_item(
+    c: *mut zimru_creator_t,
+    err: *mut *mut zimru_error_t,
+) -> bool {
+    if c.is_null() {
+        set_err(err, crate::Error::EntryNotFound);
+        return false;
+    }
+    let Some(in_flight) = (*c).in_flight.take() else {
+        set_err(
+            err,
+            crate::Error::Io(std::io::Error::other(
+                "zimru_creator_end_item: no item in flight",
+            )),
+        );
+        return false;
+    };
+    let inner = inner_mut(c, err);
+    if inner.is_null() {
+        return false;
+    }
+    let creator: &mut Creator = &mut *inner;
+    let item = Item {
+        path: in_flight.path,
+        title: in_flight.title,
+        mimetype: in_flight.mimetype,
+        content: in_flight.content,
+        namespace: in_flight.namespace,
+    };
+    match creator.push_streaming_item(item) {
         Ok(()) => true,
         Err(e) => {
             set_err(err, e);

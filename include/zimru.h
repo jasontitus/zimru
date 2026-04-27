@@ -98,7 +98,8 @@ typedef struct zimru_blob_t zimru_blob_t;
 
 /**
  * Opaque writer handle. Owns a [`Creator`] until `zimru_creator_write_to`
- * consumes it.
+ * consumes it. May also hold a single in-flight chunked item between
+ * `begin_item` and `end_item` calls.
  */
 typedef struct zimru_creator_t zimru_creator_t;
 
@@ -791,6 +792,70 @@ bool zimru_creator_start_writing(struct zimru_creator_t *c,
  *   call is `free`.
  */
  bool zimru_creator_finish_writing(struct zimru_creator_t *c, struct zimru_error_t **err);
+
+/**
+ * Begin a chunked item — the caller will follow up with one or
+ * more [`zimru_creator_item_chunk`] calls and a single
+ * [`zimru_creator_end_item`] call to finalise. Useful for callers
+ * with streaming content sources (e.g. libzim's
+ * `ContentProvider::feed()`) that want to avoid slurping the
+ * entire body into one buffer before handing it to zimru.
+ *
+ * `path` honours the same `X/<rest>` namespace-prefix shortcut as
+ * [`zimru_creator_add_item`]; pass `'X'` (or any single-byte
+ * namespace) explicitly via `namespace` to bypass the prefix logic.
+ * Pass `0` for `namespace` to use the default routing
+ * (`X/...` peel, otherwise `'C'`).
+ *
+ * `size_hint` is a non-binding capacity hint used to pre-allocate
+ * the in-flight buffer. Pass `0` to skip.
+ *
+ * Errors:
+ *
+ * * Creator not in streaming mode → `*err` set, returns `false`.
+ *   Call `start_writing` first.
+ * * Another chunked item is already in flight → `*err` set,
+ *   returns `false`. Call `end_item` (or `cancel_item` — TODO if
+ *   needed) before starting a new one.
+ */
+
+bool zimru_creator_begin_item(struct zimru_creator_t *c,
+                              uint8_t namespace_,
+                              const char *path,
+                              const char *title,
+                              const char *mimetype,
+                              uintptr_t size_hint,
+                              struct zimru_error_t **err);
+
+/**
+ * Append a chunk of body bytes to the in-flight chunked item.
+ * Cheap — copies `len` bytes into the in-flight buffer. Empty
+ * chunks (`len == 0`, `chunk` may be NULL) are no-ops.
+ *
+ * Errors:
+ *
+ * * No item in flight → `*err` set, returns `false`. Call
+ *   `begin_item` first.
+ */
+
+bool zimru_creator_item_chunk(struct zimru_creator_t *c,
+                              const uint8_t *chunk,
+                              uintptr_t len,
+                              struct zimru_error_t **err);
+
+/**
+ * Finalise the in-flight chunked item — pushes it through the
+ * streaming bin-packer (same path as `add_item`). After this
+ * returns successfully, no item is in flight; the caller can
+ * `begin_item` again or proceed to `finish_writing`.
+ *
+ * Errors:
+ *
+ * * No item in flight → `*err` set, returns `false`.
+ * * Internal write/encode error during the (potentially
+ *   triggered) cluster flush → `*err` set, returns `false`.
+ */
+ bool zimru_creator_end_item(struct zimru_creator_t *c, struct zimru_error_t **err);
 
 /**
  * Free a `zimru_entry_t` previously returned by an Archive lookup.

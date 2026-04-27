@@ -135,6 +135,48 @@ pub struct MetadataEntry {
     pub value: Vec<u8>,
 }
 
+/// Builder for a chunked-input item — see [`Creator::begin_item`].
+/// Holds the partially-accumulated body until `finish()` is called,
+/// at which point the assembled item is pushed through the same
+/// streaming bin-packer as `add_item`. The borrow on the parent
+/// `Creator` keeps misuse compile-checked: only one chunked item
+/// is in flight at a time.
+pub struct ItemBuilder<'a> {
+    creator: &'a mut Creator,
+    path: String,
+    title: String,
+    mimetype: String,
+    namespace: Option<u8>,
+    content: Vec<u8>,
+}
+
+impl ItemBuilder<'_> {
+    /// Append a chunk of body bytes to the in-flight item.
+    pub fn write_chunk(&mut self, chunk: &[u8]) {
+        self.content.extend_from_slice(chunk);
+    }
+
+    /// Finalise the item — pushes it through the streaming
+    /// bin-packer. After this call the builder is consumed; the
+    /// caller can call `begin_item` again for the next item.
+    pub fn finish(self) -> Result<()> {
+        let item = Item {
+            path: self.path,
+            title: self.title,
+            mimetype: self.mimetype,
+            content: self.content,
+            namespace: self.namespace,
+        };
+        // Safe to unwrap because `begin_item` checked stream.is_some().
+        let s = self
+            .creator
+            .stream
+            .as_mut()
+            .expect("ItemBuilder requires streaming mode");
+        s.push_item(item)
+    }
+}
+
 /// Reserved bytes after the 80-byte header for the mime-type list.
 /// Real libzim asserts `mimelistPos == 80`; the streaming writer pins
 /// it there and writes the actual mime list at finalize time, padded
@@ -259,6 +301,73 @@ impl Creator {
             self.items.push(item);
         }
         self
+    }
+
+    /// True iff `start_writing` has been called and the creator is
+    /// ready for streaming-mode `add_*` calls. Used by the C ABI to
+    /// validate `begin_item` preconditions without taking out a
+    /// borrow on the inner streamer.
+    #[doc(hidden)]
+    pub fn peek_streaming(&self) -> Option<()> {
+        if self.stream.is_some() {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Streaming-mode push that propagates errors (unlike
+    /// `add_item`'s panic-on-error). Used by the chunked C ABI
+    /// after assembling an item from chunks. Errors if streaming
+    /// mode hasn't been started.
+    #[doc(hidden)]
+    pub fn push_streaming_item(&mut self, item: Item) -> Result<()> {
+        match self.stream.as_mut() {
+            Some(s) => s.push_item(item),
+            None => Err(Error::Io(std::io::Error::other(
+                "push_streaming_item before start_writing",
+            ))),
+        }
+    }
+
+    /// Begin a chunked item — for callers that have a streaming
+    /// content source (e.g. `ContentProvider::feed()` chunks from
+    /// libzim-shim) and don't want to slurp the body into one
+    /// `Vec<u8>` before handing it off. Memory peak on the *caller*
+    /// side becomes one chunk; zimru still accumulates the item's
+    /// bytes internally until cluster flush.
+    ///
+    /// Returns a builder that owns the in-flight item state. Caller
+    /// pushes chunks via [`ItemBuilder::write_chunk`] and finishes
+    /// with [`ItemBuilder::finish`].
+    ///
+    /// Requires streaming mode (`start_writing` must have been
+    /// called); buffered-mode chunked items aren't supported.
+    pub fn begin_item(
+        &mut self,
+        path: impl Into<String>,
+        title: impl Into<String>,
+        mimetype: impl Into<String>,
+        namespace: Option<u8>,
+        size_hint: Option<usize>,
+    ) -> Result<ItemBuilder<'_>> {
+        if self.stream.is_none() {
+            return Err(Error::Io(std::io::Error::other(
+                "begin_item requires start_writing first",
+            )));
+        }
+        let mut content = Vec::new();
+        if let Some(n) = size_hint {
+            content.reserve(n);
+        }
+        Ok(ItemBuilder {
+            creator: self,
+            path: path.into(),
+            title: title.into(),
+            mimetype: mimetype.into(),
+            namespace,
+            content,
+        })
     }
 
     pub fn add_redirection(
