@@ -28,6 +28,7 @@ use std::io::Write as _;
 use std::path::Path;
 
 use md5::{Digest, Md5};
+use rayon::prelude::*;
 
 use crate::cluster::Compression;
 use crate::error::{Error, Result};
@@ -408,11 +409,13 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
         }
     }
 
-    // 4. Build article dirents + compressed cluster bytes in one sweep.
+    // 4a. Pass 1: walk groups serially to build dirents + intern mime types.
+    //     This pass is fast (just metadata bookkeeping). The expensive
+    //     cluster-encoding work is split out to a parallel pass below.
     let mut mimes: Vec<String> = Vec::new();
     let mut mime_index: BTreeMap<String, u16> = BTreeMap::new();
     let mut dirents: Vec<RawDirent> = Vec::new();
-    let mut cluster_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut blob_groups: Vec<Vec<Vec<u8>>> = Vec::with_capacity(groups.len());
 
     for (ci, group) in groups.into_iter().enumerate() {
         let ci = ci as u32;
@@ -430,12 +433,20 @@ fn finalize(builder: Creator, mut file: File) -> Result<()> {
             });
             blobs_for_cluster.push(p.content);
         }
-        cluster_bytes.push(encode_cluster(
-            &blobs_for_cluster,
-            compression,
-            compression_level,
-        )?);
+        blob_groups.push(blobs_for_cluster);
     }
+
+    // 4b. Pass 2: encode every cluster in parallel via rayon. Each
+    //     cluster is independent — its bytes go into its own slot in
+    //     the output Vec, and the output index is stable so the
+    //     cluster-pointer list still reflects URL-pointer order.
+    //     On a multi-core host this turns single-threaded zstd 19/22
+    //     compression into N-way parallel; on smaller archives the
+    //     rayon scheduler will just run the work serially.
+    let cluster_bytes: Vec<Vec<u8>> = blob_groups
+        .par_iter()
+        .map(|blobs| encode_cluster(blobs, compression, compression_level))
+        .collect::<Result<Vec<_>>>()?;
 
     // 5. Append pending redirects.
     dirents.extend(pending_redirects);
@@ -711,10 +722,18 @@ fn encode_cluster(
         payload.extend_from_slice(b);
     }
 
+    // When the caller didn't pin a compression level, honour
+    // `ZSTD_CLEVEL` / `XZ_DEFAULTS` env vars so cross-stack tooling
+    // can configure both real libzim (which respects libzstd's env)
+    // and zimru with the same one-liner. Falls back to a fast level
+    // 3 default for zstd / 3 for xz when no env var is set.
+    fn env_zstd_level() -> Option<i32> {
+        std::env::var("ZSTD_CLEVEL").ok().and_then(|v| v.parse().ok())
+    }
     let (compression_id, body) = match compression {
         Compression::None => (1u8, payload),
         Compression::Zstd => {
-            let lvl = level.unwrap_or(3);
+            let lvl = level.or_else(env_zstd_level).unwrap_or(3);
             (
                 5u8,
                 zstd::stream::encode_all(&payload[..], lvl)
