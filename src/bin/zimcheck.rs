@@ -187,6 +187,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Every check walks dirents and (in -A / -C) cluster bodies in
+    // forward order, so a sequential-scan advisory pays off here.
+    runner.advise_sequential_scan();
     let report = run_checks(&file, &runner, &o);
     let pass = report.pass;
     if o.json {

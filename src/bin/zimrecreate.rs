@@ -145,6 +145,9 @@ fn run(
     cluster_strategy: ClusterStrategy,
 ) -> Result<(), zimru::Error> {
     let source = Archive::open(src)?;
+    // We're about to walk every entry + every cluster end-to-end,
+    // so hint the kernel to prefetch sequentially.
+    source.advise_sequential_scan();
     let mut creator = Creator::new();
     creator.set_compression(compression);
     if let Some(level) = compression_level {

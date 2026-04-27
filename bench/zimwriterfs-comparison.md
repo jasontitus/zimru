@@ -12,12 +12,12 @@ post-write integrity verify):
 | workload | wall | RSS peak | output | entries | zimcheck |
 |---|---:|---:|---:|---:|:---:|
 | sv-unpacked (zimwriterfs, 17 K files) | 144 s | 2.0 GB | 209 MB | 16 916 | Pass |
-| **texas-unpacked (zimwriterfs, 1.08 M files)** | **640 s** | **5.3 GB** | **3.74 GB** | 1 080 097 | Pass |
+| **texas-unpacked (zimwriterfs, 1.08 M files)** | **582 s** | **5.4 GB** | **3.65 GB** | 1 080 097 | Pass |
 | wiki_top_nopic via zimrecreate (923 K entries) | 389 s | 3.9 GB | 1.71 GB | 923 593 | Pass |
 | _texas via real libzim baseline_ | 1 331 s | 0.96 GB | 5.22 GB | 1 080 102 | Pass |
 
-zimru native on texas: **2.08 × faster than real libzim** with
-**28 % smaller output** at zstd 19. Output is structurally
+zimru native on texas: **2.29 × faster than real libzim** with
+**30 % smaller output** at zstd 19. Output is structurally
 byte-comparable now (`M/Counter`, `X/listing/titleOrdered/v1`,
 `M/Scraper` all present and well-formed).
 
@@ -40,10 +40,10 @@ on wall-time by an order of magnitude.
 | stack / level                | wall   | RSS    | output  |
 |------------------------------|-------:|-------:|--------:|
 | **real libzim** (default zstd) | 1331 s |  0.96 GB | 4.86 GB |
-| zimru @ zstd **3** (default)   |   90 s |  5.3 GB | 4.33 GB |
+| zimru @ zstd **3** (default)   |   74 s |  5.3 GB | 4.33 GB |
 | zimru @ zstd **9**             |  104 s |  5.1 GB | 4.02 GB |
 | zimru @ zstd **12**            |  130 s |  5.3 GB | 4.00 GB |
-| zimru @ zstd **19**            |  627 s |  5.4 GB | 3.74 GB |
+| zimru @ zstd **19**            |  582 s |  5.4 GB | 3.74 GB |
 
 Two takeaways:
 
@@ -55,11 +55,11 @@ Two takeaways:
    apparently doesn't), so the zstd dictionary inside each cluster
    is less effective on libzim's clusters.
 
-2. **At any matched compression effort, zimru is 12-15× faster.**
-   The "2.12× faster" headline above is the conservative
+2. **At any matched compression effort, zimru is 12-18× faster.**
+   The "2.29× faster" headline above is the conservative
    high-quality comparison (zimru @ zstd 19); the
    production-realistic comparison at libzim's effective level is
-   `1331 / 90 = 14.8×` faster. The 5.6× higher RSS is the
+   `1331 / 74 = 18.0×` faster. The 5.6× higher RSS is the
    parallel-batch trade — see "Memory characteristics" below.
 
 ### Phase breakdown on texas (`ZIMRU_STATS=1`):
@@ -78,6 +78,73 @@ Cores avg = 5.64 of 8. Streaming-encode of the 2 huge items is
 serial across them (each uses zstdmt internally); parallelizing
 that path across items would buy ~3 % wall (~30 s) — filed as
 "Idea C" follow-up.
+
+### Portable I/O hygiene — capturing io_uring-style wins
+
+io_uring's headline benefits — batched syscall submission, zero-
+copy file-to-file moves, kernel-prefetch hints — are mostly
+available portably on Linux + macOS via primitives that have
+been in POSIX or Apple's libc for years. We pulled in five of
+them (no io_uring dependency, no Linux-only path) and got most
+of the benefit for low-compression-level builds:
+
+| change                                  | mechanism (Linux / macOS)                                |
+|-----------------------------------------|----------------------------------------------------------|
+| Batched table-write at finalize         | one big `Vec<u8>` + single `write_all` (was ~3 M syscalls) |
+| Zero-copy temp-file → output splice     | `std::io::copy` → `copy_file_range(2)` / `fcopyfile(2)`  |
+| Sequential-scan hint on input mmap      | `madvise(MADV_SEQUENTIAL)` (`Archive::advise_sequential_scan`) |
+| Sequential read hint on huge files      | `posix_fadvise(SEQUENTIAL)` / `fcntl(F_RDAHEAD)` (`io_hints::hint_sequential`) |
+| Larger parallel-read batch (zimwriterfs)| `READ_BATCH` 64 → 256 (deeper disk queue per rayon batch) |
+
+Texas, before vs. after these changes (same build, same machine,
+same input):
+
+| level / config            | before     | after          | wall delta |
+|---------------------------|-----------:|---------------:|-----------:|
+| zstd 3, uncapped          |     85 s   | **74 s**       | **−13 %** |
+| zstd 19, uncapped         |    595 s   | **582 s**      | **−2.3 %** (~14 s) |
+| zstd 19, `--max-memory=128`|    621 s   | 622 s          | noise      |
+
+Reading the curve: at zstd 3 the overall wall is short enough
+(~85 s) that I/O hygiene matters — saving syscalls and skipping
+user-space copies trims 13 %. At zstd 19, the run is dominated
+by zstdmt CPU (486 s out of 627 s in the phase breakdown above),
+so even a perfect I/O layer can only shave a couple percent. The
+`--max-memory=128` row is noise because the cap-driven drain
+forces enough parallel-batch round-trips to mask the savings —
+the hygiene wins land cleanly only when the parallel-batch isn't
+being throttled.
+
+The wins compound the right way: low-compression rebuilds
+(zimrecreate, zimwriterfs at default level) are the realistic
+hot path on cloud zimfarm workers, and that's exactly where the
+13 % shows up.
+
+### Future: io_uring on Linux
+
+The above captures the io_uring benefits that have portable
+equivalents. The remaining io_uring-only wins (and what they'd
+buy us, on top of the current state):
+
+* **`IORING_OP_*` submission queue with `SQE_LINK`** —
+  fire-and-forget chained reads + writes for the temp-file
+  splice, removing the `std::io::copy` synchronous wait between
+  splices. Speculative ~5–10 s on z19 (parallelises the
+  serial drain loop across cluster_idx).
+* **Registered fixed buffers + fixed FDs** — skip per-syscall
+  fd lookup and buffer registration. Marginal on a 1.08 M-item
+  build (very few unique fds: input mmap, output file, ~2 temp
+  files), maybe 1–2 s.
+* **`IORING_SETUP_IOPOLL` for NVMe** — bypass the storage stack's
+  interrupt path. Only meaningful on `O_DIRECT` workloads, which
+  we'd have to opt into anyway.
+
+Net plausible upper bound from a full io_uring port: another
+~10 s on z19, ~3 s on z3. The uplift is real but small relative
+to the parallel-batch / zstdmt CPU cost. Likely worth it only
+if zimru is also driven from an async runtime that can already
+use io_uring (e.g. a future kiwix-rs server). Filed as a
+follow-up; not in the critical path.
 
 ### Memory characteristics — `--max-memory` knob
 
@@ -153,6 +220,8 @@ Reading the table:
 
 | commit (most recent first) | what |
 |---|---|
+| (this PR)  | portable I/O hygiene — `copy_file_range`/`fcopyfile` splice, batched table-write, `madvise(SEQUENTIAL)`, `posix_fadvise`/`F_RDAHEAD`, `READ_BATCH` 64→256 (z3 85→74 s, z19 595→582 s) |
+| `849fdaa`  | `--max-memory` soft cap on parallel-batch in-flight bytes |
 | `2cd83d1` | dup-emit guard so caller-supplied `M/Counter` etc. wins over auto-emit (zimrecreate forwarding) |
 | `1ae1deb` | parallel `fs::read` via rayon batches in `zimwriterfs` (texas 717 → 640 s) |
 | `04fefee` | auto-emit `M/Counter`, `X/listing/titleOrdered/v1`, default `M/Scraper` |

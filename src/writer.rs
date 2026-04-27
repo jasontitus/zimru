@@ -1314,22 +1314,19 @@ impl Streamer {
         // cluster_ptrs by cluster_idx, so the on-disk byte order
         // doesn't matter, but smaller cluster_idx values having
         // smaller offsets is nicer for sequential reads.
+        //
+        // `std::io::copy` between two `&mut File`s picks the most
+        // efficient kernel primitive available: `copy_file_range(2)`
+        // on Linux (in-kernel page-cache-aware copy, no userspace
+        // bounce buffer), `fcopyfile(2)` on macOS, falling back to
+        // a read/write loop only on platforms without either. This
+        // captures the io_uring-style "skip user-space copies" win
+        // without depending on io_uring itself.
         completed.sort_by_key(|(idx, _, _)| *idx);
-        let mut buf = vec![0u8; 1 << 20];
         for (cluster_idx, temp_path, bytes) in completed {
             self.cluster_offsets[cluster_idx as usize] = self.file_pos;
-            // Stream-copy temp → main. read+write loop on a 1 MiB
-            // buffer, no full-file slurp.
             let mut tf = std::fs::File::open(&temp_path)?;
-            let mut copied: u64 = 0;
-            loop {
-                let n = tf.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                self.file_mut().write_all(&buf[..n])?;
-                copied += n as u64;
-            }
+            let copied = std::io::copy(&mut tf, self.file_mut())?;
             drop(tf);
             // Best-effort cleanup; non-fatal if it fails.
             let _ = std::fs::remove_file(&temp_path);
@@ -1770,20 +1767,35 @@ impl Streamer {
         };
 
         // 10. Write the trailing tables in one forward pass.
+        //
+        // The naïve form is one `write_all` per element, which on
+        // texas (1.08 M dirents) is ~3 M syscalls. We stage every
+        // table into a single `Vec<u8>` and emit one `write_all`
+        // (which on Linux/macOS turns into a small handful of
+        // kernel `write(2)` syscalls amortised over MB-sized
+        // chunks). Same kernel-syscall reduction io_uring's
+        // batched-submission would buy here, without io_uring.
         let table_phase = Instant::now();
+        let cluster_offsets = std::mem::take(&mut self.cluster_offsets);
+        let total_table_bytes = dirent_offsets.len() * 8
+            + title_order.len() * 4
+            + cluster_offsets.len() * 8
+            + dirent_blobs.iter().map(|b| b.len()).sum::<usize>();
+        let mut staging = Vec::with_capacity(total_table_bytes);
         for off in &dirent_offsets {
-            self.file_mut().write_all(&off.to_le_bytes())?;
+            staging.extend_from_slice(&off.to_le_bytes());
         }
         for idx in &title_order {
-            self.file_mut().write_all(&idx.to_le_bytes())?;
+            staging.extend_from_slice(&idx.to_le_bytes());
         }
-        let cluster_offsets = std::mem::take(&mut self.cluster_offsets);
         for off in &cluster_offsets {
-            self.file_mut().write_all(&off.to_le_bytes())?;
+            staging.extend_from_slice(&off.to_le_bytes());
         }
         for blob in &dirent_blobs {
-            self.file_mut().write_all(blob)?;
+            staging.extend_from_slice(blob);
         }
+        self.file_mut().write_all(&staging)?;
+        drop(staging);
         drop(dirent_blobs);
         drop(dirent_offsets);
         self.stats.table_write += table_phase.elapsed();

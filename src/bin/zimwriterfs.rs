@@ -293,7 +293,13 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     use rayon::prelude::*;
     use std::io::Read as _;
     const STREAMING_THRESHOLD_BIN: u64 = 4 * 1024 * 1024;
-    const READ_BATCH: usize = 64;
+    // Bumped from 64 to 256: more files queued in flight per
+    // rayon batch keeps the disk queue deeper, capturing some of
+    // io_uring's submission-batching win on spinning rust + NVMe
+    // alike. The peak in-batch memory is `READ_BATCH × avg_size`,
+    // a few tens of MB on typical inputs — well under the
+    // parallel-batch encode buffer.
+    const READ_BATCH: usize = 256;
     let mut count = 0usize;
 
     // Build the (path, relpath, size, is_html) list once. metadata()
@@ -345,6 +351,12 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
         if !needs_full_read(e) && e.size >= STREAMING_THRESHOLD_BIN {
             let mime = mime_for_path(&e.path);
             let mut f = fs::File::open(&e.path)?;
+            // Hint the kernel: we're about to read this whole
+            // file sequentially. On Linux this turns on aggressive
+            // readahead and drops pages behind us; on macOS it
+            // enables F_RDAHEAD. Either way the next read() call
+            // tends to find its bytes already warm in cache.
+            zimru::io_hints::hint_sequential(&f);
             creator.begin_chunked_item(
                 None,
                 e.rel_str.clone(),

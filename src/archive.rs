@@ -202,6 +202,20 @@ impl Archive {
         crate::Uuid::from_bytes(self.core.header.uuid)
     }
 
+    /// Hint the OS that this archive will be scanned start-to-end.
+    /// Calls `madvise(MADV_SEQUENTIAL)` on the entire mapping, which
+    /// (on Linux) doubles readahead and drops pages after they're
+    /// touched, and (on macOS) enables `MADV_SEQUENTIAL`-equivalent
+    /// pre-paging. Best-effort — failures are ignored.
+    ///
+    /// Use this before bulk operations that walk every dirent and
+    /// every cluster (e.g. `zimrecreate`, `zimcheck`,
+    /// `zimdump --all`). Don't call it for typical reader workloads
+    /// — the default `MADV_NORMAL` is better for random access.
+    pub fn advise_sequential_scan(&self) {
+        let _ = self.core.mmap.advise(Advice::Sequential);
+    }
+
     /// Total number of dirents (articles + redirects + reserved).
     pub fn all_entry_count(&self) -> u32 {
         self.core.header.entry_count
