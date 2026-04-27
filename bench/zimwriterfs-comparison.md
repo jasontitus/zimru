@@ -28,6 +28,40 @@ the remaining gap is small system metadata (e.g. no
 `X/title/xapian` suggestion DB yet) plus the 64 KB mime-list
 reserve we use to keep `mimelistPos == 80`.
 
+### Apples-to-apples by compression level (texas, `--withoutFTIndex`)
+
+Real libzim's `zimwriterfs` hard-codes its zstd level in the
+binary and doesn't expose a `--compression-level` flag, so the
+"zimru wins because we use zstd 19" framing wasn't fair.
+Actually, at *every* level zimru produces a smaller archive
+than libzim's default zstd, and at every level zimru wins
+on wall-time by an order of magnitude.
+
+| stack / level                | wall   | RSS    | output  |
+|------------------------------|-------:|-------:|--------:|
+| **real libzim** (default zstd) | 1331 s |  0.96 GB | 4.86 GB |
+| zimru @ zstd **3** (default)   |   90 s |  5.3 GB | 4.33 GB |
+| zimru @ zstd **9**             |  104 s |  5.1 GB | 4.02 GB |
+| zimru @ zstd **12**            |  130 s |  5.3 GB | 4.00 GB |
+| zimru @ zstd **19**            |  627 s |  5.4 GB | 3.74 GB |
+
+Two takeaways:
+
+1. **No zstd level produces output as large as real libzim's
+   default.** Even at zstd 3 zimru is 11% smaller; at zstd 9 it's
+   17 % smaller. Likely cause: libzim's bin-packing order packs
+   less compressible content per cluster (URL-sort puts
+   alphabetically-adjacent items together; libzim's order
+   apparently doesn't), so the zstd dictionary inside each cluster
+   is less effective on libzim's clusters.
+
+2. **At any matched compression effort, zimru is 12-15× faster.**
+   The "2.12× faster" headline above is the conservative
+   high-quality comparison (zimru @ zstd 19); the
+   production-realistic comparison at libzim's effective level is
+   `1331 / 90 = 14.8×` faster. The 5.6× higher RSS is the
+   parallel-batch trade — see "Memory characteristics" below.
+
 ### Phase breakdown on texas (`ZIMRU_STATS=1`):
 
 ```
