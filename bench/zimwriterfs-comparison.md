@@ -134,9 +134,9 @@ have to fix; see "Output equivalence" earlier in this doc):
 
 | stack | Xapian | parallel? | wall | user | user/wall | output | RSS peak | integrity |
 |---|:---:|:---:|---:|---:|---:|---:|---:|:---:|
-| zimru native (zstd 19, par) | ❌ | rayon | _streaming re-run pending_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| shim+zimru (zstd 19, par) | ❌ | upstream 4 + rayon | _pending_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
-| **real libzim (`--withoutFTIndex`)** | ❌ | upstream 4 | **1 342 s (22:22)** | 2 727 s | 2.03 | **5.22 GB** | ~840 MB | Pass |
+| zimru native (zstd 19, par + stream) | ❌ | rayon | **1 011 s (16:51)** | 3 285 s | 3.25 | 3.92 GB | ~19 GB → drains | Pass |
+| shim+zimru (zstd 19, par + stream) | ❌ | upstream 4 + rayon | **1 240 s (20:40)** | 3 453 s | 2.78 | 3.92 GB (-3.4 KB vs native) | ~15 GB peak (snapshot, not `time -v`) | Pass |
+| **real libzim (`--withoutFTIndex`)** | ❌ | upstream 4 | 1 342 s (22:22) | 2 727 s | 2.03 | **5.22 GB** | ~840 MB | Pass |
 
 For reference, the older runs:
 
@@ -152,9 +152,15 @@ Xapian. That was wrong — real libzim was building an
 `X/fulltextIndex/xapian` over every `text/html` item (extra
 work, extra output bytes), and "we're faster because we skip
 the work" is not a meaningful claim. The right comparison
-is real-libzim `--withoutFTIndex` against the zimru rows; the
-former is now measured (1 342 s / 5.22 GB), the latter is
-re-running with the streaming writer.
+is real-libzim `--withoutFTIndex` against the zimru rows;
+both are now measured at zstd 19 with the post-streaming
+zimru writer (commits `1aeedf7` parallel + `7695429`
+streaming output). zimru native and shim+zimru both produce
+3.92 GB output (size matches to within 4 KB on a 3.92 GB
+archive — same compression, same content, but the file
+hashes differ because of metadata-emission ordering and
+the shim's slightly different `Hints`-vs-native handling);
+real libzim `--withoutFTIndex` produces 5.22 GB.
 
 **Output is still not fully equivalent even with `--withoutFTIndex`.**
 zimru-side ZIMs are missing a few entries that real libzim
@@ -177,32 +183,37 @@ Three observations dominate the take:
    zimru wins on raw write-speed-per-output-byte at higher
    compression.
 
-2. **Real libzim streams; zimru buffers.** Peak RSS:
-   real libzim **459 MB** on 17 GB of input vs zimru native
-   **22.9 GB**. Real libzim fills clusters as items come in,
+2. **Real libzim streams; zimru still partially buffers.**
+   Peak RSS on 17 GB input: real libzim
+   **~840 MB** (`--withoutFTIndex`, fully streaming) vs
+   zimru native **~19 GB then drains** (post-streaming
+   writer; clusters now stream out of memory once encoded,
+   but the input items are still buffered up front).
+   Real libzim fills clusters as items come in,
    compresses+writes+frees, repeats — total RAM stays small
-   regardless of archive size. zimru holds every cluster's
-   bytes resident until `finalize`, then compresses in
-   parallel.
-   On 17 GB texas this is fine — barely fits the Kiwix
-   zimfarm's 22 GB per-task budget. On English Wikipedia
-   (~120 GB unpacked) zimru's current writer would OOM the
-   worker. **Streaming cluster compression is the
-   production-blocker** for the mwoffliner+shim+zimru
-   Wikipedia drop-in (filed as task #22 in the bench notes).
+   regardless of archive size. zimru's streaming writer
+   freed the cluster-output buffering (commit `7695429`)
+   but the input-side buffering remains: every `add_item`
+   call's bytes still live in RAM until finalize starts
+   bin-packing. On 17 GB texas this fits the Kiwix
+   zimfarm's 22 GB per-task budget. **On English Wikipedia
+   (~120 GB unpacked) zimru would still OOM the worker** —
+   input-side streaming (drain-as-we-go bin-packing into
+   the cluster output stream) is the remaining
+   production-blocker for the mwoffliner+shim+zimru
+   Wikipedia drop-in.
 
-3. **Shim is 1.87× slower than native and 1.32× slower than
-   real libzim** at this scale. All three stacks produce
-   structurally valid ZIMs. The shim's slowdown vs native is
+3. **Shim is 1.23× slower than native, 1.08× FASTER than
+   real libzim** at this scale (post-streaming). All three
+   stacks produce structurally valid ZIMs (`zimcheck -I`
+   and `-C` Pass). The shim's slowdown vs native is
    upstream `zimwriterfs`'s per-file work (libmagic mime
    detect, HTML refresh-tag scan, Xapian-indexer prep) plus
    the C-ABI hop on every `addItem` — overhead the simpler
-   zimru-native binary doesn't pay. The shim's slowdown vs
-   real libzim is partly because zimru is at zstd 19 (real is
-   at libzim's lower default) and partly because zimru
-   buffers everything in RAM (cache pressure on the 22 GB
-   worker compared to real libzim's 459 MB streaming
-   footprint).
+   zimru-native binary doesn't pay. Net of all that, the
+   shim still beats real libzim (`--withoutFTIndex`)
+   wall-clock at the same per-file work and produces a
+   25 % smaller output (3.92 GB vs 5.22 GB) at zstd 19.
 
 Effective parallelism on native at this scale is ~3.8 cores —
 much better than the colorado run (1.98×), because the larger
