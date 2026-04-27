@@ -1418,14 +1418,25 @@ impl Streamer {
         //     separated, no trailing semicolon, mimes in mime-list
         //     index order). zimcheck consumes this for its mime
         //     report and some kiwix tooling reads it for stats.
-        let counter_str = build_counter_string(&self.mimes, &self.dirents);
-        self.push_item(Item {
-            path: "Counter".to_string(),
-            title: "Counter".to_string(),
-            mimetype: "text/plain;charset=utf-8".to_string(),
-            content: counter_str.into_bytes(),
-            namespace: Some(b'M'),
-        })?;
+        // Skip if a caller already added an `M/Counter` entry of
+        // their own (e.g. zimrecreate forwarding the source ZIM's
+        // value, or a test that wants exact bytes). We always
+        // trust caller-supplied metadata over our auto-generated
+        // version.
+        let counter_already_set = self
+            .dirents
+            .iter()
+            .any(|d| d.namespace() == b'M' && d.url() == "Counter");
+        if !counter_already_set {
+            let counter_str = build_counter_string(&self.mimes, &self.dirents);
+            self.push_item(Item {
+                path: "Counter".to_string(),
+                title: "Counter".to_string(),
+                mimetype: "text/plain;charset=utf-8".to_string(),
+                content: counter_str.into_bytes(),
+                namespace: Some(b'M'),
+            })?;
+        }
 
         // 2b. Close every still-open bucket — one cluster per
         //     non-empty bucket, in deterministic key order.
@@ -1535,20 +1546,31 @@ impl Streamer {
         //     reader-side just zstd-decodes and indexes into the
         //     resulting bytes. Mimetype matches real libzim's so
         //     `zimcheck -A` is happy.
-        let mut listing_bytes: Vec<u8> = Vec::with_capacity(title_order_snapshot.len() * 4);
-        for idx in &title_order_snapshot {
-            listing_bytes.extend_from_slice(&idx.to_le_bytes());
+        //
+        //     Skip if a caller already added an
+        //     `X/listing/titleOrdered/v1` (e.g. zimrecreate
+        //     forwarding from the source ZIM).
+        let listing_already_set = self
+            .dirents
+            .iter()
+            .any(|d| d.namespace() == b'X' && d.url() == "listing/titleOrdered/v1");
+        if !listing_already_set {
+            let mut listing_bytes: Vec<u8> = Vec::with_capacity(title_order_snapshot.len() * 4);
+            for idx in &title_order_snapshot {
+                listing_bytes.extend_from_slice(&idx.to_le_bytes());
+            }
+            self.push_item(Item {
+                path: "listing/titleOrdered/v1".to_string(),
+                title: "listing/titleOrdered/v1".to_string(),
+                mimetype: "application/octet-stream+zimlisting".to_string(),
+                content: listing_bytes,
+                namespace: Some(b'X'),
+            })?;
+            // Flush so the listing's cluster commits and its
+            // dirent lands in `self.dirents` for the final sort
+            // below.
+            self.flush_all_buckets()?;
         }
-        self.push_item(Item {
-            path: "listing/titleOrdered/v1".to_string(),
-            title: "listing/titleOrdered/v1".to_string(),
-            mimetype: "application/octet-stream+zimlisting".to_string(),
-            content: listing_bytes,
-            namespace: Some(b'X'),
-        })?;
-        // Flush so the listing's cluster commits and its dirent
-        // lands in `self.dirents` for the final sort below.
-        self.flush_all_buckets()?;
 
         // 6c. Re-sort dirents with the new listing entry in place.
         //     Adding an X-namespace entry doesn't shift C-, M-, or
