@@ -135,6 +135,20 @@ pub struct MetadataEntry {
     pub value: Vec<u8>,
 }
 
+/// Threshold for switching from buffered-chunked-item mode (which
+/// accumulates chunks into a single `Vec<u8>`, then runs the normal
+/// bin-packer) to streaming-encode mode (which dedicates a fresh
+/// cluster to the item and streams its bytes through a zstd encoder
+/// straight to disk). Items bigger than this benefit hugely from
+/// streaming — peak RAM goes from O(item size) down to a few MB of
+/// encoder state regardless of how big the body is. Items smaller
+/// than this are better off bin-packed alongside their neighbours.
+///
+/// Set to twice the default cluster size target so any item that
+/// would have busted the bin-packer's 2 MiB target on its own goes
+/// down the streaming path.
+pub(crate) const STREAMING_ENCODE_THRESHOLD: usize = 4 * 1024 * 1024;
+
 /// Builder for a chunked-input item — see [`Creator::begin_item`].
 /// Holds the partially-accumulated body until `finish()` is called,
 /// at which point the assembled item is pushed through the same
@@ -175,6 +189,40 @@ impl ItemBuilder<'_> {
             .expect("ItemBuilder requires streaming mode");
         s.push_item(item)
     }
+}
+
+/// Metadata for a chunked item before its body bytes accumulate.
+pub(crate) struct ChunkedMeta {
+    pub namespace: Option<u8>,
+    pub path: String,
+    pub title: String,
+    pub mimetype: String,
+}
+
+/// In-flight state for a chunked item between `begin_item` and
+/// `end_item`. Either accumulating into a `Vec<u8>` (small / unknown
+/// size) or streaming straight through a zstd encoder into a
+/// dedicated cluster on disk (huge known size).
+pub(crate) enum ChunkedInFlight {
+    /// Buffered: chunks append to `content`. At `finish` time the
+    /// assembled body goes through `Streamer::push_item` like a
+    /// regular `add_item` call.
+    Buffered {
+        meta: ChunkedMeta,
+        content: Vec<u8>,
+    },
+    /// Streaming-encode: the encoder owns the output file and
+    /// receives chunks one at a time. At `finish` we close the
+    /// encoder, recover the file, and update `cluster_offsets`.
+    StreamingZstd {
+        meta: ChunkedMeta,
+        encoder: zstd::stream::Encoder<'static, File>,
+        cluster_idx: u32,
+        cluster_start: u64,
+        bytes_written: u64,
+        expected_size: u64,
+        mime_idx: u16,
+    },
 }
 
 /// Reserved bytes after the 80-byte header for the mime-type list.
@@ -328,6 +376,54 @@ impl Creator {
                 "push_streaming_item before start_writing",
             ))),
         }
+    }
+
+    /// C-ABI-shape chunked-item begin. Internally dispatches between
+    /// buffered (small / unknown size) and streaming-encode (huge,
+    /// zstd-compressed) paths based on `expected_size` and the
+    /// configured compression. Streaming-encode bounds peak memory
+    /// at ~zstd encoder state regardless of how big the body is.
+    #[doc(hidden)]
+    pub fn begin_chunked_item(
+        &mut self,
+        namespace: Option<u8>,
+        path: String,
+        title: String,
+        mimetype: String,
+        expected_size: Option<u64>,
+    ) -> Result<()> {
+        let s = self.stream.as_mut().ok_or_else(|| {
+            Error::Io(std::io::Error::other(
+                "begin_chunked_item before start_writing",
+            ))
+        })?;
+        s.begin_chunked_item(
+            ChunkedMeta { namespace, path, title, mimetype },
+            expected_size,
+        )
+    }
+
+    /// Append a chunk to the in-flight chunked item. See
+    /// [`Creator::begin_chunked_item`].
+    #[doc(hidden)]
+    pub fn chunked_item_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        let s = self.stream.as_mut().ok_or_else(|| {
+            Error::Io(std::io::Error::other(
+                "chunked_item_chunk before start_writing",
+            ))
+        })?;
+        s.chunked_item_chunk(chunk)
+    }
+
+    /// Finalise the in-flight chunked item.
+    #[doc(hidden)]
+    pub fn end_chunked_item(&mut self) -> Result<()> {
+        let s = self.stream.as_mut().ok_or_else(|| {
+            Error::Io(std::io::Error::other(
+                "end_chunked_item before start_writing",
+            ))
+        })?;
+        s.end_chunked_item()
     }
 
     /// Begin a chunked item — for callers that have a streaming
@@ -628,8 +724,13 @@ fn intern_mime(m: &str, mimes: &mut Vec<String>, index: &mut BTreeMap<String, u1
 /// back. Real libzim's only positional invariant is `mime_list_pos
 /// == 80`, which we honour via the reserved region.
 struct Streamer {
-    file: File,
+    /// Output file handle. `Some` normally; temporarily `None` while
+    /// a streaming-encode huge item is in flight (the zstd encoder
+    /// owns the file across `item_chunk` calls and gives it back at
+    /// `end_item`).
+    file: Option<File>,
     file_pos: u64,
+    output_path: std::path::PathBuf,
 
     compression: Compression,
     compression_level: Option<i32>,
@@ -672,6 +773,12 @@ struct Streamer {
     redirections: Vec<Redirection>,
     metadata: Vec<MetadataEntry>,
     illustrations: Vec<(u32, Vec<u8>)>,
+
+    // The single in-flight chunked item between `begin_chunked_item`
+    // and `end_chunked_item` (if any). Held on the streamer so the
+    // streaming-encode variant can swap the file out while the
+    // encoder owns it.
+    in_flight: Option<ChunkedInFlight>,
 }
 
 /// One in-flight cluster's worth of un-flushed work for a single
@@ -699,6 +806,17 @@ struct PendingArticle {
 }
 
 impl Streamer {
+    /// Mutable access to the output file. Panics if called while a
+    /// streaming-encode item is in flight (the encoder has the file
+    /// in that case). All non-streaming-encode code paths can rely
+    /// on this never panicking.
+    #[inline]
+    fn file_mut(&mut self) -> &mut File {
+        self.file
+            .as_mut()
+            .expect("Streamer file was taken by streaming-encode and not yet returned")
+    }
+
     fn open(
         path: &Path,
         compression: Compression,
@@ -721,8 +839,9 @@ impl Streamer {
         let zeros = vec![0u8; MIME_LIST_RESERVE];
         file.write_all(&zeros)?;
         Ok(Streamer {
-            file,
+            file: Some(file),
             file_pos: HEADER_SIZE as u64 + MIME_LIST_RESERVE as u64,
+            output_path: path.to_path_buf(),
             compression,
             compression_level,
             cluster_size_target,
@@ -738,7 +857,195 @@ impl Streamer {
             redirections: Vec::new(),
             metadata: Vec::new(),
             illustrations: Vec::new(),
+            in_flight: None,
         })
+    }
+
+    /// Open a chunked item. If `expected_size > STREAMING_ENCODE_THRESHOLD`
+    /// AND compression is zstd, the body will be stream-encoded to its
+    /// own cluster on disk; otherwise chunks accumulate in a `Vec<u8>`
+    /// and the assembled item runs through the normal bin-packer.
+    fn begin_chunked_item(
+        &mut self,
+        meta: ChunkedMeta,
+        expected_size: Option<u64>,
+    ) -> Result<()> {
+        if self.in_flight.is_some() {
+            return Err(Error::Io(std::io::Error::other(
+                "begin_chunked_item: another chunked item is already in flight",
+            )));
+        }
+        let use_streaming = matches!(self.compression, Compression::Zstd)
+            && expected_size.is_some_and(|s| s as usize >= STREAMING_ENCODE_THRESHOLD);
+
+        if use_streaming {
+            let expected = expected_size.unwrap();
+            // Drain pending parallel-encode and flush every open
+            // bucket. We must do this before taking the file because
+            // those flushes write through `self.file_mut()`.
+            self.drain_pending_encode()?;
+            self.flush_all_buckets()?;
+            self.drain_pending_encode()?;
+
+            // Allocate cluster_idx now (placeholder offset filled in at
+            // `end_chunked_item`).
+            let cluster_idx = self.cluster_offsets.len() as u32;
+            self.cluster_offsets.push(0);
+
+            // Intern this item's mime so we can record it in the dirent.
+            let mime_idx = intern_mime(&meta.mimetype, &mut self.mimes, &mut self.mime_index);
+
+            // Build the cluster's in-band header: ptr table with one
+            // blob. ptr[0] = header_len (start of blob 0), ptr[1] =
+            // header_len + expected_size (end). Choose 4-byte vs
+            // 8-byte ptrs by whether the total (header+blob) overflows
+            // u32.
+            let extended_4 = (8u64 + expected) > u32::MAX as u64;
+            let ptr_size: u64 = if extended_4 { 8 } else { 4 };
+            let header_len = 2 * ptr_size;
+            let mut header = Vec::with_capacity(header_len as usize);
+            push_offset(&mut header, header_len, extended_4);
+            push_offset(&mut header, header_len + expected, extended_4);
+
+            // Compression info-byte: zstd id (5) | extended bit if needed.
+            let info_byte: u8 = 5 | if extended_4 { 0x10 } else { 0 };
+
+            // Take the file, write the info byte, hand it to a zstd
+            // encoder. The encoder owns the file across `chunk` calls
+            // and gives it back at `end`.
+            let mut file = self.file.take().ok_or_else(|| {
+                Error::Io(std::io::Error::other(
+                    "begin_chunked_item: file was already taken",
+                ))
+            })?;
+            let cluster_start = self.file_pos;
+            file.write_all(&[info_byte])?;
+            self.file_pos += 1;
+
+            let level = self.compression_level.unwrap_or_else(|| {
+                std::env::var("ZSTD_CLEVEL")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(3)
+            });
+            let mut encoder = zstd::stream::Encoder::new(file, level)
+                .map_err(|e| Error::Decompression(format!("zstd init: {e}")))?;
+            encoder
+                .write_all(&header)
+                .map_err(|e| Error::Decompression(format!("zstd header write: {e}")))?;
+
+            self.in_flight = Some(ChunkedInFlight::StreamingZstd {
+                meta,
+                encoder,
+                cluster_idx,
+                cluster_start,
+                bytes_written: 0,
+                expected_size: expected,
+                mime_idx,
+            });
+            return Ok(());
+        }
+
+        // Buffered path — accumulate chunks into a Vec, push as a
+        // regular item at end_chunked_item time.
+        let capacity = expected_size.map(|s| s as usize).unwrap_or(0);
+        let mut content = Vec::new();
+        if capacity > 0 {
+            content.reserve(capacity);
+        }
+        self.in_flight = Some(ChunkedInFlight::Buffered { meta, content });
+        Ok(())
+    }
+
+    fn chunked_item_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        match self.in_flight.as_mut() {
+            None => Err(Error::Io(std::io::Error::other(
+                "chunked_item_chunk: no item in flight",
+            ))),
+            Some(ChunkedInFlight::Buffered { content, .. }) => {
+                content.extend_from_slice(chunk);
+                Ok(())
+            }
+            Some(ChunkedInFlight::StreamingZstd {
+                encoder,
+                bytes_written,
+                expected_size,
+                ..
+            }) => {
+                if *bytes_written + chunk.len() as u64 > *expected_size {
+                    return Err(Error::Io(std::io::Error::other(format!(
+                        "chunked_item_chunk: body exceeds expected size {} > {}",
+                        *bytes_written + chunk.len() as u64,
+                        *expected_size
+                    ))));
+                }
+                encoder
+                    .write_all(chunk)
+                    .map_err(|e| Error::Decompression(format!("zstd chunk write: {e}")))?;
+                *bytes_written += chunk.len() as u64;
+                Ok(())
+            }
+        }
+    }
+
+    fn end_chunked_item(&mut self) -> Result<()> {
+        match self.in_flight.take() {
+            None => Err(Error::Io(std::io::Error::other(
+                "end_chunked_item: no item in flight",
+            ))),
+            Some(ChunkedInFlight::Buffered { meta, content }) => {
+                self.push_item(Item {
+                    path: meta.path,
+                    title: meta.title,
+                    mimetype: meta.mimetype,
+                    content,
+                    namespace: meta.namespace,
+                })
+            }
+            Some(ChunkedInFlight::StreamingZstd {
+                meta,
+                encoder,
+                cluster_idx,
+                cluster_start,
+                bytes_written,
+                expected_size,
+                mime_idx,
+            }) => {
+                if bytes_written != expected_size {
+                    return Err(Error::Io(std::io::Error::other(format!(
+                        "end_chunked_item: body size mismatch (got {}, expected {})",
+                        bytes_written, expected_size
+                    ))));
+                }
+                let mut file = encoder
+                    .finish()
+                    .map_err(|e| Error::Decompression(format!("zstd finish: {e}")))?;
+                // The encoder advanced the OS file cursor by however
+                // many compressed bytes it wrote; recover the new
+                // position.
+                let new_pos = file.stream_position()?;
+                let written = new_pos.checked_sub(cluster_start).unwrap_or(0);
+                self.cluster_offsets[cluster_idx as usize] = cluster_start;
+                self.file_pos = new_pos;
+                self.file = Some(file);
+
+                let title = if meta.title.is_empty() {
+                    meta.path.clone()
+                } else {
+                    meta.title
+                };
+                self.dirents.push(RawDirent::Article {
+                    namespace: meta.namespace.unwrap_or(b'C'),
+                    url: meta.path,
+                    title,
+                    mime_idx,
+                    cluster: cluster_idx,
+                    blob: 0,
+                });
+                let _ = written; // surface for future telemetry
+                Ok(())
+            }
+        }
     }
 
     /// Pick which bucket an item joins under the active strategy.
@@ -866,7 +1173,7 @@ impl Streamer {
         encoded.sort_by_key(|(idx, _)| *idx);
         for (idx, bytes) in encoded {
             self.cluster_offsets[idx as usize] = self.file_pos;
-            self.file.write_all(&bytes)?;
+            self.file_mut().write_all(&bytes)?;
             self.file_pos += bytes.len() as u64;
         }
         Ok(())
@@ -1047,16 +1354,17 @@ impl Streamer {
 
         // 10. Write the trailing tables in one forward pass.
         for off in &dirent_offsets {
-            self.file.write_all(&off.to_le_bytes())?;
+            self.file_mut().write_all(&off.to_le_bytes())?;
         }
         for idx in &title_order {
-            self.file.write_all(&idx.to_le_bytes())?;
+            self.file_mut().write_all(&idx.to_le_bytes())?;
         }
-        for off in &self.cluster_offsets {
-            self.file.write_all(&off.to_le_bytes())?;
+        let cluster_offsets = std::mem::take(&mut self.cluster_offsets);
+        for off in &cluster_offsets {
+            self.file_mut().write_all(&off.to_le_bytes())?;
         }
         for blob in &dirent_blobs {
-            self.file.write_all(blob)?;
+            self.file_mut().write_all(blob)?;
         }
         drop(dirent_blobs);
         drop(dirent_offsets);
@@ -1075,8 +1383,8 @@ impl Streamer {
                 ),
             )));
         }
-        self.file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
-        self.file.write_all(&mime_list_bytes)?;
+        self.file_mut().seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+        self.file_mut().write_all(&mime_list_bytes)?;
 
         // 12. Write final header at offset 0.
         let final_header = encode_header(&HeaderFields {
@@ -1092,20 +1400,20 @@ impl Streamer {
             main_page: main_page_idx,
             checksum_pos,
         });
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&final_header)?;
-        self.file.flush()?;
+        self.file_mut().seek(SeekFrom::Start(0))?;
+        self.file_mut().write_all(&final_header)?;
+        self.file_mut().flush()?;
 
         // 13. MD5 over [0, checksum_pos) by re-reading the now-final
         //     file. SSDs do this at ~1 GB/s; small relative to the
         //     cluster-encode time we just saved by streaming.
-        self.file.seek(SeekFrom::Start(0))?;
+        self.file_mut().seek(SeekFrom::Start(0))?;
         let mut hasher = Md5::new();
         let mut buf = vec![0u8; 64 * 1024];
         let mut hashed: u64 = 0;
         while hashed < checksum_pos {
             let want = ((checksum_pos - hashed) as usize).min(buf.len());
-            let n = self.file.read(&mut buf[..want])?;
+            let n = self.file_mut().read(&mut buf[..want])?;
             if n == 0 {
                 break;
             }
@@ -1113,11 +1421,57 @@ impl Streamer {
             hashed += n as u64;
         }
         let digest: [u8; 16] = hasher.finalize().into();
-        self.file.seek(SeekFrom::Start(checksum_pos))?;
-        self.file.write_all(&digest)?;
-        self.file.flush()?;
+        self.file_mut().seek(SeekFrom::Start(checksum_pos))?;
+        self.file_mut().write_all(&digest)?;
+        self.file_mut().flush()?;
+
+        // 14. Verify the just-written archive opens cleanly and
+        //     passes every structural check we have. This is the
+        //     reliability gate the user asked for: every successful
+        //     `finish_writing` returns only after the produced ZIM
+        //     reads back with sorted dirents, valid pointer tables,
+        //     resolvable mimetypes, and a matching MD5. Failure
+        //     here means our writer produced something we can't
+        //     read — surface that loudly rather than ship it.
+        //
+        //     The verify step is a single forward pass over the
+        //     file (mmap + zimru's checks); cost is sub-second on
+        //     small ZIMs, ~1-2 s per GB on big ZIMs.
+        let path = self.output_path.clone();
+        // Drop our File handle before the Archive opens it — keeps
+        // ownership clean and avoids the verify path racing on a
+        // still-open writer fd.
+        drop(self);
+        verify_archive(&path)?;
         Ok(())
     }
+}
+
+/// Re-open `path` and run every integrity check zimru exposes.
+/// Returns `Err` with a descriptive message on the first failure.
+fn verify_archive(path: &Path) -> Result<()> {
+    let arc = crate::archive::Archive::open(path)?;
+    let checks: &[(&str, &dyn Fn(&crate::archive::Archive) -> Result<bool>)] = &[
+        ("dirent_ptrs", &|a| a.check_dirent_ptrs()),
+        ("dirent_order", &|a| a.check_dirent_order()),
+        ("title_index", &|a| a.check_title_index()),
+        ("cluster_ptrs", &|a| a.check_cluster_ptrs()),
+        ("mimetypes", &|a| a.check_mimetypes()),
+        ("md5_checksum", &|a| a.check()),
+    ];
+    for (name, check) in checks {
+        let ok = check(&arc).map_err(|e| {
+            Error::Io(std::io::Error::other(format!(
+                "post-write verify: {name} failed during check: {e}"
+            )))
+        })?;
+        if !ok {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "post-write verify: {name} reported the archive is malformed"
+            ))));
+        }
+    }
+    Ok(())
 }
 
 

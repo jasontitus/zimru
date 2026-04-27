@@ -30,25 +30,11 @@ use crate::writer::{Creator, Item};
 use crate::Compression;
 
 /// Opaque writer handle. Owns a [`Creator`] until `zimru_creator_write_to`
-/// consumes it. May also hold a single in-flight chunked item between
-/// `begin_item` and `end_item` calls.
+/// consumes it. The chunked-item in-flight state lives on the underlying
+/// `Creator`'s streamer (so the streaming-encode variant can take the
+/// output file out from under the writer mid-item without aliasing).
 pub struct zimru_creator_t {
     inner: Option<Creator>,
-    /// Set between `zimru_creator_begin_item` and `zimru_creator_end_item`.
-    /// Holds the metadata + accumulated chunks. We don't use the borrowed
-    /// `ItemBuilder` here because lifetime-tying to `inner` would require
-    /// self-referential storage; instead we replicate its state and call
-    /// `Creator::begin_item().write_chunk(...).finish()` synthetically at
-    /// `end_item` time.
-    in_flight: Option<InFlightItem>,
-}
-
-struct InFlightItem {
-    namespace: Option<u8>,
-    path: String,
-    title: String,
-    mimetype: String,
-    content: Vec<u8>,
 }
 
 /// Resolve `c` to a `&mut Creator` or set `*err` and return `null_mut()`.
@@ -118,7 +104,6 @@ unsafe fn ptr_to_vec(
 pub unsafe extern "C" fn zimru_creator_new() -> *mut zimru_creator_t {
     Box::into_raw(Box::new(zimru_creator_t {
         inner: Some(Creator::new()),
-        in_flight: None,
     }))
 }
 
@@ -600,19 +585,6 @@ pub unsafe extern "C" fn zimru_creator_begin_item(
     size_hint: usize,
     err: *mut *mut zimru_error_t,
 ) -> bool {
-    if c.is_null() {
-        set_err(err, crate::Error::EntryNotFound);
-        return false;
-    }
-    if (*c).in_flight.is_some() {
-        set_err(
-            err,
-            crate::Error::Io(std::io::Error::other(
-                "zimru_creator: another chunked item is already in flight",
-            )),
-        );
-        return false;
-    }
     let Some(path_str) = cstr_to_string(path, err) else {
         return false;
     };
@@ -627,6 +599,7 @@ pub unsafe extern "C" fn zimru_creator_begin_item(
         return false;
     }
     let creator: &mut Creator = &mut *inner;
+
     // Resolve namespace: explicit `namespace` wins; if 0, fall back
     // to the X/ prefix shortcut to match zimru_creator_add_item.
     let (resolved_ns, resolved_path) = if namespace == 0 {
@@ -643,30 +616,24 @@ pub unsafe extern "C" fn zimru_creator_begin_item(
         (Some(namespace), path_str)
     };
 
-    // Validate that the creator is in streaming mode; reuse the
-    // exact same check Creator::begin_item performs.
-    if creator.peek_streaming().is_none() {
-        set_err(
-            err,
-            crate::Error::Io(std::io::Error::other(
-                "zimru_creator_begin_item requires start_writing first",
-            )),
-        );
-        return false;
+    let expected_size = if size_hint > 0 {
+        Some(size_hint as u64)
+    } else {
+        None
+    };
+    match creator.begin_chunked_item(
+        resolved_ns,
+        resolved_path,
+        title_str,
+        mime_str,
+        expected_size,
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            set_err(err, e);
+            false
+        }
     }
-
-    let mut content = Vec::new();
-    if size_hint > 0 {
-        content.reserve(size_hint);
-    }
-    (*c).in_flight = Some(InFlightItem {
-        namespace: resolved_ns,
-        path: resolved_path,
-        title: title_str,
-        mimetype: mime_str,
-        content,
-    });
-    true
 }
 
 /// Append a chunk of body bytes to the in-flight chunked item.
@@ -684,19 +651,6 @@ pub unsafe extern "C" fn zimru_creator_item_chunk(
     len: usize,
     err: *mut *mut zimru_error_t,
 ) -> bool {
-    if c.is_null() {
-        set_err(err, crate::Error::EntryNotFound);
-        return false;
-    }
-    let Some(in_flight) = (*c).in_flight.as_mut() else {
-        set_err(
-            err,
-            crate::Error::Io(std::io::Error::other(
-                "zimru_creator_item_chunk: no item in flight (call begin_item first)",
-            )),
-        );
-        return false;
-    };
     if len == 0 {
         return true;
     }
@@ -704,9 +658,19 @@ pub unsafe extern "C" fn zimru_creator_item_chunk(
         set_err(err, crate::Error::EntryNotFound);
         return false;
     }
+    let inner = inner_mut(c, err);
+    if inner.is_null() {
+        return false;
+    }
+    let creator: &mut Creator = &mut *inner;
     let slice = std::slice::from_raw_parts(chunk, len);
-    in_flight.content.extend_from_slice(slice);
-    true
+    match creator.chunked_item_chunk(slice) {
+        Ok(()) => true,
+        Err(e) => {
+            set_err(err, e);
+            false
+        }
+    }
 }
 
 /// Finalise the in-flight chunked item — pushes it through the
@@ -724,32 +688,12 @@ pub unsafe extern "C" fn zimru_creator_end_item(
     c: *mut zimru_creator_t,
     err: *mut *mut zimru_error_t,
 ) -> bool {
-    if c.is_null() {
-        set_err(err, crate::Error::EntryNotFound);
-        return false;
-    }
-    let Some(in_flight) = (*c).in_flight.take() else {
-        set_err(
-            err,
-            crate::Error::Io(std::io::Error::other(
-                "zimru_creator_end_item: no item in flight",
-            )),
-        );
-        return false;
-    };
     let inner = inner_mut(c, err);
     if inner.is_null() {
         return false;
     }
     let creator: &mut Creator = &mut *inner;
-    let item = Item {
-        path: in_flight.path,
-        title: in_flight.title,
-        mimetype: in_flight.mimetype,
-        content: in_flight.content,
-        namespace: in_flight.namespace,
-    };
-    match creator.push_streaming_item(item) {
+    match creator.end_chunked_item() {
         Ok(()) => true,
         Err(e) => {
             set_err(err, e);

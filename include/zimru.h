@@ -98,8 +98,9 @@ typedef struct zimru_blob_t zimru_blob_t;
 
 /**
  * Opaque writer handle. Owns a [`Creator`] until `zimru_creator_write_to`
- * consumes it. May also hold a single in-flight chunked item between
- * `begin_item` and `end_item` calls.
+ * consumes it. The chunked-item in-flight state lives on the underlying
+ * `Creator`'s streamer (so the streaming-encode variant can take the
+ * output file out from under the writer mid-item without aliasing).
  */
 typedef struct zimru_creator_t zimru_creator_t;
 
