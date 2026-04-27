@@ -20,7 +20,7 @@
 
 use std::process::ExitCode;
 
-use zimru::writer::{Creator, Item};
+use zimru::writer::{ClusterStrategy, Creator, Item};
 use zimru::{Archive, Compression, Dirent};
 
 const VERSION: &str = "zimrecreate (zimru) 0.1.0";
@@ -32,6 +32,7 @@ fn main() -> ExitCode {
     let mut compression = Compression::Zstd;
     let mut compression_level: Option<i32> = None;
     let mut cluster_target: Option<usize> = None;
+    let mut cluster_strategy: ClusterStrategy = ClusterStrategy::Single;
 
     let mut i = 1;
     while i < args.len() {
@@ -75,6 +76,23 @@ fn main() -> ExitCode {
                 i += 1;
                 cluster_target = args.get(i).and_then(|s| s.parse().ok());
             }
+            "--cluster-by" => {
+                i += 1;
+                cluster_strategy = match args.get(i).map(String::as_str) {
+                    Some("single") | Some("") => ClusterStrategy::Single,
+                    Some("mime") => ClusterStrategy::ByMime,
+                    Some("extension") | Some("ext") => ClusterStrategy::ByExtension,
+                    Some("path") | Some("path-segment") => {
+                        ClusterStrategy::ByFirstPathSegment
+                    }
+                    other => {
+                        eprintln!(
+                            "zimrecreate: --cluster-by must be one of single|mime|extension|path; got `{other:?}`"
+                        );
+                        return ExitCode::from(2);
+                    }
+                };
+            }
             a if a.starts_with('-') => {
                 eprintln!("zimrecreate: unknown option `{a}`");
                 return ExitCode::from(2);
@@ -98,7 +116,14 @@ fn main() -> ExitCode {
         }
     };
 
-    match run(&src, &dst, compression, compression_level, cluster_target) {
+    match run(
+        &src,
+        &dst,
+        compression,
+        compression_level,
+        cluster_target,
+        cluster_strategy,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("zimrecreate: {e}");
@@ -119,6 +144,7 @@ fn run(
     compression: Compression,
     compression_level: Option<i32>,
     cluster_target: Option<usize>,
+    cluster_strategy: ClusterStrategy,
 ) -> Result<(), zimru::Error> {
     let source = Archive::open(src)?;
     let mut creator = Creator::new();
@@ -130,6 +156,7 @@ fn run(
     if let Some(n) = cluster_target {
         creator.set_cluster_size_target(n);
     }
+    creator.set_cluster_strategy(cluster_strategy);
 
     // Forward the main path (if any).
     if source.has_main_entry() {
@@ -137,6 +164,11 @@ fn run(
             creator.set_main_path(&main);
         }
     }
+
+    // Switch to streaming mode — bodies bin-pack into clusters and
+    // stream-encode-write as we iterate the source. Peak RSS becomes
+    // O(cluster_size_target × bucket_count) instead of O(total content).
+    creator.start_writing(dst)?;
 
     // Iterate every entry, partition by kind. We skip:
     //   W/mainPage  (added automatically via set_main_path above)
@@ -196,7 +228,7 @@ fn run(
         }
     }
 
-    creator.write_to(dst)?;
+    creator.finish_writing()?;
     Ok(())
 }
 

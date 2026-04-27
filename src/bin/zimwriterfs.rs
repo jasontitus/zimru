@@ -46,6 +46,9 @@ struct Opts {
     scraper: Option<String>,
     skip_libmagic: bool,
     verbose: bool,
+    /// Cluster routing strategy: "single" (default), "mime",
+    /// "extension", or "path".
+    cluster_by: Option<String>,
 
     html_dir: Option<PathBuf>,
     zim_file: Option<PathBuf>,
@@ -103,6 +106,7 @@ fn main() -> ExitCode {
             ("-e", v) | ("--source", v) => o.source = Some(value_or_next(v, &args, &mut i)),
             ("-o", v) | ("--flavour", v) => o.flavour = Some(value_or_next(v, &args, &mut i)),
             ("-s", v) | ("--scraper", v) => o.scraper = Some(value_or_next(v, &args, &mut i)),
+            ("--cluster-by", v) => o.cluster_by = Some(value_or_next(v, &args, &mut i)),
             (other, _) if other.starts_with('-') => {
                 eprintln!("zimwriterfs: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -198,6 +202,24 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     if let Some(kb) = o.cluster_size_kb {
         creator.set_cluster_size_target(kb * 1024);
     }
+    if let Some(strategy) = o.cluster_by.as_deref() {
+        let s = match strategy {
+            "single" | "" => zimru::writer::ClusterStrategy::Single,
+            "mime" => zimru::writer::ClusterStrategy::ByMime,
+            "extension" | "ext" => zimru::writer::ClusterStrategy::ByExtension,
+            "path" | "path-segment" => zimru::writer::ClusterStrategy::ByFirstPathSegment,
+            other => {
+                eprintln!(
+                    "zimwriterfs: --cluster-by must be one of single|mime|extension|path; got `{other}`"
+                );
+                return Err(zimru::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid --cluster-by value: {other}"),
+                )));
+            }
+        };
+        creator.set_cluster_strategy(s);
+    }
     creator.set_main_path(o.welcome.as_deref().unwrap());
 
     // Switch to streaming mode now so each subsequent add_item /
@@ -251,7 +273,17 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     for entry in walk_dir(html_dir)? {
         let path = entry;
         let rel = path.strip_prefix(html_dir).unwrap();
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        // On Windows, Path components are joined with '\\' — convert
+        // those to '/' so the URL inside the ZIM is portable. On Unix,
+        // '\\' is a *literal* character in filenames (Wikipedia has
+        // articles like "AC\\DC", "Acid\\Base_chemistry") and must NOT
+        // be rewritten — doing so would alias them onto unrelated
+        // directory-traversal paths and produce duplicate dirents.
+        let rel_str = if cfg!(windows) {
+            rel.to_string_lossy().replace('\\', "/")
+        } else {
+            rel.to_string_lossy().into_owned()
+        };
         let mime = mime_for_path(&path);
         let mut content = fs::read(&path)?;
         if o.inflate_html && (path.extension().is_some_and(|e| e == "html" || e == "htm")) {

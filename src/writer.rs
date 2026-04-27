@@ -28,6 +28,7 @@ use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::path::Path;
 
 use md5::{Digest, Md5};
+use rayon::prelude::*;
 
 use crate::cluster::Compression;
 use crate::error::{Error, Result};
@@ -142,6 +143,42 @@ pub struct MetadataEntry {
 /// a 4 GB output).
 pub(crate) const MIME_LIST_RESERVE: usize = 64 * 1024;
 
+/// Choice of how the streaming writer decides which "in-flight
+/// cluster" each item joins. Different choices group similar
+/// content into the same cluster so zstd's match-finder can reuse
+/// dictionary entries across adjacent items.
+///
+/// Trade-off: more buckets → more in-flight clusters → more peak
+/// RAM (`buckets × cluster_size_target`) and potentially smaller
+/// per-cluster averages (less dictionary warmup → worse
+/// compression on under-filled clusters). Empirically, gains are
+/// largest on ZIMs with non-trivial mime / extension diversity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterStrategy {
+    /// One in-flight cluster, items packed in `add_item` order
+    /// (URL-sort order if the caller is the buffered API). Default.
+    Single,
+    /// One in-flight cluster per distinct mime type. HTML items go
+    /// together, JSON items go together, PNG items go together, and
+    /// so on.
+    ByMime,
+    /// One in-flight cluster per file-extension (the bytes after
+    /// the last `.` in the path, or `""` for paths without an
+    /// extension).
+    ByExtension,
+    /// One in-flight cluster per first path segment (the bytes
+    /// before the first `/`, or the whole path if it has none).
+    /// Useful for ZIMs whose directory layout reflects content
+    /// types (`wiki/...`, `maps/...`, `images/...`).
+    ByFirstPathSegment,
+}
+
+impl Default for ClusterStrategy {
+    fn default() -> Self {
+        ClusterStrategy::Single
+    }
+}
+
 /// High-level ZIM file builder. Two usage modes:
 ///
 /// * **Buffered** — call `add_*` then `write_to(path)`. Every body
@@ -163,6 +200,7 @@ pub struct Creator {
     compression_level: Option<i32>,
     cluster_size_target: usize,
     uuid: [u8; 16],
+    cluster_strategy: ClusterStrategy,
 
     /// Set when `start_writing` is called. Once set, all `add_*` and
     /// `set_main_path` calls route directly into the streamer; any
@@ -189,8 +227,22 @@ impl Creator {
             compression_level: None,
             cluster_size_target: DEFAULT_CLUSTER_SIZE_TARGET,
             uuid: default_uuid(),
+            cluster_strategy: ClusterStrategy::Single,
             stream: None,
         }
+    }
+
+    /// Pick how items are grouped into clusters during streaming.
+    /// See [`ClusterStrategy`] for the choices. Must be called
+    /// before [`Creator::start_writing`] (or [`Creator::write_to`]);
+    /// changing strategy mid-write is unsupported and will panic.
+    pub fn set_cluster_strategy(&mut self, s: ClusterStrategy) -> &mut Self {
+        assert!(
+            self.stream.is_none(),
+            "set_cluster_strategy called after start_writing",
+        );
+        self.cluster_strategy = s;
+        self
     }
 
     pub fn add_item(&mut self, item: Item) -> &mut Self {
@@ -356,6 +408,7 @@ impl Creator {
             self.cluster_size_target,
             self.uuid,
             self.main_path.take(),
+            self.cluster_strategy,
         )?;
         // Drain anything the caller buffered through add_* before
         // they decided to stream.
@@ -474,25 +527,66 @@ struct Streamer {
     cluster_size_target: usize,
     uuid: [u8; 16],
     main_path: Option<String>,
+    cluster_strategy: ClusterStrategy,
 
     // Mime list, accumulating as items arrive.
     mimes: Vec<String>,
     mime_index: BTreeMap<String, u16>,
 
-    // Current cluster being filled (raw blob bytes, uncompressed).
-    current_cluster: Vec<Vec<u8>>,
-    current_cluster_size: usize,
+    // One in-flight cluster per bucket key (`""` for `Single` mode,
+    // mime / extension / first path segment for the others). When a
+    // bucket exceeds `cluster_size_target` it is flushed independently
+    // of the others — its blobs are queued for parallel-batch encode
+    // and its dirents are committed with the freshly-allocated
+    // `cluster_idx`.
+    buckets: BTreeMap<String, Bucket>,
 
-    // Completed cluster offsets (absolute file positions).
+    // Per-cluster offsets in the output file. Each closed cluster
+    // gets a slot here; the slot is filled with the actual offset
+    // when its encoded bytes are written. `cluster_offsets.len()`
+    // doubles as the next cluster_idx allocator at flush time.
     cluster_offsets: Vec<u64>,
 
-    // Dirents accumulated for items already streamed. Small (~50 B/item).
+    // Bounded queue of (cluster_idx, raw_blobs) waiting to be
+    // encode-and-written. When this fills to `rayon::current_num_threads()`
+    // we drain it as a single `par_iter` batch and write the encoded
+    // bytes in cluster_idx order. Cap is small
+    // (`cluster_size_target * thread_count` raw bytes) so peak RSS
+    // stays bounded.
+    pending_encode: Vec<(u32, Vec<Vec<u8>>)>,
+
+    // Dirents committed for items whose cluster has been flushed.
+    // Small (~50 B/item).
     dirents: Vec<RawDirent>,
 
     // Buffered until finalize — small data.
     redirections: Vec<Redirection>,
     metadata: Vec<MetadataEntry>,
     illustrations: Vec<(u32, Vec<u8>)>,
+}
+
+/// One in-flight cluster's worth of un-flushed work for a single
+/// bucket. Lives inside [`Streamer::buckets`].
+#[derive(Default)]
+struct Bucket {
+    /// Raw blob bytes for items pushed to this bucket since the
+    /// last flush. Encoded into one cluster on the next flush.
+    blobs: Vec<Vec<u8>>,
+    /// Sum of `blobs[i].len()`, the trigger for flush.
+    size_bytes: usize,
+    /// Per-item dirent metadata for the items currently in `blobs`.
+    /// `cluster_idx` is filled at flush time (when we know which
+    /// cluster index this bucket's contents will become); `blob_idx`
+    /// is the position within `blobs` and is final.
+    pending: Vec<PendingArticle>,
+}
+
+struct PendingArticle {
+    namespace: u8,
+    url: String,
+    title: String,
+    mime_idx: u16,
+    blob_idx: u32,
 }
 
 impl Streamer {
@@ -503,6 +597,7 @@ impl Streamer {
         cluster_size_target: usize,
         uuid: [u8; 16],
         main_path: Option<String>,
+        cluster_strategy: ClusterStrategy,
     ) -> Result<Self> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -524,11 +619,12 @@ impl Streamer {
             cluster_size_target,
             uuid,
             main_path,
+            cluster_strategy,
             mimes: Vec::new(),
             mime_index: BTreeMap::new(),
-            current_cluster: Vec::new(),
-            current_cluster_size: 0,
+            buckets: BTreeMap::new(),
             cluster_offsets: Vec::new(),
+            pending_encode: Vec::new(),
             dirents: Vec::new(),
             redirections: Vec::new(),
             metadata: Vec::new(),
@@ -536,9 +632,30 @@ impl Streamer {
         })
     }
 
-    /// Stream-process one item: bin-pack its body into the current
-    /// cluster, encode-write-free if the cluster overflows, record
-    /// the dirent.
+    /// Pick which bucket an item joins under the active strategy.
+    /// Pure function of `path` and `mimetype` — not of dynamic
+    /// state — so a given (item, strategy) always lands in the
+    /// same bucket regardless of arrival order.
+    fn bucket_key(&self, path: &str, mimetype: &str) -> String {
+        match self.cluster_strategy {
+            ClusterStrategy::Single => String::new(),
+            ClusterStrategy::ByMime => mimetype.to_string(),
+            ClusterStrategy::ByExtension => match path.rsplit_once('.') {
+                Some((_, ext)) if !ext.contains('/') => ext.to_string(),
+                _ => String::new(),
+            },
+            ClusterStrategy::ByFirstPathSegment => {
+                match path.split_once('/') {
+                    Some((head, _)) => head.to_string(),
+                    None => path.to_string(),
+                }
+            }
+        }
+    }
+
+    /// Stream-process one item: bin-pack its body into the bucket
+    /// it belongs to, flush that bucket if it overflows, record the
+    /// pending dirent (committed at the bucket's next flush).
     fn push_item(&mut self, item: Item) -> Result<()> {
         let mime_idx = intern_mime(&item.mimetype, &mut self.mimes, &mut self.mime_index);
         let title = if item.title.is_empty() {
@@ -548,41 +665,118 @@ impl Streamer {
         };
         let body = item.content;
         let body_len = body.len();
+        let key = self.bucket_key(&item.path, &item.mimetype);
 
-        if !self.current_cluster.is_empty()
-            && self.current_cluster_size + body_len > self.cluster_size_target
-        {
-            self.flush_current_cluster()?;
+        // Ensure the bucket exists, then check overflow against
+        // *this* bucket's running size (not a global running size).
+        let needs_flush = match self.buckets.get(&key) {
+            Some(b) => !b.blobs.is_empty() && b.size_bytes + body_len > self.cluster_size_target,
+            None => false,
+        };
+        if needs_flush {
+            self.flush_bucket(&key)?;
         }
 
-        let cluster_idx = self.cluster_offsets.len() as u32;
-        let blob_idx = self.current_cluster.len() as u32;
-        self.current_cluster.push(body);
-        self.current_cluster_size += body_len;
-
-        self.dirents.push(RawDirent::Article {
+        let bucket = self.buckets.entry(key).or_default();
+        let blob_idx = bucket.blobs.len() as u32;
+        bucket.blobs.push(body);
+        bucket.size_bytes += body_len;
+        bucket.pending.push(PendingArticle {
             namespace: item.namespace.unwrap_or(b'C'),
             url: item.path,
             title,
             mime_idx,
-            cluster: cluster_idx,
-            blob: blob_idx,
+            blob_idx,
         });
         Ok(())
     }
 
-    /// Encode the current cluster to disk and free its source bytes.
-    /// Records the cluster's absolute offset.
-    fn flush_current_cluster(&mut self) -> Result<()> {
-        if self.current_cluster.is_empty() {
+    /// Allocate a cluster_idx for this bucket's accumulated blobs,
+    /// commit the bucket's pending dirents with that cluster_idx,
+    /// and queue the raw blobs for parallel-batch encoding. The
+    /// actual encode + write happens in `drain_pending_encode` when
+    /// the queue fills (typically at `rayon::current_num_threads()`
+    /// entries) or at finalize.
+    fn flush_bucket(&mut self, key: &str) -> Result<()> {
+        let bucket = match self.buckets.remove(key) {
+            Some(b) if !b.blobs.is_empty() => b,
+            // Empty bucket — nothing to do; reinsert default so the
+            // map shape is stable across call patterns.
+            Some(_) => {
+                self.buckets.insert(key.to_string(), Bucket::default());
+                return Ok(());
+            }
+            None => return Ok(()),
+        };
+        let cluster_idx = self.cluster_offsets.len() as u32;
+        // Reserve the slot now (offset filled in when we write).
+        self.cluster_offsets.push(0);
+        // Commit dirents — this cluster_idx is final regardless of
+        // when the encode completes.
+        for pa in bucket.pending {
+            self.dirents.push(RawDirent::Article {
+                namespace: pa.namespace,
+                url: pa.url,
+                title: pa.title,
+                mime_idx: pa.mime_idx,
+                cluster: cluster_idx,
+                blob: pa.blob_idx,
+            });
+        }
+        self.pending_encode.push((cluster_idx, bucket.blobs));
+        // Reinsert empty bucket for reuse without map churn.
+        self.buckets.insert(key.to_string(), Bucket::default());
+
+        // If the queue is at thread-pool size, drain it: parallel
+        // encode + sequential write keeps cluster bytes contiguous
+        // and matches `cluster_offsets[i]` to file position.
+        let threads = rayon::current_num_threads().max(1);
+        if self.pending_encode.len() >= threads {
+            self.drain_pending_encode()?;
+        }
+        Ok(())
+    }
+
+    /// Encode all queued clusters in parallel, then write them
+    /// sequentially in cluster_idx order. Updates
+    /// `cluster_offsets[i]` with the absolute file position where
+    /// each cluster lands. Frees source blobs after encoding.
+    fn drain_pending_encode(&mut self) -> Result<()> {
+        if self.pending_encode.is_empty() {
             return Ok(());
         }
-        let blobs = std::mem::take(&mut self.current_cluster);
-        self.current_cluster_size = 0;
-        let encoded = encode_cluster(&blobs, self.compression, self.compression_level)?;
-        self.cluster_offsets.push(self.file_pos);
-        self.file.write_all(&encoded)?;
-        self.file_pos += encoded.len() as u64;
+        let chunk = std::mem::take(&mut self.pending_encode);
+        let comp = self.compression;
+        let level = self.compression_level;
+        let mut encoded: Vec<(u32, Vec<u8>)> = chunk
+            .into_par_iter()
+            .map(|(idx, blobs)| {
+                encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        encoded.sort_by_key(|(idx, _)| *idx);
+        for (idx, bytes) in encoded {
+            self.cluster_offsets[idx as usize] = self.file_pos;
+            self.file.write_all(&bytes)?;
+            self.file_pos += bytes.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Drain every non-empty bucket, in deterministic key order,
+    /// then drain the encode queue so all clusters are on disk.
+    /// Called once at finalize after all add_* work is done.
+    fn flush_all_buckets(&mut self) -> Result<()> {
+        let keys: Vec<String> = self
+            .buckets
+            .iter()
+            .filter(|(_, b)| !b.blobs.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in keys {
+            self.flush_bucket(&k)?;
+        }
+        self.drain_pending_encode()?;
         Ok(())
     }
 
@@ -616,8 +810,9 @@ impl Streamer {
             })?;
         }
 
-        // 2. Close the last cluster.
-        self.flush_current_cluster()?;
+        // 2. Close every still-open bucket — one cluster per
+        //    non-empty bucket, in deterministic key order.
+        self.flush_all_buckets()?;
 
         // 3. Build redirect dirents (no content). Includes the
         //    optional W/mainPage redirect.
