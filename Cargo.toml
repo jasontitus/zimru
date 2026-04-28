@@ -8,6 +8,11 @@ repository = "https://github.com/jasontitus/zimru"
 readme = "README.md"
 keywords = ["zim", "openzim", "wikipedia", "kiwix"]
 categories = ["filesystem", "compression", "parser-implementations"]
+# We declare every binary explicitly with `[[bin]]` below. Disable
+# auto-discovery so `src/bin/_*.rs` files (which are per-bin shared
+# helper modules included via `#[path = ...]`) aren't treated as
+# standalone binaries.
+autobins = false
 
 [features]
 default = ["writer"]

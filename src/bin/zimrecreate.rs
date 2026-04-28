@@ -18,10 +18,15 @@
 //!   --cluster-size BYTES       cluster size target (default 2MiB)
 //! ```
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use zimru::writer::{ClusterStrategy, Creator, Item};
 use zimru::{Archive, Compression, Dirent};
+
+#[path = "_index_helper.rs"]
+mod index_helper;
+use index_helper::IndexHelper;
 
 const VERSION: &str = "zimrecreate (zimru) 0.1.0";
 
@@ -33,6 +38,8 @@ fn main() -> ExitCode {
     let mut compression_level: Option<i32> = None;
     let mut cluster_target: Option<usize> = None;
     let mut cluster_strategy: ClusterStrategy = ClusterStrategy::Single;
+    let mut without_ft_index = false;
+    let mut xapianbuilder_path: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -46,7 +53,11 @@ fn main() -> ExitCode {
                 print_help();
                 return ExitCode::SUCCESS;
             }
-            "-j" | "--withoutFTIndex" => {}
+            "-j" | "--withoutFTIndex" => without_ft_index = true,
+            "--xapianbuilder-path" => {
+                i += 1;
+                xapianbuilder_path = args.get(i).map(PathBuf::from);
+            }
             "-J" | "--threads" => {
                 i += 1; // consume value, ignore
             }
@@ -121,6 +132,8 @@ fn main() -> ExitCode {
         compression_level,
         cluster_target,
         cluster_strategy,
+        without_ft_index,
+        xapianbuilder_path.as_deref(),
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -143,6 +156,8 @@ fn run(
     compression_level: Option<i32>,
     cluster_target: Option<usize>,
     cluster_strategy: ClusterStrategy,
+    without_ft_index: bool,
+    xapianbuilder_path: Option<&std::path::Path>,
 ) -> Result<(), zimru::Error> {
     let source = Archive::open(src)?;
     // We're about to walk every entry + every cluster end-to-end,
@@ -170,6 +185,17 @@ fn run(
     // stream-encode-write as we iterate the source. Peak RSS becomes
     // O(cluster_size_target × bucket_count) instead of O(total content).
     creator.start_writing(dst)?;
+
+    // Pull the source's M/Language metadata so we can pass it to
+    // xapianbuilder. Empty (the helper will skip stemming if so).
+    let language = read_metadata_string(&source, "Language").unwrap_or_default();
+    let dst_path = std::path::Path::new(dst);
+    let index_tmp = make_index_tmp_dir(dst_path)?;
+    let mut indexer = if without_ft_index {
+        IndexHelper::disabled()
+    } else {
+        IndexHelper::spawn(&language, &index_tmp, xapianbuilder_path, false)
+    };
 
     // Iterate every entry, partition by kind. We skip:
     //   W/mainPage         — added automatically via set_main_path above
@@ -203,11 +229,15 @@ fn run(
                     // Look up the target's path so we can add it via the
                     // public redirection API.
                     let target = source.entry_by_url_index(r.redirect_index)?;
+                    let target_path = target.path().to_string();
                     creator.add_redirection(
                         path.to_string(),
                         title.to_string(),
-                        target.path().to_string(),
+                        target_path.clone(),
                     );
+                    // Redirects also belong in the title index, with
+                    // the target stored in value slot 1.
+                    indexer.feed_title(path, title, &target_path);
                 }
                 // Redirects in W/M/X namespaces are rebuilt implicitly by
                 // re-adding the underlying entries.
@@ -223,6 +253,13 @@ fn run(
                     .to_string();
                 let data = item.bytes()?;
                 if ns == b'C' {
+                    indexer.feed_title(path, title, "");
+                    if mime.starts_with("text/html") {
+                        let body = std::str::from_utf8(&data)
+                            .map(std::borrow::Cow::Borrowed)
+                            .unwrap_or_else(|_| String::from_utf8_lossy(&data));
+                        indexer.feed_fulltext(path, title, &mime, &body, &language);
+                    }
                     creator.add_item(Item::new(path, title, mime, data));
                 } else if ns == b'M' {
                     // Strip the special illustration path back into add_illustration
@@ -237,8 +274,38 @@ fn run(
         }
     }
 
+    // Drain the helper, attach output blobs as X/* items.
+    let blobs = indexer.finish(false);
+    for blob in blobs {
+        creator.add_item(
+            Item::in_namespace(b'X', blob.url, "", blob.mimetype, blob.bytes)
+                .with_compress(false),
+        );
+    }
+    let _ = std::fs::remove_dir_all(&index_tmp);
+
     creator.finish_writing()?;
     Ok(())
+}
+
+fn read_metadata_string(archive: &Archive, name: &str) -> Option<String> {
+    let bytes = archive.get_metadata(name).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn make_index_tmp_dir(zim_file: &std::path::Path) -> Result<PathBuf, zimru::Error> {
+    let parent = zim_file.parent().unwrap_or(std::path::Path::new("."));
+    let stem = zim_file
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "zim".into());
+    let pid = std::process::id();
+    let dir = parent.join(format!(".{stem}.xapianbuilder.{pid}"));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 fn parse_illustration_path(path: &str) -> Option<u32> {
