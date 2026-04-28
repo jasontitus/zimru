@@ -20,6 +20,10 @@ use std::process::ExitCode;
 use zimru::writer::{Creator, Item};
 use zimru::Compression;
 
+#[path = "_index_helper.rs"]
+mod index_helper;
+use index_helper::IndexHelper;
+
 const VERSION: &str = "zimwriterfs (zimru) 0.1.0";
 
 #[derive(Default, Debug)]
@@ -40,6 +44,10 @@ struct Opts {
     inflate_html: bool,
     redirects_file: Option<PathBuf>,
     without_ft_index: bool,
+    /// Optional explicit path to the xapianbuilder helper binary. If
+    /// unset we look at $XAPIANBUILDER, then $PATH. Absence is
+    /// non-fatal: the ZIM is built without search indexes.
+    xapianbuilder_path: Option<PathBuf>,
     tags: Option<String>,
     source: Option<String>,
     flavour: Option<String>,
@@ -113,6 +121,9 @@ fn main() -> ExitCode {
             ("-s", v) | ("--scraper", v) => o.scraper = Some(value_or_next(v, &args, &mut i)),
             ("--cluster-by", v) => o.cluster_by = Some(value_or_next(v, &args, &mut i)),
             ("--max-memory", v) => o.max_memory_mb = value_or_next(v, &args, &mut i).parse().ok(),
+            ("--xapianbuilder-path", v) => {
+                o.xapianbuilder_path = Some(PathBuf::from(value_or_next(v, &args, &mut i)))
+            }
             (other, _) if other.starts_with('-') => {
                 eprintln!("zimwriterfs: unknown option `{other}`");
                 return ExitCode::from(2);
@@ -186,7 +197,7 @@ fn value_or_next(v: Option<&str>, args: &[String], i: &mut usize) -> String {
 
 fn print_help() {
     println!(
-        "Usage: zimwriterfs [mandatory arguments] [optional arguments] HTML_DIR ZIM_FILE\n\nMandatory:\n  -w/--welcome PATH      main HTML page (relative to HTML_DIR)\n  -I/--illustration PATH 48×48 PNG illustration (relative)\n  -l/--language LANG     ISO639-3 language code (e.g. eng)\n  -n/--name NAME         version-independent identifier\n  -t/--title TITLE       ZIM title\n  -d/--description TEXT  short description\n  -c/--creator AUTHOR    content creator\n  -p/--publisher PUB     ZIM creator/publisher\n\nOptional:\n  -L/--longDescription TEXT\n  -m/--clusterSize KB    cluster size in KiB (default 2048)\n  --compression-level N  compression level (zstd: 1..=22, xz: 0..=9)\n  -J/--threads N         rayon thread-pool size (default num_cpus)\n  -x/--inflateHtml       gunzip *.html files before packing\n  -j/--withoutFTIndex    don't build fulltext index (always)\n  -r/--redirects PATH    TSV file: url\\ttitle\\ttarget_url\n  -a/--tags TAGS         semicolon-separated tags\n  -e/--source URL        source URL\n  -o/--flavour NAME      content flavour\n  -s/--scraper NAME      scraper tool name+version\n  --skip-libmagic-check  ignore libmagic; use file-extension mime detection (default in zimru)\n  -v/--verbose           print processing details\n  -V/--version           print version\n"
+        "Usage: zimwriterfs [mandatory arguments] [optional arguments] HTML_DIR ZIM_FILE\n\nMandatory:\n  -w/--welcome PATH      main HTML page (relative to HTML_DIR)\n  -I/--illustration PATH 48×48 PNG illustration (relative)\n  -l/--language LANG     ISO639-3 language code (e.g. eng)\n  -n/--name NAME         version-independent identifier\n  -t/--title TITLE       ZIM title\n  -d/--description TEXT  short description\n  -c/--creator AUTHOR    content creator\n  -p/--publisher PUB     ZIM creator/publisher\n\nOptional:\n  -L/--longDescription TEXT\n  -m/--clusterSize KB    cluster size in KiB (default 2048)\n  --compression-level N  compression level (zstd: 1..=22, xz: 0..=9)\n  -J/--threads N         rayon thread-pool size (default num_cpus)\n  -x/--inflateHtml       gunzip *.html files before packing\n  -j/--withoutFTIndex    don't build fulltext / title indexes\n  --xapianbuilder-path P override $PATH lookup of xapianbuilder helper\n  -r/--redirects PATH    TSV file: url\\ttitle\\ttarget_url\n  -a/--tags TAGS         semicolon-separated tags\n  -e/--source URL        source URL\n  -o/--flavour NAME      content flavour\n  -s/--scraper NAME      scraper tool name+version\n  --skip-libmagic-check  ignore libmagic; use file-extension mime detection (default in zimru)\n  -v/--verbose           print processing details\n  -V/--version           print version\n"
     );
 }
 
@@ -237,6 +248,24 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     // cluster overflows. Peak RSS becomes O(cluster_size_target ×
     // thread_count) instead of O(total input size).
     creator.start_writing(zim_file)?;
+
+    // Spin up xapianbuilder helpers (one each for fulltext + title)
+    // unless the user opted out. The helpers run in parallel with the
+    // ZIM writer; we feed each entry via stdin as we add it. On
+    // finish() we slurp the output files back and add them as
+    // X/* items before the creator finalises.
+    let language = o.language.clone().unwrap_or_default();
+    let index_tmp = make_index_tmp_dir(zim_file)?;
+    let mut indexer = if o.without_ft_index {
+        IndexHelper::disabled()
+    } else {
+        IndexHelper::spawn(
+            &language,
+            &index_tmp,
+            o.xapianbuilder_path.as_deref(),
+            o.verbose,
+        )
+    };
 
     // Mandatory metadata.
     creator.add_metadata("Title", o.title.clone().unwrap());
@@ -374,6 +403,10 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                 creator.chunked_item_chunk(&buf[..n])?;
             }
             creator.end_chunked_item()?;
+            // Title indexer sees every C-namespace entry regardless
+            // of mimetype. Big non-HTML files (images, audio, …) get
+            // a title-only entry — same behaviour as libzim.
+            indexer.feed_title(&e.rel_str, &e.rel_str, "");
             count += 1;
             idx += 1;
             if o.verbose && count.is_multiple_of(100) {
@@ -426,6 +459,27 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
         // Push to creator in walk-order so bin-packing stays
         // deterministic.
         for it in items {
+            // Feed both indexers BEFORE the content moves into the
+            // creator (after which we no longer borrow it). The
+            // title DB sees every entry; the fulltext DB only HTML
+            // (the helper filters by mimetype internally). The
+            // body is treated as UTF-8 lossily — non-UTF-8
+            // payloads are not valid HTML to libzim's parser
+            // anyway, so dropping ill-formed bytes here is
+            // strictly safer than feeding them through.
+            indexer.feed_title(&it.rel_str, &it.title, "");
+            if it.mime.starts_with("text/html") {
+                let body = std::str::from_utf8(&it.content)
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&it.content));
+                indexer.feed_fulltext(
+                    &it.rel_str,
+                    &it.title,
+                    &it.mime,
+                    &body,
+                    &language,
+                );
+            }
             creator.add_item(Item::new(it.rel_str, it.title, it.mime, it.content));
             count += 1;
             if o.verbose && count.is_multiple_of(100) {
@@ -450,8 +504,25 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                 continue;
             }
             creator.add_redirection(parts[0], parts[1], parts[2]);
+            // Redirects also go in the title index, with their
+            // target stored in value slot 1.
+            indexer.feed_title(parts[0], parts[1], parts[2]);
         }
     }
+
+    // Drain xapianbuilder children, ingest their output blobs, and
+    // attach them to the ZIM as `X/fulltext/xapian` and
+    // `X/title/xapian`. The X namespace is uncompressed by kiwix
+    // convention so libzim/kiwix-serve can mmap and Database(int fd)
+    // directly into the index.
+    let blobs = indexer.finish(o.verbose);
+    for blob in blobs {
+        creator.add_item(
+            Item::in_namespace(b'X', blob.url, "", blob.mimetype, blob.bytes)
+                .with_compress(false),
+        );
+    }
+    let _ = std::fs::remove_dir_all(&index_tmp);
 
     if o.verbose {
         eprintln!("[zimwriterfs] {count} items collected; finalising…");
@@ -583,4 +654,25 @@ fn flate2_decoder(_buf: &[u8]) -> std::io::Result<std::io::Empty> {
         std::io::ErrorKind::Unsupported,
         "--inflateHtml requires the flate2 feature (not yet enabled)",
     ))
+}
+
+/// Allocate a per-run temp directory next to the output ZIM for the
+/// xapianbuilder children's output files. We avoid `std::env::temp_dir`
+/// because Wikipedia-scale fulltext indexes can be tens of GB and many
+/// systems put `/tmp` on a small ramdisk; co-locating with the ZIM
+/// keeps bytes on the same filesystem the user already chose for the
+/// big output.
+fn make_index_tmp_dir(zim_file: &Path) -> Result<PathBuf, zimru::Error> {
+    let parent = zim_file.parent().unwrap_or(Path::new("."));
+    let stem = zim_file
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "zim".into());
+    let pid = std::process::id();
+    let dir = parent.join(format!(".{stem}.xapianbuilder.{pid}"));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }

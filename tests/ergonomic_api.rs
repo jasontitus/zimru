@@ -238,14 +238,21 @@ fn build_test_zim() -> Vec<u8> {
 }
 
 fn write_tmp(bytes: &[u8]) -> std::path::PathBuf {
+    // Unique counter — `SystemTime::now().as_nanos()` is not coarse
+    // enough to disambiguate two parallel test threads in the same
+    // process, which used to cause one test to delete another's
+    // tmp file mid-run.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "zimru-ergo-{}-{}.zim",
+        "zimru-ergo-{}-{}-{}.zim",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        seq,
     ));
     std::fs::File::create(&p).unwrap().write_all(bytes).unwrap();
     p
