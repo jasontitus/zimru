@@ -59,6 +59,15 @@ pub struct Item {
     /// libzim-shim's fulltext-index emission, which writes
     /// `{ns:'X', url:"fulltext/xapian"}`.
     pub namespace: Option<u8>,
+    /// Per-item compression override. `None` = use the Creator's
+    /// default compression for this item's cluster. `Some(true)` =
+    /// force the cluster to use the Creator's compression. `Some(false)`
+    /// = force the cluster to be uncompressed regardless of Creator
+    /// default. Items differing in effective compression land in
+    /// separate clusters, so a single ZIM can mix compressed and raw
+    /// content (use case: streetzim's >500 MB routing chunks that bust
+    /// PWA fzstd's per-cluster decompression cap).
+    pub compress: Option<bool>,
 }
 
 impl Item {
@@ -74,6 +83,7 @@ impl Item {
             mimetype: mimetype.into(),
             content: content.into(),
             namespace: None,
+            compress: None,
         }
     }
     /// Construct an item that lands in `namespace` rather than `'C'`.
@@ -93,6 +103,7 @@ impl Item {
             mimetype: mimetype.into(),
             content: content.into(),
             namespace: Some(namespace),
+            compress: None,
         }
     }
     pub fn html(
@@ -115,6 +126,38 @@ impl Item {
         content: impl Into<Vec<u8>>,
     ) -> Self {
         Self::new(path, title, "image/png", content)
+    }
+
+    /// Builder-style setter for the per-item compression override.
+    pub fn with_compress(mut self, compress: bool) -> Self {
+        self.compress = Some(compress);
+        self
+    }
+}
+
+/// Resolve an item's effective cluster compression given the
+/// Creator's default. `compress = Some(false)` always wins (raw); the
+/// other branches use the default verbatim.
+fn effective_compression(default: Compression, compress: Option<bool>) -> Compression {
+    match compress {
+        Some(false) => Compression::None,
+        // Some(true) and None both honour the Creator default. The
+        // explicit `true` exists so callers can document intent /
+        // round-trip a value that was originally `false` elsewhere
+        // without losing the override grammar.
+        _ => default,
+    }
+}
+
+/// One-character tag used to disambiguate buckets that share a
+/// strategy key but differ in target compression. Keeps `bucket_key`
+/// returning a single `String` (cheap BTreeMap key) instead of a
+/// composite tuple.
+fn compression_tag(c: Compression) -> &'static str {
+    match c {
+        Compression::None => "n",
+        Compression::Zstd => "z",
+        Compression::Xz => "x",
     }
 }
 
@@ -272,12 +315,20 @@ pub struct ItemBuilder<'a> {
     mimetype: String,
     namespace: Option<u8>,
     content: Vec<u8>,
+    compress: Option<bool>,
 }
 
 impl ItemBuilder<'_> {
     /// Append a chunk of body bytes to the in-flight item.
     pub fn write_chunk(&mut self, chunk: &[u8]) {
         self.content.extend_from_slice(chunk);
+    }
+
+    /// Set the per-item compression override before finishing. See
+    /// [`Item::compress`] for semantics.
+    pub fn set_compress(&mut self, compress: Option<bool>) -> &mut Self {
+        self.compress = compress;
+        self
     }
 
     /// Finalise the item — pushes it through the streaming
@@ -290,6 +341,7 @@ impl ItemBuilder<'_> {
             mimetype: self.mimetype,
             content: self.content,
             namespace: self.namespace,
+            compress: self.compress,
         };
         // Safe to unwrap because `begin_item` checked stream.is_some().
         let s = self
@@ -307,6 +359,11 @@ pub(crate) struct ChunkedMeta {
     pub path: String,
     pub title: String,
     pub mimetype: String,
+    /// Per-item compression override (see [`Item::compress`]). The
+    /// streaming-encode dispatch in `begin_chunked_item` resolves this
+    /// against the Creator's default to pick between zstd-encode (the
+    /// historical path) and a raw passthrough.
+    pub compress: Option<bool>,
 }
 
 /// In-flight state for a chunked item between `begin_item` and
@@ -329,6 +386,22 @@ pub(crate) enum ChunkedInFlight {
     StreamingZstd {
         meta: ChunkedMeta,
         encoder: zstd::stream::Encoder<'static, File>,
+        temp_path: std::path::PathBuf,
+        cluster_idx: u32,
+        bytes_written: u64,
+        expected_size: u64,
+        mime_idx: u16,
+    },
+    /// Streaming raw: chunks pass straight through to a per-item temp
+    /// file with no encoder. Same finalize-splice contract as
+    /// `StreamingZstd` (cluster slot allocated at `begin`, temp file
+    /// concatenated into the main output in `cluster_idx` order at
+    /// finalize). Used when an item has `compress: Some(false)`
+    /// (or the Creator default is `Compression::None`); the cluster
+    /// header is written with `info_byte = 1` (raw, type-1).
+    StreamingRaw {
+        meta: ChunkedMeta,
+        temp_file: File,
         temp_path: std::path::PathBuf,
         cluster_idx: u32,
         bytes_written: u64,
@@ -505,9 +578,10 @@ impl Creator {
 
     /// C-ABI-shape chunked-item begin. Internally dispatches between
     /// buffered (small / unknown size) and streaming-encode (huge,
-    /// zstd-compressed) paths based on `expected_size` and the
-    /// configured compression. Streaming-encode bounds peak memory
-    /// at ~zstd encoder state regardless of how big the body is.
+    /// zstd-compressed *or* raw passthrough) paths based on
+    /// `expected_size` and the effective compression. Streaming-encode
+    /// bounds peak memory at ~zstd encoder state regardless of body
+    /// size; the raw-passthrough variant is even cheaper.
     #[doc(hidden)]
     pub fn begin_chunked_item(
         &mut self,
@@ -516,6 +590,7 @@ impl Creator {
         title: String,
         mimetype: String,
         expected_size: Option<u64>,
+        compress: Option<bool>,
     ) -> Result<()> {
         let s = self.stream.as_mut().ok_or_else(|| {
             Error::Io(std::io::Error::other(
@@ -528,6 +603,7 @@ impl Creator {
                 path,
                 title,
                 mimetype,
+                compress,
             },
             expected_size,
         )
@@ -593,6 +669,7 @@ impl Creator {
             mimetype: mimetype.into(),
             namespace,
             content,
+            compress: None,
         })
     }
 
@@ -952,7 +1029,11 @@ struct Streamer {
     // bytes in cluster_idx order. Cap is small
     // (`cluster_size_target * thread_count` raw bytes) so peak RSS
     // stays bounded.
-    pending_encode: Vec<(u32, Vec<Vec<u8>>)>,
+    /// Each entry: (cluster_idx, raw blobs, compression for this
+    /// cluster). Compression is per-cluster (driven by the bucket's
+    /// configured compression — see [`Bucket::compression`]) so a
+    /// single build can mix compressed and raw clusters.
+    pending_encode: Vec<(u32, Vec<Vec<u8>>, Compression)>,
 
     // Dirents committed for items whose cluster has been flushed.
     // Small (~50 B/item).
@@ -985,7 +1066,6 @@ struct Streamer {
 
 /// One in-flight cluster's worth of un-flushed work for a single
 /// bucket. Lives inside [`Streamer::buckets`].
-#[derive(Default)]
 struct Bucket {
     /// Raw blob bytes for items pushed to this bucket since the
     /// last flush. Encoded into one cluster on the next flush.
@@ -997,6 +1077,22 @@ struct Bucket {
     /// cluster index this bucket's contents will become); `blob_idx`
     /// is the position within `blobs` and is final.
     pending: Vec<PendingArticle>,
+    /// Compression for this bucket's eventual cluster. Set when the
+    /// bucket key is constructed (encodes the compression tag) and
+    /// kept in sync via the `compression_tag` prefix; reading it from
+    /// the bucket avoids re-parsing the key at flush time.
+    compression: Compression,
+}
+
+impl Bucket {
+    fn with_compression(c: Compression) -> Self {
+        Self {
+            blobs: Vec::new(),
+            size_bytes: 0,
+            pending: Vec::new(),
+            compression: c,
+        }
+    }
 }
 
 struct PendingArticle {
@@ -1071,31 +1167,35 @@ impl Streamer {
     }
 
     /// Open a chunked item. If `expected_size > STREAMING_ENCODE_THRESHOLD`
-    /// AND compression is zstd, the body will be stream-encoded to its
-    /// own cluster on disk; otherwise chunks accumulate in a `Vec<u8>`
-    /// and the assembled item runs through the normal bin-packer.
+    /// the body is streamed to its own dedicated cluster — zstd-encoded
+    /// when the item's effective compression is zstd, raw passthrough
+    /// when it's `Compression::None`. Otherwise chunks accumulate in
+    /// a `Vec<u8>` and the assembled item runs through the normal
+    /// bin-packer (where it joins a bucket of compatible-compression
+    /// items).
     fn begin_chunked_item(&mut self, meta: ChunkedMeta, expected_size: Option<u64>) -> Result<()> {
         if self.in_flight.is_some() {
             return Err(Error::Io(std::io::Error::other(
                 "begin_chunked_item: another chunked item is already in flight",
             )));
         }
-        let use_streaming = matches!(self.compression, Compression::Zstd)
-            && expected_size.is_some_and(|s| s as usize >= STREAMING_ENCODE_THRESHOLD);
+        let comp = effective_compression(self.compression, meta.compress);
+        let big_enough = expected_size.is_some_and(|s| s as usize >= STREAMING_ENCODE_THRESHOLD);
+        let stream_zstd = big_enough && matches!(comp, Compression::Zstd);
+        let stream_raw = big_enough && matches!(comp, Compression::None);
 
-        if use_streaming {
+        if stream_zstd || stream_raw {
             let expected = expected_size.unwrap();
             self.stats.items_streamed += 1;
             self.stats.raw_bytes_total += expected;
 
             // Allocate cluster_idx now (placeholder offset filled in
-            // at finalize, when we splice the temp-file's compressed
-            // bytes into the main output). No need to drain or flush
-            // anything here: the streaming encode targets its OWN
-            // temp file, so the in-flight bucket / parallel-batch
-            // queue can keep doing whatever it was doing — they
-            // write to `self.file`, the streaming encoder writes
-            // somewhere else.
+            // at finalize, when we splice the temp file's bytes into
+            // the main output). No need to drain or flush anything
+            // here: the streaming target is the per-item temp file,
+            // so the in-flight bucket / parallel-batch queue can keep
+            // doing whatever it was doing — they write to `self.file`,
+            // we write somewhere else.
             let cluster_idx = self.cluster_offsets.len() as u32;
             self.cluster_offsets.push(0);
 
@@ -1114,8 +1214,11 @@ impl Streamer {
             push_offset(&mut header, header_len, extended_4);
             push_offset(&mut header, header_len + expected, extended_4);
 
-            // Compression info-byte: zstd id (5) | extended bit if needed.
-            let info_byte: u8 = 5 | if extended_4 { 0x10 } else { 0 };
+            // Compression info-byte: zstd id (5) for the encoded
+            // path or `1` (raw) for the passthrough path; OR with
+            // the extended bit when blob offsets need 8 bytes.
+            let info_byte: u8 = if stream_zstd { 5 } else { 1 }
+                | if extended_4 { 0x10 } else { 0 };
 
             // Per-item temp file. Each streamed item writes to its
             // own scratch file so multiple streaming-encode tasks
@@ -1136,43 +1239,60 @@ impl Streamer {
                 .create(true)
                 .truncate(true)
                 .open(&temp_path)?;
-            // Cluster format prefix on disk: info_byte then zstd-
-            // compressed (ptr table + blob bytes).
             tmp_file.write_all(&[info_byte])?;
 
-            let level = self.compression_level.unwrap_or_else(|| {
-                std::env::var("ZSTD_CLEVEL")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(3)
-            });
-            let mut encoder = zstd::stream::Encoder::new(tmp_file, level)
-                .map_err(|e| Error::Decompression(format!("zstd init: {e}")))?;
-            // Enable zstd's internal multi-worker parallelism for
-            // the streaming-encode path. With per-item temp files
-            // multiple streamed items also run concurrently with
-            // each other (Idea C); each gets fewer workers but
-            // they overlap across items.
-            let workers = rayon::current_num_threads().max(1) as u32;
-            let _ = encoder.multithread(workers);
-            encoder
-                .write_all(&header)
-                .map_err(|e| Error::Decompression(format!("zstd header write: {e}")))?;
+            if stream_zstd {
+                let level = self.compression_level.unwrap_or_else(|| {
+                    std::env::var("ZSTD_CLEVEL")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(3)
+                });
+                let mut encoder = zstd::stream::Encoder::new(tmp_file, level)
+                    .map_err(|e| Error::Decompression(format!("zstd init: {e}")))?;
+                // Enable zstd's internal multi-worker parallelism for
+                // the streaming-encode path. With per-item temp files
+                // multiple streamed items also run concurrently with
+                // each other (Idea C); each gets fewer workers but
+                // they overlap across items.
+                let workers = rayon::current_num_threads().max(1) as u32;
+                let _ = encoder.multithread(workers);
+                encoder
+                    .write_all(&header)
+                    .map_err(|e| Error::Decompression(format!("zstd header write: {e}")))?;
 
-            self.in_flight = Some(ChunkedInFlight::StreamingZstd {
-                meta,
-                encoder,
-                temp_path,
-                cluster_idx,
-                bytes_written: 0,
-                expected_size: expected,
-                mime_idx,
-            });
+                self.in_flight = Some(ChunkedInFlight::StreamingZstd {
+                    meta,
+                    encoder,
+                    temp_path,
+                    cluster_idx,
+                    bytes_written: 0,
+                    expected_size: expected,
+                    mime_idx,
+                });
+            } else {
+                // Raw passthrough — write the ptr table directly into
+                // the temp file, then accept chunks straight to disk
+                // until expected_size is met.
+                tmp_file
+                    .write_all(&header)
+                    .map_err(|e| Error::Io(std::io::Error::other(format!("raw header write: {e}"))))?;
+                self.in_flight = Some(ChunkedInFlight::StreamingRaw {
+                    meta,
+                    temp_file: tmp_file,
+                    temp_path,
+                    cluster_idx,
+                    bytes_written: 0,
+                    expected_size: expected,
+                    mime_idx,
+                });
+            }
             return Ok(());
         }
 
         // Buffered path — accumulate chunks into a Vec, push as a
-        // regular item at end_chunked_item time.
+        // regular item at end_chunked_item time. The per-item compress
+        // flag rides through `meta` and is honoured at push_item.
         let capacity = expected_size.map(|s| s as usize).unwrap_or(0);
         let mut content = Vec::new();
         if capacity > 0 {
@@ -1217,6 +1337,28 @@ impl Streamer {
                 }
                 Ok(())
             }
+            Some(ChunkedInFlight::StreamingRaw {
+                temp_file,
+                bytes_written,
+                expected_size,
+                ..
+            }) => {
+                if *bytes_written + chunk.len() as u64 > *expected_size {
+                    return Err(Error::Io(std::io::Error::other(format!(
+                        "chunked_item_chunk: body exceeds expected size {} > {}",
+                        *bytes_written + chunk.len() as u64,
+                        *expected_size
+                    ))));
+                }
+                let phase_start = Instant::now();
+                let r = temp_file
+                    .write_all(chunk)
+                    .map_err(|e| Error::Io(std::io::Error::other(format!("raw chunk write: {e}"))));
+                self.stats.streaming_encode += phase_start.elapsed();
+                r?;
+                *bytes_written += chunk.len() as u64;
+                Ok(())
+            }
         }
     }
 
@@ -1231,6 +1373,7 @@ impl Streamer {
                 mimetype: meta.mimetype,
                 content,
                 namespace: meta.namespace,
+                compress: meta.compress,
             }),
             Some(ChunkedInFlight::StreamingZstd {
                 meta,
@@ -1278,6 +1421,52 @@ impl Streamer {
                         .map_err(|e| Error::Decompression(format!("zstd finish: {e}")))?;
                     let bytes = file.metadata()?.len();
                     drop(file); // close the temp file
+                    Ok((temp_path_for_thread, bytes))
+                });
+                self.streaming_tasks.push(StreamingTask {
+                    cluster_idx,
+                    handle,
+                });
+                Ok(())
+            }
+            Some(ChunkedInFlight::StreamingRaw {
+                meta,
+                temp_file,
+                temp_path,
+                cluster_idx,
+                bytes_written,
+                expected_size,
+                mime_idx,
+            }) => {
+                if bytes_written != expected_size {
+                    return Err(Error::Io(std::io::Error::other(format!(
+                        "end_chunked_item: body size mismatch (got {}, expected {})",
+                        bytes_written, expected_size
+                    ))));
+                }
+                let title = if meta.title.is_empty() {
+                    meta.path.clone()
+                } else {
+                    meta.title
+                };
+                self.dirents.push(RawDirent::Article {
+                    namespace: meta.namespace.unwrap_or(b'C'),
+                    url: meta.path,
+                    title,
+                    mime_idx,
+                    cluster: cluster_idx,
+                    blob: 0,
+                });
+
+                // Raw passthrough has nothing to drain — close the
+                // temp file synchronously, record total bytes for
+                // finalize splice. Wrap in a JoinHandle-shaped task
+                // so `drain_streaming_tasks` can treat both variants
+                // uniformly.
+                let temp_path_for_thread = temp_path.clone();
+                let handle = std::thread::spawn(move || -> Result<(std::path::PathBuf, u64)> {
+                    let bytes = temp_file.metadata()?.len();
+                    drop(temp_file);
                     Ok((temp_path_for_thread, bytes))
                 });
                 self.streaming_tasks.push(StreamingTask {
@@ -1339,11 +1528,19 @@ impl Streamer {
     }
 
     /// Pick which bucket an item joins under the active strategy.
-    /// Pure function of `path` and `mimetype` — not of dynamic
-    /// state — so a given (item, strategy) always lands in the
-    /// same bucket regardless of arrival order.
-    fn bucket_key(&self, path: &str, mimetype: &str) -> String {
-        match self.cluster_strategy {
+    /// Pure function of `path`, `mimetype`, and the item's effective
+    /// compression — so two items with the same strategy key but
+    /// different effective compressions land in distinct buckets and
+    /// therefore distinct clusters. The compression tag goes first so
+    /// the BTreeMap iteration order interleaves cleanly when both
+    /// compressed and raw clusters exist.
+    fn bucket_key(
+        &self,
+        path: &str,
+        mimetype: &str,
+        compression: Compression,
+    ) -> String {
+        let strat = match self.cluster_strategy {
             ClusterStrategy::Single => String::new(),
             ClusterStrategy::ByMime => mimetype.to_string(),
             ClusterStrategy::ByExtension => match path.rsplit_once('.') {
@@ -1354,7 +1551,8 @@ impl Streamer {
                 Some((head, _)) => head.to_string(),
                 None => path.to_string(),
             },
-        }
+        };
+        format!("{}|{}", compression_tag(compression), strat)
     }
 
     /// Stream-process one item: bin-pack its body into the bucket
@@ -1371,7 +1569,8 @@ impl Streamer {
         let body_len = body.len();
         self.stats.items_buffered += 1;
         self.stats.raw_bytes_total += body_len as u64;
-        let key = self.bucket_key(&item.path, &item.mimetype);
+        let comp = effective_compression(self.compression, item.compress);
+        let key = self.bucket_key(&item.path, &item.mimetype, comp);
 
         // Ensure the bucket exists, then check overflow against
         // *this* bucket's running size (not a global running size).
@@ -1383,7 +1582,10 @@ impl Streamer {
             self.flush_bucket(&key)?;
         }
 
-        let bucket = self.buckets.entry(key).or_default();
+        let bucket = self
+            .buckets
+            .entry(key)
+            .or_insert_with(|| Bucket::with_compression(comp));
         let blob_idx = bucket.blobs.len() as u32;
         bucket.blobs.push(body);
         bucket.size_bytes += body_len;
@@ -1406,10 +1608,13 @@ impl Streamer {
     fn flush_bucket(&mut self, key: &str) -> Result<()> {
         let bucket = match self.buckets.remove(key) {
             Some(b) if !b.blobs.is_empty() => b,
-            // Empty bucket — nothing to do; reinsert default so the
-            // map shape is stable across call patterns.
-            Some(_) => {
-                self.buckets.insert(key.to_string(), Bucket::default());
+            // Empty bucket — nothing to do; reinsert empty so the
+            // map shape is stable across call patterns. Carry the
+            // bucket's recorded compression forward so the next item
+            // landing in this key keeps the same target compression.
+            Some(b) => {
+                self.buckets
+                    .insert(key.to_string(), Bucket::with_compression(b.compression));
                 return Ok(());
             }
             None => return Ok(()),
@@ -1433,9 +1638,13 @@ impl Streamer {
         // doesn't have to walk every queued cluster.
         let added_bytes: usize = bucket.blobs.iter().map(|b| b.len()).sum();
         self.pending_bytes += added_bytes;
-        self.pending_encode.push((cluster_idx, bucket.blobs));
-        // Reinsert empty bucket for reuse without map churn.
-        self.buckets.insert(key.to_string(), Bucket::default());
+        self.pending_encode
+            .push((cluster_idx, bucket.blobs, bucket.compression));
+        // Reinsert empty bucket for reuse without map churn — keep
+        // the same compression so subsequent items with this key
+        // continue to land in compatible clusters.
+        self.buckets
+            .insert(key.to_string(), Bucket::with_compression(bucket.compression));
 
         // Drain trigger: either we hit thread-pool size (CPU-
         // saturation default) OR the byte-cap is non-zero and the
@@ -1468,11 +1677,12 @@ impl Streamer {
         // total so subsequent flushes start from zero.
         self.pending_bytes = 0;
         let chunk_len = chunk.len() as u64;
-        let comp = self.compression;
         let level = self.compression_level;
         let mut encoded: Vec<(u32, Vec<u8>)> = chunk
             .into_par_iter()
-            .map(|(idx, blobs)| encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes)))
+            .map(|(idx, blobs, comp)| {
+                encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes))
+            })
             .collect::<Result<Vec<_>>>()?;
         encoded.sort_by_key(|(idx, _)| *idx);
         let mut bytes_written = 0u64;
@@ -1520,6 +1730,7 @@ impl Streamer {
                 mimetype: m.mimetype,
                 content: m.value,
                 namespace: Some(b'M'),
+                compress: None,
             })?;
         }
 
@@ -1532,6 +1743,7 @@ impl Streamer {
                 mimetype: "image/png".to_string(),
                 content: png,
                 namespace: Some(b'M'),
+                compress: None,
             })?;
         }
 
@@ -1559,6 +1771,7 @@ impl Streamer {
                 mimetype: "text/plain;charset=utf-8".to_string(),
                 content: counter_str.into_bytes(),
                 namespace: Some(b'M'),
+                compress: None,
             })?;
         }
 
@@ -1693,6 +1906,7 @@ impl Streamer {
                 mimetype: "application/octet-stream+zimlisting".to_string(),
                 content: listing_bytes,
                 namespace: Some(b'X'),
+                compress: None,
             })?;
             // Flush so the listing's cluster commits and its
             // dirent lands in `self.dirents` for the final sort
