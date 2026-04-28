@@ -1217,8 +1217,7 @@ impl Streamer {
             // Compression info-byte: zstd id (5) for the encoded
             // path or `1` (raw) for the passthrough path; OR with
             // the extended bit when blob offsets need 8 bytes.
-            let info_byte: u8 = if stream_zstd { 5 } else { 1 }
-                | if extended_4 { 0x10 } else { 0 };
+            let info_byte: u8 = if stream_zstd { 5 } else { 1 } | if extended_4 { 0x10 } else { 0 };
 
             // Per-item temp file. Each streamed item writes to its
             // own scratch file so multiple streaming-encode tasks
@@ -1274,9 +1273,9 @@ impl Streamer {
                 // Raw passthrough — write the ptr table directly into
                 // the temp file, then accept chunks straight to disk
                 // until expected_size is met.
-                tmp_file
-                    .write_all(&header)
-                    .map_err(|e| Error::Io(std::io::Error::other(format!("raw header write: {e}"))))?;
+                tmp_file.write_all(&header).map_err(|e| {
+                    Error::Io(std::io::Error::other(format!("raw header write: {e}")))
+                })?;
                 self.in_flight = Some(ChunkedInFlight::StreamingRaw {
                     meta,
                     temp_file: tmp_file,
@@ -1534,12 +1533,7 @@ impl Streamer {
     /// therefore distinct clusters. The compression tag goes first so
     /// the BTreeMap iteration order interleaves cleanly when both
     /// compressed and raw clusters exist.
-    fn bucket_key(
-        &self,
-        path: &str,
-        mimetype: &str,
-        compression: Compression,
-    ) -> String {
+    fn bucket_key(&self, path: &str, mimetype: &str, compression: Compression) -> String {
         let strat = match self.cluster_strategy {
             ClusterStrategy::Single => String::new(),
             ClusterStrategy::ByMime => mimetype.to_string(),
@@ -1643,8 +1637,10 @@ impl Streamer {
         // Reinsert empty bucket for reuse without map churn — keep
         // the same compression so subsequent items with this key
         // continue to land in compatible clusters.
-        self.buckets
-            .insert(key.to_string(), Bucket::with_compression(bucket.compression));
+        self.buckets.insert(
+            key.to_string(),
+            Bucket::with_compression(bucket.compression),
+        );
 
         // Drain trigger: either we hit thread-pool size (CPU-
         // saturation default) OR the byte-cap is non-zero and the
@@ -1680,9 +1676,7 @@ impl Streamer {
         let level = self.compression_level;
         let mut encoded: Vec<(u32, Vec<u8>)> = chunk
             .into_par_iter()
-            .map(|(idx, blobs, comp)| {
-                encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes))
-            })
+            .map(|(idx, blobs, comp)| encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes)))
             .collect::<Result<Vec<_>>>()?;
         encoded.sort_by_key(|(idx, _)| *idx);
         let mut bytes_written = 0u64;
