@@ -617,6 +617,7 @@ pub unsafe extern "C" fn zimru_creator_begin_item(
         title_str,
         mime_str,
         expected_size,
+        None,
     ) {
         Ok(()) => true,
         Err(e) => {

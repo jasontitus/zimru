@@ -363,6 +363,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                 e.rel_str.clone(),
                 mime,
                 Some(e.size),
+                None,
             )?;
             let mut buf = vec![0u8; 64 * 1024];
             loop {

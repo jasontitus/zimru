@@ -64,6 +64,7 @@ fn huge_item_streams_through_zstd_encoder_without_buffering() {
         "Huge".to_string(),
         "application/octet-stream".to_string(),
         Some(payload.len() as u64),
+        None,
     )
     .expect("begin_chunked_item");
     for chunk in payload.chunks(64 * 1024) {
@@ -156,6 +157,7 @@ fn small_chunked_item_uses_buffered_path_and_bin_packs() {
         "Small".to_string(),
         "application/octet-stream".to_string(),
         Some(body.len() as u64),
+        None,
     )
     .expect("begin_chunked_item");
     c.chunked_item_chunk(&body).expect("chunked_item_chunk");
