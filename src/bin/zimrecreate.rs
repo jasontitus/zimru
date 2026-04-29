@@ -149,6 +149,7 @@ fn print_help() {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     src: &str,
     dst: &str,
@@ -278,8 +279,7 @@ fn run(
     let blobs = indexer.finish(false);
     for blob in blobs {
         creator.add_item(
-            Item::in_namespace(b'X', blob.url, "", blob.mimetype, blob.bytes)
-                .with_compress(false),
+            Item::in_namespace(b'X', blob.url, "", blob.mimetype, blob.bytes).with_compress(false),
         );
     }
     let _ = std::fs::remove_dir_all(&index_tmp);

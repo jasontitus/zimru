@@ -51,10 +51,7 @@ pub struct IndexHelper {
 }
 
 enum State {
-    Active {
-        fulltext: Job,
-        title: Job,
-    },
+    Active { fulltext: Job, title: Job },
     Disabled,
 }
 
@@ -130,7 +127,9 @@ impl IndexHelper {
     /// is where the output files are written; the caller cleans it
     /// up.
     pub fn disabled() -> Self {
-        IndexHelper { state: State::Disabled }
+        IndexHelper {
+            state: State::Disabled,
+        }
     }
 
     pub fn spawn(
@@ -159,7 +158,9 @@ impl IndexHelper {
         let fulltext = match spawn_one(&bin, "fulltext", &fulltext_out, language) {
             Ok(j) => j,
             Err(e) => {
-                eprintln!("[zimwriterfs] xapianbuilder fulltext spawn failed: {e}; skipping indexes");
+                eprintln!(
+                    "[zimwriterfs] xapianbuilder fulltext spawn failed: {e}; skipping indexes"
+                );
                 return Self::disabled();
             }
         };
@@ -172,14 +173,18 @@ impl IndexHelper {
             }
         };
 
-        IndexHelper { state: State::Active { fulltext, title } }
+        IndexHelper {
+            state: State::Active { fulltext, title },
+        }
     }
 
     /// Feed one entry to the title index. Always called for content
     /// entries (title DB indexes everything in namespace C, regardless
     /// of mimetype).
     pub fn feed_title(&mut self, path: &str, title: &str, target_path: &str) {
-        let State::Active { title: t, .. } = &mut self.state else { return };
+        let State::Active { title: t, .. } = &mut self.state else {
+            return;
+        };
         let buf = encode_title_doc(path, title, target_path);
         write_raw(t, &buf);
     }
@@ -198,7 +203,9 @@ impl IndexHelper {
         if !mimetype.starts_with("text/html") {
             return;
         }
-        let State::Active { fulltext, .. } = &mut self.state else { return };
+        let State::Active { fulltext, .. } = &mut self.state else {
+            return;
+        };
         let buf = encode_fulltext_doc(path, title, mimetype, body, language);
         write_raw(fulltext, &buf);
     }
@@ -208,7 +215,13 @@ impl IndexHelper {
     /// without indexes, matching libzim's "indexes are best-effort"
     /// posture.
     pub fn finish(self, verbose: bool) -> Vec<IndexBlob> {
-        let State::Active { mut fulltext, mut title } = self.state else { return Vec::new() };
+        let State::Active {
+            mut fulltext,
+            mut title,
+        } = self.state
+        else {
+            return Vec::new();
+        };
 
         // Close stdin pipes so the children see EOF and finalise.
         fulltext.stdin.take();
@@ -222,10 +235,7 @@ impl IndexHelper {
                 Ok(out) if out.status.success() => match std::fs::read(&out_path) {
                     Ok(bytes) if !bytes.is_empty() => {
                         if verbose {
-                            eprintln!(
-                                "[zimwriterfs] xapianbuilder {url}: {} bytes",
-                                bytes.len()
-                            );
+                            eprintln!("[zimwriterfs] xapianbuilder {url}: {} bytes", bytes.len());
                         }
                         blobs.push(IndexBlob {
                             url,
@@ -235,9 +245,7 @@ impl IndexHelper {
                     }
                     Ok(_) => {
                         if verbose {
-                            eprintln!(
-                                "[zimwriterfs] xapianbuilder {url}: empty output, skipping"
-                            );
+                            eprintln!("[zimwriterfs] xapianbuilder {url}: empty output, skipping");
                         }
                     }
                     Err(e) => {
@@ -268,7 +276,9 @@ impl IndexHelper {
 }
 
 fn write_raw(job: &mut Job, buf: &[u8]) {
-    let Some(stdin) = job.stdin.as_mut() else { return };
+    let Some(stdin) = job.stdin.as_mut() else {
+        return;
+    };
     if let Err(e) = stdin.write_all(buf) {
         eprintln!(
             "[zimwriterfs] xapianbuilder {} stdin write failed: {e} (child likely exited)",
@@ -292,8 +302,10 @@ fn spawn_one(
     };
     let mut cmd = Command::new(bin);
     cmd.arg(subcommand)
-        .arg("--input").arg("-")
-        .arg("--output").arg(out_path)
+        .arg("--input")
+        .arg("-")
+        .arg("--output")
+        .arg(out_path)
         .arg("--quiet");
     if !language.is_empty() {
         cmd.arg("--language").arg(language);

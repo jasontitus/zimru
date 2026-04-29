@@ -8,3 +8,4 @@ Cargo.lock
 bench/parity-out/
 bench/upstream-out/
 bench/results-*.md
+.DS_Store
