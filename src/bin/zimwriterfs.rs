@@ -472,13 +472,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                 let body = std::str::from_utf8(&it.content)
                     .map(std::borrow::Cow::Borrowed)
                     .unwrap_or_else(|_| String::from_utf8_lossy(&it.content));
-                indexer.feed_fulltext(
-                    &it.rel_str,
-                    &it.title,
-                    &it.mime,
-                    &body,
-                    &language,
-                );
+                indexer.feed_fulltext(&it.rel_str, &it.title, &it.mime, &body, &language);
             }
             creator.add_item(Item::new(it.rel_str, it.title, it.mime, it.content));
             count += 1;
@@ -518,8 +512,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     let blobs = indexer.finish(o.verbose);
     for blob in blobs {
         creator.add_item(
-            Item::in_namespace(b'X', blob.url, "", blob.mimetype, blob.bytes)
-                .with_compress(false),
+            Item::in_namespace(b'X', blob.url, "", blob.mimetype, blob.bytes).with_compress(false),
         );
     }
     let _ = std::fs::remove_dir_all(&index_tmp);
