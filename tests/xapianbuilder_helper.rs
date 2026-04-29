@@ -1,6 +1,13 @@
 //! End-to-end test for the `zimwriterfs`/`zimrecreate` ↔ xapianbuilder
 //! integration. Skipped (with a notice) when xapianbuilder isn't on
 //! PATH so this test doesn't fail on minimal CI without the helper.
+//!
+//! The whole module is gated on the `writer` feature: `zimwriterfs` is
+//! a writer-feature binary, so under `--no-default-features` reader
+//! builds these tests have no binary to invoke and would hard-fail
+//! on `Command::new` rather than at the assertion level.
+
+#![cfg(feature = "writer")]
 
 use std::path::PathBuf;
 use std::process::Command;
