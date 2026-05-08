@@ -2254,11 +2254,39 @@ fn encode_cluster(
         Compression::None => (1u8, payload),
         Compression::Zstd => {
             let lvl = level.or_else(env_zstd_level).unwrap_or(3);
-            (
-                5u8,
-                zstd::stream::encode_all(&payload[..], lvl)
-                    .map_err(|e| Error::Decompression(format!("zstd encode: {e}")))?,
-            )
+            // Pin windowLog to ceil(log2(payload.len())). zstd's default
+            // windowLog at level >=20 is 27 (128 MiB window), regardless
+            // of input size. fzstd (the in-browser decoder used by the
+            // streetzim PWA) allocates a buffer of windowLog size per
+            // decompression, so a 128 MiB window for a 1 MiB cluster
+            // imposes 100×+ overhead per chunk fetch when the viewer
+            // typeahead fans out 256 parallel fetches. Pinning the
+            // window to the actual payload size brings the per-decode
+            // allocation down to a few MiB, matching libzim's default
+            // behaviour. Cap at 27 (the zstd / fzstd ceiling) just in
+            // case payloads ever exceed 128 MiB.
+            let payload_len = payload.len().max(1) as u64;
+            let mut window_log = 64 - (payload_len - 1).leading_zeros();
+            // zstd requires windowLog >= 10 (1 KiB). Anything below
+            // that wastes space; clamp.
+            if window_log < 10 { window_log = 10; }
+            if window_log > 27 { window_log = 27; }
+            let mut buf = Vec::new();
+            {
+                let mut enc = zstd::stream::Encoder::new(&mut buf, lvl)
+                    .map_err(|e| Error::Decompression(format!("zstd encoder: {e}")))?;
+                // Use the parameter API to pin window_log so the frame
+                // header records the actual size. zstd-rs exposes this
+                // via `set_parameter(WindowLog, n)`.
+                enc.set_parameter(zstd::stream::raw::CParameter::WindowLog(window_log))
+                    .map_err(|e| Error::Decompression(format!("zstd window_log: {e}")))?;
+                use std::io::Write as _;
+                enc.write_all(&payload)
+                    .map_err(|e| Error::Decompression(format!("zstd write: {e}")))?;
+                enc.finish()
+                    .map_err(|e| Error::Decompression(format!("zstd finish: {e}")))?;
+            }
+            (5u8, buf)
         }
         Compression::Xz => {
             let lvl = level.unwrap_or(3).clamp(0, 9) as u32;
