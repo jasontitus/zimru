@@ -378,13 +378,27 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
 
         // Big non-HTML file → chunked-streaming path one-at-a-time.
         if !needs_full_read(e) && e.size >= STREAMING_THRESHOLD_BIN {
-            let mime = mime_for_path(&e.path);
+            let mut f = fs::File::open(&e.path)?;
+            // Extension first, content sniff for extensionless files
+            // (rewinding afterwards so the streaming loop sees the
+            // whole body).
+            let mime = match e.path.extension() {
+                Some(_) => mime_for_path(&e.path),
+                None => {
+                    use std::io::Seek as _;
+                    let mut head = [0u8; 1024];
+                    let n = f.read(&mut head)?;
+                    f.seek(std::io::SeekFrom::Start(0))?;
+                    sniff_mime(&head[..n])
+                        .unwrap_or("application/octet-stream")
+                        .to_string()
+                }
+            };
             let compress_hint = if should_compress(&mime) {
                 None
             } else {
                 Some(false)
             };
-            let mut f = fs::File::open(&e.path)?;
             // Hint the kernel: we're about to read this whole
             // file sequentially. On Linux this turns on aggressive
             // readahead and drops pages behind us; on macOS it
@@ -446,12 +460,21 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                         }
                     }
                 }
-                let title = if e.is_html {
+                // Resolve the mimetype: extension first, then content
+                // sniff for extensionless files (dumped wiki articles).
+                let mime = match e.path.extension() {
+                    Some(_) => mime_for_path(&e.path),
+                    None => sniff_mime(&content)
+                        .unwrap_or("application/octet-stream")
+                        .to_string(),
+                };
+                // HTML gets its title from the <title> tag whether the
+                // file was recognised by extension or by sniffing.
+                let title = if e.is_html || mime.starts_with("text/html") {
                     derive_title_from_bytes(&content).unwrap_or_else(|| e.rel_str.clone())
                 } else {
                     e.rel_str.clone()
                 };
-                let mime = mime_for_path(&e.path);
                 Ok(ReadyItem {
                     rel_str: e.rel_str.clone(),
                     title,
@@ -714,6 +737,69 @@ fn mime_for_path(p: &Path) -> String {
         }
     }
     "application/octet-stream".to_string()
+}
+
+/// Best-effort content sniff for files whose extension didn't resolve
+/// a mimetype. The big real-world case is `zimdump dump` output, where
+/// every wiki article is an extensionless HTML file — upstream
+/// zimwriterfs resolves those through libmagic; without sniffing they
+/// were mislabelled `application/octet-stream`, which broke fulltext
+/// indexing, title extraction, link checking, and (with mime-driven
+/// cluster compression) routed all article text into raw clusters.
+fn sniff_mime(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if head.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if head.starts_with(b"GIF8") {
+        return Some("image/gif");
+    }
+    if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if head.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if head.starts_with(b"%PDF") {
+        return Some("application/pdf");
+    }
+    if head.starts_with(b"\x1f\x8b") {
+        return Some("application/gzip");
+    }
+    // Text-ish sniff over the first KB.
+    let window = &head[..head.len().min(1024)];
+    let text = String::from_utf8_lossy(window);
+    let lower = text.to_ascii_lowercase();
+    let trimmed = lower.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
+    if trimmed.starts_with("<!doctype html")
+        || trimmed.starts_with("<html")
+        || lower.contains("<head")
+        || lower.contains("<body")
+    {
+        return Some("text/html");
+    }
+    if trimmed.starts_with("<svg") {
+        return Some("image/svg+xml");
+    }
+    if trimmed.starts_with("<?xml") {
+        // Could be SVG with an XML prolog.
+        return if lower.contains("<svg") {
+            Some("image/svg+xml")
+        } else {
+            Some("application/xml")
+        };
+    }
+    let utf8_ok = match std::str::from_utf8(window) {
+        Ok(_) => true,
+        // A multibyte char split at the window edge is fine.
+        Err(e) => e.error_len().is_none(),
+    };
+    if !window.is_empty() && !window.contains(&0) && utf8_ok {
+        return Some("text/plain");
+    }
+    None
 }
 
 /// Pull `<title>...</title>` out of an HTML body the caller already
