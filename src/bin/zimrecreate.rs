@@ -10,9 +10,10 @@
 //!
 //! Options:
 //!   -v, --version              print software version
-//!   -j, --withoutFTIndex       don't build a fulltext index (always on
-//!                              in zimru — we don't have a fulltext indexer yet)
-//!   -J, --threads <number>     ignored (single-threaded writer for now)
+//!   -j, --withoutFTIndex       don't build fulltext/title indexes (when
+//!                              omitted, indexes are built via the external
+//!                              `xapianbuilder` helper if it is on $PATH)
+//!   -J, --threads <number>     encode worker pool size (default: one per CPU)
 //!   --compression none|zstd|xz choose cluster compression (default zstd)
 //!   --compression-level N      compression level (zstd: 1..=22, xz: 0..=9)
 //!   --cluster-size BYTES       cluster size target (default 2MiB)
@@ -59,7 +60,15 @@ fn main() -> ExitCode {
                 xapianbuilder_path = args.get(i).map(PathBuf::from);
             }
             "-J" | "--threads" => {
-                i += 1; // consume value, ignore
+                i += 1;
+                if let Some(n) = args.get(i).and_then(|s| s.parse::<usize>().ok()) {
+                    // Sizes the writer's encode worker pool (and the
+                    // cluster-grouped source reads). Ignore failure —
+                    // it just means a pool was already initialised.
+                    let _ = rayon::ThreadPoolBuilder::new()
+                        .num_threads(n)
+                        .build_global();
+                }
             }
             "--compression" => {
                 i += 1;
@@ -145,7 +154,7 @@ fn main() -> ExitCode {
 
 fn print_help() {
     println!(
-        "\nzimrecreate recreates a ZIM file from an existing ZIM.\n\nUsage: zimrecreate ORIGIN_FILE OUTPUT_FILE [Options]\nOptions:\n\t-v, --version              print software version\n\t-j, --withoutFTIndex       don't create a fulltext index (always)\n\t-J, --threads <number>     ignored\n\t--compression C            one of: none | zstd | xz  (default zstd)\n\t--compression-level N      compression level (zstd: 1..=22, xz: 0..=9)\n\t--cluster-size BYTES       cluster size target (default 2097152)\n"
+        "\nzimrecreate recreates a ZIM file from an existing ZIM.\n\nUsage: zimrecreate ORIGIN_FILE OUTPUT_FILE [Options]\nOptions:\n\t-v, --version              print software version\n\t-j, --withoutFTIndex       don't create a fulltext index (always)\n\t-J, --threads <number>     encode worker pool size (default: one per CPU)\n\t--compression C            one of: none | zstd | xz  (default zstd)\n\t--compression-level N      compression level (zstd: 1..=22, xz: 0..=9)\n\t--cluster-size BYTES       cluster size target (default 2097152)\n"
     );
 }
 

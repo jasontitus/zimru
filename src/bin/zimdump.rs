@@ -562,7 +562,9 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
         .map(|((c, b, r), e)| (c, b, r, e))
         .collect();
     arts.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-    let mut groups: Vec<(u32, Vec<(u32, String, bool)>)> = Vec::new();
+    // One group per source cluster: (blob_idx, rel_path, exiled).
+    type ClusterGroup = (u32, Vec<(u32, String, bool)>);
+    let mut groups: Vec<ClusterGroup> = Vec::new();
     for (cluster, blob, rel, exiled) in arts {
         match groups.last_mut() {
             Some((c, v)) if *c == cluster => v.push((blob, rel, exiled)),

@@ -189,10 +189,11 @@ pub struct MetadataEntry {
 /// * how many items took each routing path
 ///   (`add_item` buffered, chunked-buffered, chunked-streamed),
 /// * how many clusters of each flavour ended up on disk
-///   (parallel-batch encoded buckets, streamed huge items),
+///   (pipeline-encoded buckets, streamed huge items),
 /// * total time spent in each phase
-///   (bucket flush + parallel encode, streaming-encode, table
-///   write, MD5 trailer, post-write verify),
+///   (pipeline encode busy-time summed across workers,
+///   streaming-encode, table write, MD5 trailer, post-write
+///   verify),
 /// * raw input bytes vs compressed output bytes (compression
 ///   ratio).
 #[derive(Default, Debug)]
@@ -279,30 +280,27 @@ impl BuildStats {
 /// cluster to the item and streams its bytes through a zstd encoder
 /// straight to disk).
 ///
-/// Trade-off (measured on `texas-unpacked` at zstd 19):
+/// Trade-off (originally measured on `texas-unpacked` at zstd 19):
 ///
 /// * **Buffered path**: each item gets its own cluster (since it
-///   busts the 2 MiB bin-pack target), enters the
-///   `pending_encode` queue, and is encoded in a parallel batch
-///   of `rayon::current_num_threads()` clusters. Peak memory is
-///   `threads × max_item_size + encoded_output`. Wall-time is
-///   excellent — 8 cores compress 8 clusters simultaneously at
-///   full speed.
-/// * **Streaming-encode path**: zstd encoder owns the file across
-///   chunked feeds; uses zstdmt internally to parallelise within
-///   one frame. Memory is bounded at ~zstd-encoder-state (~50 MB)
-///   regardless of item size. But streaming-encodes are
-///   **serial across items** — only one in flight at a time —
-///   so 534 medium-large items end up encoded sequentially, which
-///   dominated 76% of total wall on the texas run.
+///   busts the 2 MiB bin-pack target) and is handed to the
+///   continuous encode pipeline, where one worker per CPU
+///   compresses clusters concurrently. Peak memory is
+///   `queued_clusters × max_item_size + encoded_output`. Wall-time
+///   is excellent — every core compresses a cluster at full speed.
+/// * **Streaming-encode path**: chunks feed a zstd encoder writing
+///   to a per-item temp file; zstdmt parallelises within the one
+///   frame. Memory is bounded at ~zstd-encoder-state (~50 MB)
+///   regardless of item size, but per-item encoder setup and the
+///   finalize-time splice make it the slower path for items that
+///   could have been buffered.
 ///
-/// Conclusion: streaming-encode is only worth its serialising
-/// cost on items so big that buffering them would blow the memory
-/// budget. We pick 256 MiB as the cutoff: items below that go
-/// through the parallel-batch path (memory peak ~`8 × 256 MiB =
-/// 2 GiB` during encode bursts, totally fine), only truly huge
-/// items (e.g. texas's 1.74 GB `addr.json` and 516 MB `poi.json`)
-/// take the slow-but-low-memory streaming path.
+/// Conclusion: streaming-encode is only worth it on items so big
+/// that buffering them would blow the memory budget. We pick
+/// 256 MiB as the cutoff: items below that go through the pipeline
+/// (memory peak `~workers × 256 MiB` worst case, fine), only truly
+/// huge items (e.g. texas's 1.74 GB `addr.json` and 516 MB
+/// `poi.json`) take the bounded-memory streaming path.
 pub(crate) const STREAMING_ENCODE_THRESHOLD: usize = 256 * 1024 * 1024;
 
 /// Builder for a chunked-input item — see [`Creator::begin_item`].
@@ -382,8 +380,8 @@ pub(crate) enum ChunkedInFlight {
     /// a per-item *temp file* (not the main output). At
     /// `end_chunked_item` we hand the encoder + temp-file path off
     /// to a background thread that calls `finish()` while the
-    /// producer continues with subsequent items / parallel-batch
-    /// encode of buckets. At `finalize` we join the background
+    /// producer continues with subsequent items / feeding the
+    /// encode pipeline. At `finalize` we join the background
     /// threads and concat each completed temp file into the main
     /// output in cluster_idx order, then delete the temps.
     StreamingZstd {
@@ -517,12 +515,11 @@ pub struct Creator {
     compression: Compression,
     compression_level: Option<i32>,
     cluster_size_target: usize,
-    /// Soft cap on bytes queued for parallel-batch encode at any
-    /// time. `0` means "unlimited" (drain only when the queue hits
-    /// `rayon::current_num_threads()` clusters, the default).
-    /// Setting a non-zero value forces an early drain whenever the
-    /// queue's running total exceeds the cap — trades wall-time
-    /// parallelism for a tighter peak-RSS bound.
+    /// Soft cap on raw bytes queued ahead of the encode workers.
+    /// `0` means "default" (2 queued clusters per worker). A
+    /// non-zero value sizes the pipeline's bounded job channel so
+    /// queued-but-unencoded clusters stay under the cap — trades
+    /// encoder utilisation for a tighter peak-RSS bound.
     max_in_flight_bytes: usize,
     uuid: [u8; 16],
     cluster_strategy: ClusterStrategy,
@@ -813,25 +810,20 @@ impl Creator {
         self
     }
 
-    /// Soft cap on the number of raw bytes queued in the
-    /// parallel-batch encode pipeline at any time. Zero (the
-    /// default) means "drain only when the queue hits
-    /// `rayon::current_num_threads()` clusters" — i.e. saturate
-    /// CPU at the cost of a wider memory footprint.
+    /// Soft cap on the number of raw bytes queued ahead of the
+    /// encode workers. Zero (the default) sizes the pipeline's
+    /// bounded job channel at 2 queued clusters per worker — enough
+    /// look-ahead that encoders never starve while the producer
+    /// reads source data.
     ///
-    /// A non-zero value forces an early drain whenever the
-    /// queue's accumulated bytes cross the cap, trading
-    /// parallel-batch CPU saturation for a tighter peak RSS.
-    /// Useful in memory-constrained environments (Kiwix
-    /// zimfarm worker, embedded builds): for example pass
-    /// `512 * 1024 * 1024` to keep the parallel-batch buffer
-    /// under ~512 MiB on top of zimru's other in-process state
-    /// (~few hundred MB).
-    ///
-    /// Note: encode batches run on a background thread overlapped
-    /// with item production, so up to two batches can be resident
-    /// at once (one encoding, one accumulating) — size the cap
-    /// accordingly (peak ≈ 2 × cap).
+    /// A non-zero value re-sizes that channel so the raw clusters
+    /// waiting to be compressed stay under the cap, trading encoder
+    /// utilisation for a tighter peak RSS. Useful in
+    /// memory-constrained environments (Kiwix zimfarm worker,
+    /// embedded builds): for example pass `512 * 1024 * 1024` to
+    /// keep the queue under ~512 MiB on top of zimru's other
+    /// in-process state. Clusters being actively compressed (one
+    /// per worker) are additional to the cap.
     pub fn set_max_in_flight_bytes(&mut self, bytes: usize) -> &mut Self {
         self.max_in_flight_bytes = bytes;
         self
@@ -1350,9 +1342,9 @@ impl Streamer {
             // at finalize, when we splice the temp file's bytes into
             // the main output). No need to drain or flush anything
             // here: the streaming target is the per-item temp file,
-            // so the in-flight bucket / parallel-batch queue can keep
-            // doing whatever it was doing — they write to `self.file`,
-            // we write somewhere else.
+            // so the in-flight buckets / encode pipeline can keep
+            // doing whatever they were doing — they write to
+            // `self.file`, we write somewhere else.
             let cluster_idx = self.cluster_offsets.len() as u32;
             self.cluster_offsets.push(0);
 
@@ -1378,8 +1370,8 @@ impl Streamer {
 
             // Per-item temp file. Each streamed item writes to its
             // own scratch file so multiple streaming-encode tasks
-            // can run concurrently AND the parallel-batch path can
-            // keep writing to the main output while we feed.
+            // can run concurrently AND the encode pipeline can keep
+            // writing to the main output while we feed.
             //
             // The scratch file lives next to the output, NOT in
             // `std::env::temp_dir()`: streamed items are ≥256 MiB by
@@ -1588,7 +1580,7 @@ impl Streamer {
                 // Hand the encoder + temp path off to a background
                 // thread that drains it via `finish()`. The producer
                 // can immediately begin the next chunked item or
-                // continue feeding the parallel-batch path. The bg
+                // continue feeding the encode pipeline. The bg
                 // thread also returns the final compressed-byte
                 // count so finalize knows how many bytes to splice.
                 let temp_path_for_thread = temp_path.clone();
@@ -1793,10 +1785,9 @@ impl Streamer {
 
     /// Allocate a cluster_idx for this bucket's accumulated blobs,
     /// commit the bucket's pending dirents with that cluster_idx,
-    /// and queue the raw blobs for parallel-batch encoding. The
-    /// actual encode + write happens in `drain_pending_encode` when
-    /// the queue fills (typically at `rayon::current_num_threads()`
-    /// entries) or at finalize.
+    /// and hand the raw blobs to the encode pipeline, which
+    /// compresses on worker threads and writes from its own writer
+    /// thread; everything is on disk after `shutdown_pipeline`.
     fn flush_bucket(&mut self, key: &str) -> Result<()> {
         let bucket = match self.buckets.remove(key) {
             Some(b) if !b.blobs.is_empty() => b,

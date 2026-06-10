@@ -192,6 +192,12 @@ impl IndexHelper {
     /// Feed one entry to the fulltext index. Skip non-HTML entries:
     /// libzim's fulltext indexer only sees `text/html` (everything
     /// else has `hasIndexData() == false`).
+    ///
+    /// `title` must be the entry's RAW title, exactly as it will be
+    /// stored in the dirent. Since xapianbuilder's 2026-06 writer
+    /// improvements the helper does its own normalisation for
+    /// fulltext mode — callers must not pre-strip/fold titles (doing
+    /// so would make the indexed title diverge from the stored one).
     pub fn feed_fulltext(
         &mut self,
         path: &str,

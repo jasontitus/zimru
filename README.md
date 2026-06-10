@@ -10,8 +10,9 @@ format spec] and validated against real-world ZIM files.
 
 ## At a glance
 
-- **48 tests + 6 doctests pass** (unit + synthetic-zim + ergonomic-API +
-  writer round-trip + zimwriterfs e2e + real-file integration + doc tests).
+- **81 tests + 7 doctests pass** (unit + synthetic-zim + ergonomic-API +
+  writer round-trip + streaming-encode + per-item-compression +
+  zimwriterfs e2e + real-file integration + doc tests).
 - **7 binaries**: `zimru`, plus drop-in replacements for `zimcheck`,
   `zimdump`, `zimbench`, `zimsplit`, `zimrecreate`, `zimwriterfs`. All
   accept upstream `zim-tools` 3.6.0 flags.
@@ -19,8 +20,14 @@ format spec] and validated against real-world ZIM files.
   across 3 different ZIM archives (English mini, Chinese chemistry mini,
   1.1 GB Bashkir).
 - **Faster than upstream on every comparable workload** measured on the
-  1.1 GB Bashkir Wikipedia: `zimcheck -A` 8.27×, `zimcheck -R` 8.44×,
-  `zimcheck -C` 1.12×, `zimdump info` 2.73×, `zimrecreate` 19–59×.
+  1.1 GB Bashkir Wikipedia (full round trip vs official zim-tools 3.6.0
+  binaries — see [the benchmark](docs/bashkir-roundtrip-bench.md)):
+  `zimdump dump` 3.5×, `zimrecreate` 35× at default settings and
+  **1.49× with ~2% smaller output at matched zstd level 19**;
+  `zimcheck -A` 8.27×, `zimcheck -R` 8.44×, `zimdump info` 2.73×.
+  Upstream zimwriterfs could not complete the same 153 k-file build at
+  any thread count (fd exhaustion); zimru's finishes in 9 s (zstd 3) /
+  209 s (zstd 19).
 - **Writer validated end-to-end on 8 diverse real ZIMs** (1.8 MB → 1.1 GB,
   6 languages, 6 source projects). 8/8 round-trip with byte-perfect blob
   content; on the 6 that are clean to begin with, both source and our
@@ -276,8 +283,8 @@ drop-in replacements for the upstream `zim-tools` family:
 | `zimdump`     | `zim-tools/zimdump`       | `info` / `list` / `list --details` / `show` / `dump`. **2.73× faster on `info`.** |
 | `zimbench`    | `zim-tools/zimbench`      | `-n` / `-r` / `-d` flags. Upstream's random-URL phase crashes; ours runs to completion. |
 | `zimsplit`    | `zim-tools/zimsplit`      | byte-aligned split (concat reproduces original)                       |
-| `zimrecreate` | `zim-tools/zimrecreate`   | reads source, writes new archive. Output passes upstream `zimcheck -A`. **19–59× faster than upstream.** |
-| `zimwriterfs` | `zim-tools/zimwriterfs`   | packs an HTML directory tree into a ZIM. Side-by-side parity with upstream output. |
+| `zimrecreate` | `zim-tools/zimrecreate`   | reads source cluster-grouped, writes new archive preserving per-cluster compression. Output passes upstream `zimcheck -A`. **35× faster than upstream at defaults, 1.49× at matched zstd 19 (with smaller output).** |
+| `zimwriterfs` | `zim-tools/zimwriterfs`   | packs an HTML directory tree into a ZIM: symlinks → redirects, content-sniffed mimetypes for extensionless files, mime-driven cluster compression. Completes 153 k-file builds upstream dies on (fd exhaustion). |
 
 ```sh
 cargo build --release
@@ -376,12 +383,27 @@ Writer features:
 - **Bin-packed clusters** — items are greedily grouped until the running
   payload hits `cluster_size_target` bytes (default 2 MiB, same as
   upstream `zimwriterfs`).
+- **Continuous parallel encode pipeline** — cluster compression runs on
+  one worker thread per CPU while a dedicated writer thread appends
+  encoded clusters in completion order, fully overlapped with item
+  production. At zstd 19 on a 3 GB corpus the encoders sustain ~97% of
+  available CPU, which is what makes zimru's high-compression builds
+  faster than libzim's.
 - **Compression**: `Compression::None`, `Compression::Zstd` (default),
-  `Compression::Xz`.
+  `Compression::Xz`. Per-item override via `Item::with_compress(false)`
+  routes already-compressed payloads (JPEG, video, …) into raw clusters.
+  zstd frames carry the frame-content-size header so readers (zimru,
+  libzim, fzstd) can pre-allocate exact decode buffers.
+- **Streaming mode** — `start_writing()` / `finish_writing()` bin-packs
+  and encodes as items arrive; only dirent metadata stays resident.
+  Items ≥256 MiB stream through a chunked encoder bounded at
+  ~encoder-state memory.
 - **Namespaces**: content in `C`, metadata and illustrations in `M`, the
   main-page redirect in `W`. Output uses version 5.1 (new namespaces,
   in-header title pointer list, MD5 trailer) — readable by libzim 8+.
-- **MD5 checksum** is appended automatically.
+- **MD5 checksum** is appended automatically, followed by a structural
+  post-write verify (pointer tables, dirent order, title index,
+  mimetypes) so a successful build is guaranteed readable.
 - **Redirect resolution** happens at finalize time — a dangling redirect
   target returns an error instead of silently corrupting the file.
 - **UUID preservation** — `set_uuid(uuid)` lets `zimrecreate` carry the
@@ -421,9 +443,14 @@ All upstream flags are accepted (`-w/--welcome`, `-I/--illustration`,
 `-l/--language`, `-n/--name`, `-t/--title`, `-d/--description`,
 `-c/--creator`, `-p/--publisher`, plus `-L/-m/-J/-x/-r/-j/-a/-e/-o/-s`
 optional ones), so existing build scripts that drive `zimwriterfs` can
-swap binaries with no other changes. `-J/--threads` is currently no-op
-(single-threaded writer). Mime detection is by file extension (no
-libmagic dependency).
+swap binaries with no other changes. `-J/--threads` sizes the encode
+worker pool (default: one per CPU). Symlinks are converted into ZIM
+redirects, matching upstream. Mime detection is by file extension with
+a content sniff (HTML/SVG/XML markers, common image/audio magic bytes,
+UTF-8 text check) for extensionless files — no libmagic dependency —
+and drives per-item cluster compression: text-like content is
+compressed, already-compressed media goes into raw clusters, same as
+libzim's hints.
 
 Tested side-by-side with upstream `zimwriterfs`: the same source
 directory produces ZIMs with the same C-namespace path set, both pass
@@ -451,6 +478,14 @@ Speedups range from **19× to 59×** vs upstream (`upstream / zimru` time).
 Both produce green `zimcheck -A` on every input. Output sizes are
 comparable (within ±25%, depending on which compression preset
 outperforms the source).
+
+At scale and at matched compression the gap is smaller but still real:
+on the 1.1 GB Bashkir Wikipedia, `zimru zimrecreate --compression-level
+19` finishes in **214.8 s vs upstream's 320.5 s (1.49×)** with ~2%
+smaller output, both running 4 threads — see
+[docs/bashkir-roundtrip-bench.md](docs/bashkir-roundtrip-bench.md) for
+the full methodology, including the dump → zimwriterfs round trip that
+upstream zimwriterfs cannot complete.
 
 ### `zimrecreate` validated across diverse real-world archives
 
@@ -497,6 +532,9 @@ content). Hardware: shared linux container; results are warm-cache means of
 | `zimcheck -R` (decompress + MD5 every blob) | 18.28 s         | 2.19 s         | **8.44×**    |
 | `zimcheck -A` (full sweep)                | 57.27 s           | 6.93 s         | **8.27×**    |
 | `zimdump info` (cold-style header parse)  | 4.3 ms            | 1.6 ms         | **2.73×**    |
+| `zimdump dump --redirect` (export 175 k files) | 19.1 s       | 4.2–5.5 s      | **~3.5–4.5×**|
+| `zimrecreate` (defaults)                  | 320.5 s (zstd 19) | 9.0 s (zstd 3) | **35×**      |
+| `zimrecreate --compression-level 19`      | 320.5 s           | 214.8 s        | **1.49×**    |
 | `zimru readall` (decompress only)         | n/a               | 4.20 s         | —            |
 | `zimbench` (n=1000)                       | ~~n/a~~ (crashes) | 1.95 s (full)  | —            |
 
@@ -655,13 +693,14 @@ Run the full suite:
 cargo test --release
 ```
 
-Test breakdown (**54 tests + 7 doctests pass**):
+Test breakdown (**81 tests + 7 doctests pass**, plus C-ABI smoke
+binaries under the `cffi` feature):
 
 - **Unit tests** (`src/*.rs`, 20 tests) — synthetic byte-level round-trips
   for the header, MIME list, dirent, and cluster (uncompressed / zstd / xz
   / extended offsets / unsupported-compression rejection) parsers, plus
   `Uuid` Display/FromStr round-trips and malformed-input rejection.
-- **Synthetic ZIM end-to-end** (`tests/synthetic_zim.rs`, 4 tests) — builds
+- **Synthetic ZIM end-to-end** (`tests/synthetic_zim.rs`, 10 tests) — builds
   spec-compliant ZIM files in memory (header → mime list → URL/title/cluster
   pointer lists → dirents → cluster → MD5 trailer) and exercises the public
   `Archive` API against them. Covers redirect following, loop guard,
@@ -672,7 +711,7 @@ Test breakdown (**54 tests + 7 doctests pass**):
   / `content_entries` / `by_prefix` / `namespace_range` / `summary` /
   `par_iter_by_path` / `par_clusters` / `Item::text/bytes/is_html` /
   `Blob::as_str/reader/Deref` / `Entry::item/resolve/Display`).
-- **Writer round-trip** (`tests/writer_roundtrip.rs`, 8 tests) — builds
+- **Writer round-trip** (`tests/writer_roundtrip.rs`, 9 tests) — builds
   ZIMs through `Creator`, reopens them with our reader, and (when
   upstream zim-tools is installed) cross-validates each output with
   `upstream zimcheck -A`/`-C`/`-M`/`-P` and `upstream zimdump info/list`.
@@ -689,10 +728,26 @@ Test breakdown (**54 tests + 7 doctests pass**):
   and verifies the same C-namespace path set.
 - **`zimdump analyze` end-to-end** (`tests/zimdump_analyze.rs`, 3 tests)
   — builds a multi-cluster ZIM, runs the `zimdump analyze` binary, and
-  asserts that cluster byte ranges sum exactly to the on-disk cluster
-  region, that the per-cluster table prints one row per cluster + a
-  TOTAL row, and that `--by-item` lists every article and skips
-  redirects.
+  asserts that cluster byte ranges tile the on-disk cluster region with
+  no gaps or overlaps in file order (cluster index order is not
+  guaranteed to match disk order), that the per-cluster table prints
+  one row per cluster + a TOTAL row, and that `--by-item` lists every
+  article and skips redirects.
+- **Integrity checks** (`tests/integrity_checks.rs`, 9 tests) — each
+  structural check (`check_dirent_ptrs` / `check_dirent_order` /
+  `check_title_index` / `check_cluster_ptrs` / `check_mimetypes`)
+  against both valid archives and deliberately corrupted ones.
+- **Streaming encode** (`tests/streaming_encode_smoke.rs`, 2 tests) —
+  chunked items below the threshold bin-pack normally; huge items
+  stream through the bounded-memory zstd encoder and read back intact.
+- **Per-item compression** (`tests/per_item_compression.rs`, 3 tests) —
+  `Item::with_compress(false)` routes items into raw clusters that
+  coexist with compressed ones in a single archive.
+- **Direct access** (`tests/direct_access.rs`, 3 tests) — blob offsets
+  reported for uncompressed clusters point at the exact on-disk bytes.
+- **xapianbuilder helper** (`tests/xapianbuilder_helper.rs`, 3 tests) —
+  the external index-builder hand-off used by `zimwriterfs` /
+  `zimrecreate` when index building is requested.
 - **Real-file integration** (`tests/real_files.rs`, 3 tests) — runs
   against actual Wikipedia ZIM files placed under `zim-cache/`. The
   files are NOT in this repo. Each test verifies the trailing MD5
