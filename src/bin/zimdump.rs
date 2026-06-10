@@ -561,7 +561,7 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
         .zip(exiled_articles)
         .map(|((c, b, r), e)| (c, b, r, e))
         .collect();
-    arts.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    arts.sort_unstable_by_key(|a| (a.0, a.1));
     // One group per source cluster: (blob_idx, rel_path, exiled).
     type ClusterGroup = (u32, Vec<(u32, String, bool)>);
     let mut groups: Vec<ClusterGroup> = Vec::new();
