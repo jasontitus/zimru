@@ -39,6 +39,13 @@ use crate::header::{HEADER_SIZE, MAGIC};
 /// (2 MiB — same as libzim's zimwriterfs default).
 pub const DEFAULT_CLUSTER_SIZE_TARGET: usize = 2 * 1024 * 1024;
 
+/// Default zstd compression level when the caller pins none and no
+/// `ZSTD_CLEVEL` env override is set. Level 19 is the high-ratio
+/// default we benchmark against libzim (still ~1.5× faster than
+/// libzim at the same level); callers wanting fast-but-large output
+/// can drop it via [`Creator::set_compression_level`] or `ZSTD_CLEVEL`.
+pub const DEFAULT_ZSTD_LEVEL: i32 = 19;
+
 /// Default mimetype recorded for [`Creator::add_metadata`] entries when
 /// the caller does not specify one. Most ZIM metadata keys are short
 /// UTF-8 strings (Title, Language, Description, …); the explicit-mime
@@ -795,7 +802,7 @@ impl Creator {
     ///
     /// Range and meaning depend on the algorithm:
     /// * `Compression::Zstd` — accepts `1..=22` (libzstd's normal range, plus
-    ///   negative "fast" levels). The default is `3`.
+    ///   negative "fast" levels). The default is `19` ([`DEFAULT_ZSTD_LEVEL`]).
     /// * `Compression::Xz`   — accepts `0..=9`. The default is `3`.
     /// * `Compression::None` — ignored.
     ///
@@ -1409,7 +1416,7 @@ impl Streamer {
                     std::env::var("ZSTD_CLEVEL")
                         .ok()
                         .and_then(|v| v.parse().ok())
-                        .unwrap_or(3)
+                        .unwrap_or(DEFAULT_ZSTD_LEVEL)
                 });
                 let mut encoder = zstd::stream::Encoder::new(tmp_file, level)
                     .map_err(|e| Error::Decompression(format!("zstd init: {e}")))?;
@@ -2436,8 +2443,8 @@ fn encode_cluster(
     // When the caller didn't pin a compression level, honour
     // `ZSTD_CLEVEL` / `XZ_DEFAULTS` env vars so cross-stack tooling
     // can configure both real libzim (which respects libzstd's env)
-    // and zimru with the same one-liner. Falls back to a fast level
-    // 3 default for zstd / 3 for xz when no env var is set.
+    // and zimru with the same one-liner. Falls back to the high-ratio
+    // zstd default (DEFAULT_ZSTD_LEVEL) / 3 for xz when no env var is set.
     fn env_zstd_level() -> Option<i32> {
         std::env::var("ZSTD_CLEVEL")
             .ok()
@@ -2446,7 +2453,7 @@ fn encode_cluster(
     match compression {
         Compression::None => unreachable!("handled above"),
         Compression::Zstd => {
-            let lvl = level.or_else(env_zstd_level).unwrap_or(3);
+            let lvl = level.or_else(env_zstd_level).unwrap_or(DEFAULT_ZSTD_LEVEL);
             // Pin windowLog to ceil(log2(payload.len())). zstd's default
             // windowLog at level >=20 is 27 (128 MiB window), regardless
             // of input size. fzstd (the in-browser decoder used by the

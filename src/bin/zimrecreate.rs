@@ -258,9 +258,20 @@ fn run(
                         title.to_string(),
                         target_path.clone(),
                     );
-                    // Redirects also belong in the title index, with
-                    // the target stored in value slot 1.
-                    indexer.feed_title(path, title, &target_path);
+                    // Redirects belong in the title index only when their
+                    // target is a front article (text/html), mirroring the
+                    // content gate above and libzim's FRONT_ARTICLE rule.
+                    // Without this, redirects pointing at assets (tiles,
+                    // fonts, vector chunks) pollute the suggestion index.
+                    let target_is_front = match target.dirent() {
+                        Dirent::Article(a) => ml
+                            .get(a.mimetype)
+                            .is_some_and(|m| m.starts_with("text/html")),
+                        Dirent::Redirect(_) => false,
+                    };
+                    if target_is_front {
+                        indexer.feed_title(path, title, &target_path);
+                    }
                 }
                 // Redirects in W/M/X namespaces are rebuilt implicitly by
                 // re-adding the underlying entries.
@@ -315,8 +326,16 @@ fn run(
         while i < pending.len() && pending[i].cluster == cidx {
             let p = &pending[i];
             let data = cluster.blob(p.blob)?.to_vec();
-            indexer.feed_title(&p.path, &p.title, "");
+            // Only front articles (text/html) belong in the title /
+            // suggestion index — same gate as fulltext below. libzim
+            // populates its title index solely from FRONT_ARTICLE
+            // entries, judged exactly by this mime test. Feeding every
+            // C-namespace item (map tiles, fonts, sprites, .pbf vector
+            // chunks) instead bloated the title index by ~1000× (e.g.
+            // 822k docs / 130 MB on a Hawaii OSM archive vs libzim's
+            // handful of real place pages).
             if p.mime.starts_with("text/html") {
+                indexer.feed_title(&p.path, &p.title, "");
                 let body = std::str::from_utf8(&data)
                     .map(std::borrow::Cow::Borrowed)
                     .unwrap_or_else(|_| String::from_utf8_lossy(&data));
