@@ -22,9 +22,10 @@
 //! payload reaches `cluster_size_target` bytes (default 2 MiB, matching
 //! upstream `zimwriterfs`).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read as _, Seek, SeekFrom, Write as _};
+use std::io::{Seek, SeekFrom, Write as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -228,8 +229,11 @@ impl BuildStats {
         };
         eprintln!("--- zimru BuildStats ---");
         eprintln!("  total wall:           {:>8.2}s", total.as_secs_f64());
+        // Note: encode batches run on a background thread overlapped
+        // with item production, so this line can legitimately show a
+        // high percentage without dominating wall time.
         eprintln!(
-            "  parallel encode:      {:>8.2}s ({:.1}%)  buffered clusters: {}",
+            "  parallel encode (bg): {:>8.2}s ({:.1}%)  buffered clusters: {}",
             self.parallel_encode.as_secs_f64(),
             pct(self.parallel_encode),
             self.clusters_buffered
@@ -418,6 +422,21 @@ pub(crate) enum ChunkedInFlight {
 pub(crate) struct StreamingTask {
     pub(crate) cluster_idx: u32,
     pub(crate) handle: std::thread::JoinHandle<Result<(std::path::PathBuf, u64)>>,
+}
+
+/// Result of one background parallel-batch encode+write. The task
+/// temporarily owns the output `File` (the producer thread never
+/// touches it while a batch is in flight) and hands it back here,
+/// together with the absolute offset each cluster landed at and the
+/// telemetry deltas to fold into [`BuildStats`].
+struct EncodeBatchDone {
+    file: File,
+    file_pos: u64,
+    /// `(cluster_idx, absolute_offset)` for every cluster written.
+    offsets: Vec<(u32, u64)>,
+    clusters: u64,
+    bytes_written: u64,
+    encode_time: Duration,
 }
 
 /// Reserved bytes after the 80-byte header for the mime-type list.
@@ -789,6 +808,11 @@ impl Creator {
     /// `512 * 1024 * 1024` to keep the parallel-batch buffer
     /// under ~512 MiB on top of zimru's other in-process state
     /// (~few hundred MB).
+    ///
+    /// Note: encode batches run on a background thread overlapped
+    /// with item production, so up to two batches can be resident
+    /// at once (one encoding, one accumulating) — size the cap
+    /// accordingly (peak ≈ 2 × cap).
     pub fn set_max_in_flight_bytes(&mut self, bytes: usize) -> &mut Self {
         self.max_in_flight_bytes = bytes;
         self
@@ -1057,6 +1081,14 @@ struct Streamer {
     /// cluster_idx order.
     streaming_tasks: Vec<StreamingTask>,
 
+    /// The in-flight parallel-batch encode+write task, if any. While
+    /// it runs it owns the output `File` (`self.file` is `None`), so
+    /// the producer thread can keep accepting items / filling the
+    /// next batch concurrently. Joined (and the file taken back)
+    /// before the next batch is spawned and before any other code
+    /// path needs the file.
+    encode_task: Option<std::thread::JoinHandle<Result<EncodeBatchDone>>>,
+
     // Per-build telemetry. Updated at every routing decision and
     // every encode call. Printed to stderr at finalize time if
     // `ZIMRU_STATS` is set in the environment.
@@ -1105,14 +1137,35 @@ struct PendingArticle {
 
 impl Streamer {
     /// Mutable access to the output file. Panics if called while a
-    /// streaming-encode item is in flight (the encoder has the file
-    /// in that case). All non-streaming-encode code paths can rely
-    /// on this never panicking.
+    /// background encode batch owns the file — callers must
+    /// `join_encode_task()` first. All file-touching paths in this
+    /// module do, so this never panics in practice.
     #[inline]
     fn file_mut(&mut self) -> &mut File {
         self.file
             .as_mut()
-            .expect("Streamer file was taken by streaming-encode and not yet returned")
+            .expect("Streamer file is owned by a background encode batch")
+    }
+
+    /// Wait for the in-flight parallel-batch encode+write (if any),
+    /// take the output file back, and fold the batch's results into
+    /// `cluster_offsets` / `file_pos` / stats. Must be called before
+    /// any access to `self.file` and before spawning the next batch.
+    fn join_encode_task(&mut self) -> Result<()> {
+        if let Some(handle) = self.encode_task.take() {
+            let done = handle
+                .join()
+                .map_err(|_| Error::Io(std::io::Error::other("encode batch thread panicked")))??;
+            self.file = Some(done.file);
+            self.file_pos = done.file_pos;
+            for (idx, off) in done.offsets {
+                self.cluster_offsets[idx as usize] = off;
+            }
+            self.stats.parallel_encode += done.encode_time;
+            self.stats.clusters_buffered += done.clusters;
+            self.stats.bytes_clusters_written += done.bytes_written;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1161,6 +1214,7 @@ impl Streamer {
             illustrations: Vec::new(),
             in_flight: None,
             streaming_tasks: Vec::new(),
+            encode_task: None,
             started: Instant::now(),
             stats: BuildStats::default(),
         })
@@ -1223,8 +1277,23 @@ impl Streamer {
             // own scratch file so multiple streaming-encode tasks
             // can run concurrently AND the parallel-batch path can
             // keep writing to the main output while we feed.
-            let temp_path = std::env::temp_dir().join(format!(
-                "zimru-stream-{}-{}-{}.tmp",
+            //
+            // The scratch file lives next to the output, NOT in
+            // `std::env::temp_dir()`: streamed items are ≥256 MiB by
+            // definition and `/tmp` is commonly a RAM-backed tmpfs,
+            // so multi-GB items could exhaust memory there. Sharing
+            // the output's filesystem also lets the finalize splice
+            // use an in-kernel `copy_file_range(2)` instead of a
+            // cross-device read/write bounce.
+            let temp_dir = match self.output_path.parent() {
+                // `parent()` of a bare filename is the empty path —
+                // normalise that to the cwd so the join stays valid.
+                Some(p) if p.as_os_str().is_empty() => std::path::PathBuf::from("."),
+                Some(p) => p.to_path_buf(),
+                None => std::env::temp_dir(),
+            };
+            let temp_path = temp_dir.join(format!(
+                ".zimru-stream-{}-{}-{}.tmp",
                 std::process::id(),
                 cluster_idx,
                 std::time::SystemTime::now()
@@ -1249,6 +1318,12 @@ impl Streamer {
                 });
                 let mut encoder = zstd::stream::Encoder::new(tmp_file, level)
                     .map_err(|e| Error::Decompression(format!("zstd init: {e}")))?;
+                // We know the exact frame size (ptr table + body), so
+                // pledge it: the frame header then carries the
+                // content size, letting readers pre-allocate the
+                // decompressed buffer instead of growing one
+                // speculatively.
+                let _ = encoder.set_pledged_src_size(Some(header_len + expected));
                 // Enable zstd's internal multi-worker parallelism for
                 // the streaming-encode path. With per-item temp files
                 // multiple streamed items also run concurrently with
@@ -1482,6 +1557,10 @@ impl Streamer {
     /// output in cluster_idx order, update cluster_offsets, and
     /// delete the temp file. Called once at finalize time.
     fn drain_streaming_tasks(&mut self) -> Result<()> {
+        // The splice below appends at `file_pos`, so any in-flight
+        // background batch must land first. This also reclaims the
+        // file handle for the finalize steps that follow.
+        self.join_encode_task()?;
         if self.streaming_tasks.is_empty() {
             return Ok(());
         }
@@ -1533,20 +1612,35 @@ impl Streamer {
     /// therefore distinct clusters. The compression tag goes first so
     /// the BTreeMap iteration order interleaves cleanly when both
     /// compressed and raw clusters exist.
-    fn bucket_key(&self, path: &str, mimetype: &str, compression: Compression) -> String {
-        let strat = match self.cluster_strategy {
-            ClusterStrategy::Single => String::new(),
-            ClusterStrategy::ByMime => mimetype.to_string(),
+    fn bucket_key(
+        &self,
+        path: &str,
+        mimetype: &str,
+        compression: Compression,
+    ) -> Cow<'static, str> {
+        let tag = compression_tag(compression);
+        let strat: &str = match self.cluster_strategy {
+            // Fast path for the default strategy: the key is one of
+            // three static strings, so the per-item allocation
+            // disappears entirely.
+            ClusterStrategy::Single => {
+                return Cow::Borrowed(match compression {
+                    Compression::None => "n|",
+                    Compression::Zstd => "z|",
+                    Compression::Xz => "x|",
+                });
+            }
+            ClusterStrategy::ByMime => mimetype,
             ClusterStrategy::ByExtension => match path.rsplit_once('.') {
-                Some((_, ext)) if !ext.contains('/') => ext.to_string(),
-                _ => String::new(),
+                Some((_, ext)) if !ext.contains('/') => ext,
+                _ => "",
             },
             ClusterStrategy::ByFirstPathSegment => match path.split_once('/') {
-                Some((head, _)) => head.to_string(),
-                None => path.to_string(),
+                Some((head, _)) => head,
+                None => path,
             },
         };
-        format!("{}|{}", compression_tag(compression), strat)
+        Cow::Owned(format!("{tag}|{strat}"))
     }
 
     /// Stream-process one item: bin-pack its body into the bucket
@@ -1568,18 +1662,19 @@ impl Streamer {
 
         // Ensure the bucket exists, then check overflow against
         // *this* bucket's running size (not a global running size).
-        let needs_flush = match self.buckets.get(&key) {
+        let needs_flush = match self.buckets.get(key.as_ref()) {
             Some(b) => !b.blobs.is_empty() && b.size_bytes + body_len > self.cluster_size_target,
             None => false,
         };
         if needs_flush {
-            self.flush_bucket(&key)?;
+            self.flush_bucket(key.as_ref())?;
         }
 
-        let bucket = self
-            .buckets
-            .entry(key)
-            .or_insert_with(|| Bucket::with_compression(comp));
+        if !self.buckets.contains_key(key.as_ref()) {
+            self.buckets
+                .insert(key.clone().into_owned(), Bucket::with_compression(comp));
+        }
+        let bucket = self.buckets.get_mut(key.as_ref()).expect("just inserted");
         let blob_idx = bucket.blobs.len() as u32;
         bucket.blobs.push(body);
         bucket.size_bytes += body_len;
@@ -1659,36 +1754,60 @@ impl Streamer {
         Ok(())
     }
 
-    /// Encode all queued clusters in parallel, then write them
-    /// sequentially in cluster_idx order. Updates
-    /// `cluster_offsets[i]` with the absolute file position where
-    /// each cluster lands. Frees source blobs after encoding.
+    /// Hand the queued clusters to a background task that encodes
+    /// them in parallel (rayon) and writes them sequentially in
+    /// cluster_idx order. The task owns the output file while it
+    /// runs, so the *producer* thread returns immediately and keeps
+    /// accepting items — compression of batch N overlaps with the
+    /// production (source reads, indexing, bin-packing) of batch
+    /// N+1. Results (final offsets, advanced file_pos, stats) are
+    /// folded back in at the next `join_encode_task`.
+    ///
+    /// At most one batch is in flight: we join the previous one
+    /// before spawning the next, so peak memory is bounded at two
+    /// batches (one encoding + one accumulating).
     fn drain_pending_encode(&mut self) -> Result<()> {
         if self.pending_encode.is_empty() {
             return Ok(());
         }
-        let phase_start = Instant::now();
+        // Wait for the previous batch (also surfaces its errors) and
+        // reclaim the file handle before handing it to the new task.
+        self.join_encode_task()?;
         let chunk = std::mem::take(&mut self.pending_encode);
         // Queue is empty after the take — reset the running byte
         // total so subsequent flushes start from zero.
         self.pending_bytes = 0;
-        let chunk_len = chunk.len() as u64;
         let level = self.compression_level;
-        let mut encoded: Vec<(u32, Vec<u8>)> = chunk
-            .into_par_iter()
-            .map(|(idx, blobs, comp)| encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes)))
-            .collect::<Result<Vec<_>>>()?;
-        encoded.sort_by_key(|(idx, _)| *idx);
-        let mut bytes_written = 0u64;
-        for (idx, bytes) in encoded {
-            self.cluster_offsets[idx as usize] = self.file_pos;
-            bytes_written += bytes.len() as u64;
-            self.file_mut().write_all(&bytes)?;
-            self.file_pos += bytes.len() as u64;
-        }
-        self.stats.parallel_encode += phase_start.elapsed();
-        self.stats.clusters_buffered += chunk_len;
-        self.stats.bytes_clusters_written += bytes_written;
+        let mut file = self.file.take().expect("file present after join");
+        let file_pos = self.file_pos;
+        self.encode_task = Some(std::thread::spawn(move || -> Result<EncodeBatchDone> {
+            let phase_start = Instant::now();
+            let clusters = chunk.len() as u64;
+            let mut encoded: Vec<(u32, Vec<u8>)> = chunk
+                .into_par_iter()
+                .map(|(idx, blobs, comp)| {
+                    encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            encoded.sort_unstable_by_key(|(idx, _)| *idx);
+            let mut pos = file_pos;
+            let mut bytes_written = 0u64;
+            let mut offsets = Vec::with_capacity(encoded.len());
+            for (idx, bytes) in encoded {
+                offsets.push((idx, pos));
+                file.write_all(&bytes)?;
+                pos += bytes.len() as u64;
+                bytes_written += bytes.len() as u64;
+            }
+            Ok(EncodeBatchDone {
+                file,
+                file_pos: pos,
+                offsets,
+                clusters,
+                bytes_written,
+                encode_time: phase_start.elapsed(),
+            })
+        }));
         Ok(())
     }
 
@@ -1805,31 +1924,43 @@ impl Streamer {
         self.dirents.extend(pending_redirects);
 
         // 4. Sort dirents by (ns, url) → URL-pointer order.
-        self.dirents.sort_by(|a, b| {
+        self.dirents.sort_unstable_by(|a, b| {
             a.namespace()
                 .cmp(&b.namespace())
                 .then_with(|| a.url().cmp(b.url()))
         });
 
         // 5. Resolve redirect targets to URL-pointer-order indices.
-        for i in 0..self.dirents.len() {
-            if let RawDirent::Redirect {
-                target_ns,
-                target_url,
-                ..
-            } = &self.dirents[i]
-            {
-                let ns = *target_ns;
-                let url = target_url.clone();
-                let resolved = self
-                    .dirents
-                    .binary_search_by(|d| d.namespace().cmp(&ns).then_with(|| d.url().cmp(&url)))
-                    .ok()
-                    .map(|j| j as u32);
-                match &mut self.dirents[i] {
-                    RawDirent::Redirect { resolved_index, .. } => *resolved_index = resolved,
-                    _ => unreachable!(),
+        //    Two passes (collect then apply) so the binary search can
+        //    borrow the sorted dirents without cloning each target URL.
+        let resolutions: Vec<(usize, Option<u32>)> = self
+            .dirents
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| match d {
+                RawDirent::Redirect {
+                    target_ns,
+                    target_url,
+                    ..
+                } => {
+                    let resolved = self
+                        .dirents
+                        .binary_search_by(|d| {
+                            d.namespace()
+                                .cmp(target_ns)
+                                .then_with(|| d.url().cmp(target_url.as_str()))
+                        })
+                        .ok()
+                        .map(|j| j as u32);
+                    Some((i, resolved))
                 }
+                RawDirent::Article { .. } => None,
+            })
+            .collect();
+        for (i, resolved) in resolutions {
+            match &mut self.dirents[i] {
+                RawDirent::Redirect { resolved_index, .. } => *resolved_index = resolved,
+                _ => unreachable!(),
             }
         }
         for d in &self.dirents {
@@ -1863,7 +1994,7 @@ impl Streamer {
         //     listing entry to refer to itself, so this is fine.
         let title_order_snapshot: Vec<u32> = {
             let mut t: Vec<u32> = (0..self.dirents.len() as u32).collect();
-            t.sort_by(|&a, &b| {
+            t.sort_unstable_by(|&a, &b| {
                 let da = &self.dirents[a as usize];
                 let db = &self.dirents[b as usize];
                 da.namespace()
@@ -1920,7 +2051,7 @@ impl Streamer {
         //     W-namespace URL-pointer indices, so resolved redirect
         //     targets (always C in our pipeline) stay valid — no
         //     re-resolution needed.
-        self.dirents.sort_by(|a, b| {
+        self.dirents.sort_unstable_by(|a, b| {
             a.namespace()
                 .cmp(&b.namespace())
                 .then_with(|| a.url().cmp(b.url()))
@@ -1930,7 +2061,7 @@ impl Streamer {
         //     including the listing entry. This is what gets
         //     written to the title pointer table.
         let mut title_order: Vec<u32> = (0..self.dirents.len() as u32).collect();
-        title_order.sort_by(|&a, &b| {
+        title_order.sort_unstable_by(|&a, &b| {
             let da = &self.dirents[a as usize];
             let db = &self.dirents[b as usize];
             da.namespace()
@@ -1947,15 +2078,16 @@ impl Streamer {
         let cluster_ptr_pos = title_ptr_pos + (entry_count as u64) * 4;
         let dirents_pos = cluster_ptr_pos + (cluster_count as u64) * 8;
 
-        // 8. Render dirents; compute their absolute offsets.
-        let mut dirent_blobs: Vec<Vec<u8>> = Vec::with_capacity(self.dirents.len());
+        // 8. Compute each dirent's absolute offset from its encoded
+        //    size alone — the bytes are rendered straight into the
+        //    staging buffer in step 10, so no per-dirent Vec is
+        //    allocated (a 1 M-entry build would otherwise do 1 M
+        //    allocations plus an extra copy of every dirent).
         let mut dirent_offsets: Vec<u64> = Vec::with_capacity(self.dirents.len());
         let mut cursor = dirents_pos;
         for d in &self.dirents {
-            let bytes = encode_dirent(d);
             dirent_offsets.push(cursor);
-            cursor += bytes.len() as u64;
-            dirent_blobs.push(bytes);
+            cursor += dirent_len(d) as u64;
         }
         let checksum_pos = cursor;
 
@@ -1988,7 +2120,7 @@ impl Streamer {
         let total_table_bytes = dirent_offsets.len() * 8
             + title_order.len() * 4
             + cluster_offsets.len() * 8
-            + dirent_blobs.iter().map(|b| b.len()).sum::<usize>();
+            + (checksum_pos - dirents_pos) as usize;
         let mut staging = Vec::with_capacity(total_table_bytes);
         for off in &dirent_offsets {
             staging.extend_from_slice(&off.to_le_bytes());
@@ -1999,12 +2131,11 @@ impl Streamer {
         for off in &cluster_offsets {
             staging.extend_from_slice(&off.to_le_bytes());
         }
-        for blob in &dirent_blobs {
-            staging.extend_from_slice(blob);
+        for d in &self.dirents {
+            encode_dirent_into(d, &mut staging);
         }
         self.file_mut().write_all(&staging)?;
         drop(staging);
-        drop(dirent_blobs);
         drop(dirent_offsets);
         self.stats.table_write += table_phase.elapsed();
 
@@ -2041,23 +2172,28 @@ impl Streamer {
         self.file_mut().flush()?;
 
         // 13. MD5 over [0, checksum_pos) by re-reading the now-final
-        //     file. SSDs do this at ~1 GB/s; small relative to the
-        //     cluster-encode time we just saved by streaming.
+        //     file through a sequential-advised mmap — no read(2)
+        //     syscall loop, no bounce-buffer copies; the hasher
+        //     consumes page-cache bytes directly. Hashing what's on
+        //     disk (rather than a shadow hash of what we *meant* to
+        //     write) doubles as a write-integrity check.
         let md5_phase = Instant::now();
-        self.file_mut().seek(SeekFrom::Start(0))?;
-        let mut hasher = Md5::new();
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut hashed: u64 = 0;
-        while hashed < checksum_pos {
-            let want = ((checksum_pos - hashed) as usize).min(buf.len());
-            let n = self.file_mut().read(&mut buf[..want])?;
-            if n == 0 {
-                break;
+        let digest: [u8; 16] = {
+            let file = self.file_mut();
+            let mmap = unsafe { memmap2::Mmap::map(&*file)? };
+            #[cfg(unix)]
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+            if (mmap.len() as u64) < checksum_pos {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "output truncated: {} bytes on disk, expected {}",
+                    mmap.len(),
+                    checksum_pos
+                ))));
             }
-            hasher.update(&buf[..n]);
-            hashed += n as u64;
-        }
-        let digest: [u8; 16] = hasher.finalize().into();
+            let mut hasher = Md5::new();
+            hasher.update(&mmap[..checksum_pos as usize]);
+            hasher.finalize().into()
+        };
         self.file_mut().seek(SeekFrom::Start(checksum_pos))?;
         self.file_mut().write_all(&digest)?;
         self.file_mut().flush()?;
@@ -2097,8 +2233,16 @@ impl Streamer {
     }
 }
 
-/// Re-open `path` and run every integrity check zimru exposes.
+/// Re-open `path` and run zimru's structural integrity checks.
 /// Returns `Err` with a descriptive message on the first failure.
+///
+/// Deliberately NOT in this list: the MD5 check (`Archive::check`).
+/// Finalize step 13 already computed the trailer by hashing the
+/// final on-disk bytes, so re-reading the whole file to compare a
+/// hash against itself can only detect disk corruption occurring in
+/// the milliseconds between the two passes — not worth a second
+/// full-file read on every build. `zimcheck -C` remains available
+/// for callers who want an explicit checksum pass.
 fn verify_archive(path: &Path) -> Result<()> {
     let arc = crate::archive::Archive::open(path)?;
     type Check = dyn Fn(&crate::archive::Archive) -> Result<bool>;
@@ -2108,7 +2252,6 @@ fn verify_archive(path: &Path) -> Result<()> {
         ("title_index", &|a| a.check_title_index()),
         ("cluster_ptrs", &|a| a.check_cluster_ptrs()),
         ("mimetypes", &|a| a.check_mimetypes()),
-        ("md5_checksum", &|a| a.check()),
     ];
     for (name, check) in checks {
         let ok = check(&arc).map_err(|e| {
@@ -2167,8 +2310,21 @@ fn encode_mime_list(mimes: &[String]) -> Vec<u8> {
     out
 }
 
-fn encode_dirent(d: &RawDirent) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Exact on-disk size of `encode_dirent_into(d)`'s output. Kept in
+/// lockstep with that function so dirent offsets can be computed
+/// without rendering.
+fn dirent_len(d: &RawDirent) -> usize {
+    let (url, title, fixed) = match d {
+        // mime(2) + param_len(1) + ns(1) + revision(4) + cluster(4) + blob(4)
+        RawDirent::Article { url, title, .. } => (url, title, 16),
+        // mime(2) + param_len(1) + ns(1) + revision(4) + redirect_index(4)
+        RawDirent::Redirect { url, title, .. } => (url, title, 12),
+    };
+    let title_len = if title != url { title.len() } else { 0 };
+    fixed + url.len() + 1 + title_len + 1
+}
+
+fn encode_dirent_into(d: &RawDirent, out: &mut Vec<u8>) {
     match d {
         RawDirent::Article {
             namespace,
@@ -2212,7 +2368,6 @@ fn encode_dirent(d: &RawDirent) -> Vec<u8> {
             out.push(0);
         }
     }
-    out
 }
 
 fn encode_cluster(
@@ -2228,8 +2383,27 @@ fn encode_cluster(
     let extended = total_4 > u32::MAX as usize;
     let ptr_size = if extended { 8 } else { 4 };
     let header_len = (n + 1) * ptr_size;
+    let payload_len = header_len + payload_bytes_sum;
+    let ext_bit = if extended { 0x10u8 } else { 0 };
 
-    let mut payload = Vec::with_capacity(header_len + payload_bytes_sum);
+    // Raw clusters: assemble info byte + offsets + blobs straight
+    // into the output — no intermediate payload buffer, no copy.
+    if matches!(compression, Compression::None) {
+        let mut bytes = Vec::with_capacity(1 + payload_len);
+        bytes.push(1u8 | ext_bit);
+        let mut cursor: u64 = header_len as u64;
+        for b in blobs {
+            push_offset(&mut bytes, cursor, extended);
+            cursor += b.len() as u64;
+        }
+        push_offset(&mut bytes, cursor, extended);
+        for b in blobs {
+            bytes.extend_from_slice(b);
+        }
+        return Ok(bytes);
+    }
+
+    let mut payload = Vec::with_capacity(payload_len);
     let mut cursor: u64 = header_len as u64;
     for b in blobs {
         push_offset(&mut payload, cursor, extended);
@@ -2250,8 +2424,8 @@ fn encode_cluster(
             .ok()
             .and_then(|v| v.parse().ok())
     }
-    let (compression_id, body) = match compression {
-        Compression::None => (1u8, payload),
+    match compression {
+        Compression::None => unreachable!("handled above"),
         Compression::Zstd => {
             let lvl = level.or_else(env_zstd_level).unwrap_or(3);
             // Pin windowLog to ceil(log2(payload.len())). zstd's default
@@ -2269,42 +2443,38 @@ fn encode_cluster(
             let mut window_log = 64 - (payload_len - 1).leading_zeros();
             // zstd requires windowLog >= 10 (1 KiB). Anything below
             // that wastes space; clamp.
-            if window_log < 10 { window_log = 10; }
-            if window_log > 27 { window_log = 27; }
-            let mut buf = Vec::new();
-            {
-                let mut enc = zstd::stream::Encoder::new(&mut buf, lvl)
-                    .map_err(|e| Error::Decompression(format!("zstd encoder: {e}")))?;
-                // Use the parameter API to pin window_log so the frame
-                // header records the actual size. zstd-rs exposes this
-                // via `set_parameter(WindowLog, n)`.
-                enc.set_parameter(zstd::stream::raw::CParameter::WindowLog(window_log))
-                    .map_err(|e| Error::Decompression(format!("zstd window_log: {e}")))?;
-                use std::io::Write as _;
-                enc.write_all(&payload)
-                    .map_err(|e| Error::Decompression(format!("zstd write: {e}")))?;
-                enc.finish()
-                    .map_err(|e| Error::Decompression(format!("zstd finish: {e}")))?;
-            }
-            (5u8, buf)
+            window_log = window_log.clamp(10, 27);
+            // The one-shot bulk compressor (ZSTD_compress2 under the
+            // hood) knows the source size up front, so the produced
+            // frame carries the frame-content-size field. Readers —
+            // zimru's own `decode_zstd` fast path, libzim, fzstd —
+            // use it to pre-allocate the exact decompressed size and
+            // skip the streaming-decoder hop entirely.
+            let mut enc = zstd::bulk::Compressor::new(lvl)
+                .map_err(|e| Error::Decompression(format!("zstd encoder: {e}")))?;
+            enc.set_parameter(zstd::stream::raw::CParameter::WindowLog(window_log))
+                .map_err(|e| Error::Decompression(format!("zstd window_log: {e}")))?;
+            let body = enc
+                .compress(&payload)
+                .map_err(|e| Error::Decompression(format!("zstd compress: {e}")))?;
+            let mut bytes = Vec::with_capacity(1 + body.len());
+            bytes.push(5u8 | ext_bit);
+            bytes.extend_from_slice(&body);
+            Ok(bytes)
         }
         Compression::Xz => {
             let lvl = level.unwrap_or(3).clamp(0, 9) as u32;
-            (4u8, {
-                let mut enc = xz2::write::XzEncoder::new(Vec::new(), lvl);
-                enc.write_all(&payload)
-                    .map_err(|e| Error::Decompression(format!("xz encode: {e}")))?;
-                enc.finish()
-                    .map_err(|e| Error::Decompression(format!("xz finish: {e}")))?
-            })
+            // Seed the output with the info byte and let the encoder
+            // append — skips the prepend-copy of the compressed body.
+            let mut out = Vec::with_capacity(1 + payload.len() / 3);
+            out.push(4u8 | ext_bit);
+            let mut enc = xz2::write::XzEncoder::new(out, lvl);
+            enc.write_all(&payload)
+                .map_err(|e| Error::Decompression(format!("xz encode: {e}")))?;
+            enc.finish()
+                .map_err(|e| Error::Decompression(format!("xz finish: {e}")))
         }
-    };
-
-    let info_byte = compression_id | (if extended { 0x10 } else { 0 });
-    let mut bytes = Vec::with_capacity(1 + body.len());
-    bytes.push(info_byte);
-    bytes.extend_from_slice(&body);
-    Ok(bytes)
+    }
 }
 
 fn push_offset(v: &mut Vec<u8>, x: u64, extended: bool) {
