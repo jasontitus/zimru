@@ -160,6 +160,13 @@ struct ArchiveCore {
     /// "media" is any non-redirect, non-article entry. Redirects don't
     /// count toward either total.
     content_counts: OnceLock<(u64, u64)>,
+    /// Cluster start offsets in ascending *file* order, built lazily.
+    /// The ZIM format does not require cluster index order to match
+    /// on-disk order (zimru's own writer emits clusters in completion
+    /// order, and spliced streamed clusters land at the tail), so a
+    /// cluster's extent must be bounded by the next-greater *offset*,
+    /// not by `cluster_pointer(idx + 1)`.
+    sorted_cluster_offsets: OnceLock<Vec<u64>>,
 }
 
 /// A read-only ZIM archive.
@@ -190,6 +197,7 @@ impl Archive {
                 cluster_cache: Mutex::new(ClusterByteCache::new(DEFAULT_CLUSTER_CACHE_MAX_BYTES)),
                 title_listing: OnceLock::new(),
                 content_counts: OnceLock::new(),
+                sorted_cluster_offsets: OnceLock::new(),
             }),
         })
     }
@@ -1016,48 +1024,6 @@ impl Archive {
         raw::u64_at(&self.core.mmap, off)
     }
 
-    /// End-of-cluster-region: where the last cluster ends.
-    ///
-    /// In the legacy layout (mime + url_ptrs + title_ptrs +
-    /// cluster_ptrs + dirents come BEFORE clusters), the last
-    /// cluster ends at the MD5 trailer (checksum_pos).
-    ///
-    /// In the streaming-writer layout (mime list at offset 80, then
-    /// clusters, then url_ptrs / title_ptrs / cluster_ptrs / dirents,
-    /// then md5), the last cluster ends wherever the first table
-    /// region after the clusters begins. Compute that as the
-    /// minimum of every "post-cluster" header position that lies
-    /// after the start of the last cluster.
-    fn cluster_region_end(&self) -> u64 {
-        let h = &self.core.header;
-        let last_cluster_start = if h.cluster_count > 0 {
-            // Read the last cluster pointer directly; if that fails
-            // (corruption?), fall back to the legacy assumption.
-            self.cluster_pointer(h.cluster_count - 1).unwrap_or(0)
-        } else {
-            0
-        };
-        let candidates = [
-            h.url_ptr_pos,
-            h.title_ptr_pos,
-            h.cluster_ptr_pos,
-            if h.has_checksum() {
-                h.checksum_pos
-            } else {
-                self.core.file_len
-            },
-        ];
-        candidates
-            .into_iter()
-            .filter(|&p| p > last_cluster_start)
-            .min()
-            .unwrap_or(if h.has_checksum() {
-                h.checksum_pos
-            } else {
-                self.core.file_len
-            })
-    }
-
     /// Public access to a decoded cluster by its index. The cluster is cached
     /// inside the archive so repeat calls for the same index are free.
     pub fn cluster(&self, idx: u32) -> Result<Arc<Cluster>> {
@@ -1106,53 +1072,84 @@ impl Archive {
         self.cluster_pointer(idx)
     }
 
+    /// Exclusive end of the cluster that starts at `start`: the
+    /// smallest cluster offset strictly greater than `start`, or —
+    /// for the cluster that comes last in *file* order — the nearest
+    /// table/checksum boundary after it.
+    ///
+    /// Cluster index order is NOT guaranteed to match on-disk order
+    /// (zimru's writer emits clusters in encode-completion order, and
+    /// streamed huge items splice at the tail), so bounding cluster
+    /// `idx` by `cluster_pointer(idx + 1)` would corrupt reads of any
+    /// out-of-order cluster. The sorted offset list is built once per
+    /// archive and shared.
+    fn cluster_slice_end(&self, start: u64) -> u64 {
+        let offs = self.core.sorted_cluster_offsets.get_or_init(|| {
+            let n = self.core.header.cluster_count;
+            let mut v: Vec<u64> = (0..n)
+                .filter_map(|i| self.cluster_pointer(i).ok())
+                .collect();
+            v.sort_unstable();
+            v
+        });
+        let i = offs.partition_point(|&o| o <= start);
+        if i < offs.len() {
+            return offs[i];
+        }
+        self.cluster_region_boundary_after(start)
+    }
+
+    /// Nearest header-table / checksum / EOF position after `start` —
+    /// the end bound for the cluster that is last in file order.
+    fn cluster_region_boundary_after(&self, start: u64) -> u64 {
+        let h = &self.core.header;
+        let eof = if h.has_checksum() {
+            h.checksum_pos
+        } else {
+            self.core.file_len
+        };
+        [h.url_ptr_pos, h.title_ptr_pos, h.cluster_ptr_pos, eof]
+            .into_iter()
+            .filter(|&p| p > start)
+            .min()
+            .unwrap_or(eof)
+    }
+
     /// On-disk byte range occupied by cluster `idx`, including its info
     /// byte. The returned range's length is the compressed size the cluster
     /// takes up in the file.
     pub fn cluster_byte_range(&self, idx: u32) -> Result<std::ops::Range<u64>> {
         let start = self.cluster_pointer(idx)?;
-        let end = if idx + 1 < self.core.header.cluster_count {
-            self.cluster_pointer(idx + 1)?
-        } else {
-            self.cluster_region_end()
-        };
+        let end = self.cluster_slice_end(start);
         if end < start {
             return Err(Error::Truncated(end));
         }
         Ok(start..end)
     }
 
+    /// Raw on-disk bytes of cluster `idx` (info byte included), bounded
+    /// by the next cluster in file order.
+    fn cluster_raw(&self, idx: u32) -> Result<&[u8]> {
+        let start = self.cluster_pointer(idx)? as usize;
+        let end = self.cluster_slice_end(start as u64) as usize;
+        if end < start || end > self.core.mmap.len() {
+            return Err(Error::Truncated(end as u64));
+        }
+        Ok(&self.core.mmap[start..end])
+    }
+
     /// Decompress a cluster *without* touching the cache. Useful for parallel
     /// scans where each cluster is read exactly once and caching would only
     /// waste memory + add Mutex contention.
     pub fn cluster_uncached(&self, idx: u32) -> Result<Cluster> {
-        let start = self.cluster_pointer(idx)? as usize;
-        let end = if idx + 1 < self.core.header.cluster_count {
-            self.cluster_pointer(idx + 1)? as usize
-        } else {
-            self.cluster_region_end() as usize
-        };
-        if end < start || end > self.core.mmap.len() {
-            return Err(Error::Truncated(end as u64));
-        }
-        Cluster::parse(&self.core.mmap[start..end])
+        Cluster::parse(self.cluster_raw(idx)?)
     }
 
     fn load_cluster(&self, idx: u32) -> Result<Arc<Cluster>> {
         if let Some(c) = self.core.cluster_cache.lock().unwrap().get(idx) {
             return Ok(c);
         }
-        let start = self.cluster_pointer(idx)? as usize;
-        let end = if idx + 1 < self.core.header.cluster_count {
-            self.cluster_pointer(idx + 1)? as usize
-        } else {
-            self.cluster_region_end() as usize
-        };
-        if end < start || end > self.core.mmap.len() {
-            return Err(Error::Truncated(end as u64));
-        }
-        let raw = &self.core.mmap[start..end];
-        let cluster = Arc::new(Cluster::parse(raw)?);
+        let cluster = Arc::new(Cluster::parse(self.cluster_raw(idx)?)?);
         self.core
             .cluster_cache
             .lock()

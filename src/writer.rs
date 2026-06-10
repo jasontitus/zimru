@@ -30,7 +30,6 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use md5::{Digest, Md5};
-use rayon::prelude::*;
 
 use crate::cluster::Compression;
 use crate::error::{Error, Result};
@@ -424,19 +423,39 @@ pub(crate) struct StreamingTask {
     pub(crate) handle: std::thread::JoinHandle<Result<(std::path::PathBuf, u64)>>,
 }
 
-/// Result of one background parallel-batch encode+write. The task
-/// temporarily owns the output `File` (the producer thread never
-/// touches it while a batch is in flight) and hands it back here,
-/// together with the absolute offset each cluster landed at and the
-/// telemetry deltas to fold into [`BuildStats`].
-struct EncodeBatchDone {
-    file: File,
-    file_pos: u64,
-    /// `(cluster_idx, absolute_offset)` for every cluster written.
-    offsets: Vec<(u32, u64)>,
-    clusters: u64,
-    bytes_written: u64,
-    encode_time: Duration,
+/// One queued cluster awaiting compression: `(cluster_idx, raw
+/// blobs, compression)`.
+type EncodeJob = (u32, Vec<Vec<u8>>, Compression);
+
+/// What the pipeline's writer thread hands back at shutdown:
+/// `(file, advanced_file_pos, (cluster_idx, offset) pairs,
+/// cluster_count, bytes_written)`.
+type PipelineWriterDone = (File, u64, Vec<(u32, u64)>, u64, u64);
+
+/// Continuous encode pipeline: N worker threads pull cluster jobs
+/// from a bounded channel, compress them, and hand the encoded bytes
+/// to a dedicated writer thread that owns the output `File` and
+/// appends clusters in *completion* order (the ZIM format maps
+/// cluster index → offset through the cluster-pointer table, so
+/// on-disk order is free). Compared to the previous join-spawn batch
+/// model this removes the convoy barrier at the end of every batch —
+/// at high zstd levels a single slow cluster used to idle every
+/// other core until the batch completed.
+///
+/// Lifecycle: started lazily on the first cluster flush (taking the
+/// `File` from the `Streamer`), shut down by `shutdown_pipeline`
+/// before anything else needs the file. The bounded job channel is
+/// the memory backpressure: at most `bound` raw clusters are queued
+/// ahead of the workers.
+struct EncodePipeline {
+    job_tx: std::sync::mpsc::SyncSender<EncodeJob>,
+    /// Each worker returns the total time it spent inside
+    /// `encode_cluster` (for BuildStats).
+    workers: Vec<std::thread::JoinHandle<Duration>>,
+    /// The writer thread returns the file, the advanced write
+    /// position, per-cluster offsets, cluster count, and bytes
+    /// written — or the first encode/write error.
+    writer: std::thread::JoinHandle<Result<PipelineWriterDone>>,
 }
 
 /// Reserved bytes after the 80-byte header for the mime-type list.
@@ -1018,13 +1037,10 @@ struct Streamer {
     compression: Compression,
     compression_level: Option<i32>,
     cluster_size_target: usize,
-    /// Soft cap on raw bytes queued in `pending_encode` (see
-    /// [`Creator::set_max_in_flight_bytes`]). 0 = unlimited.
+    /// Soft cap on raw bytes queued ahead of the encode workers (see
+    /// [`Creator::set_max_in_flight_bytes`]). 0 = unlimited; sizes
+    /// the pipeline's bounded job channel.
     max_in_flight_bytes: usize,
-    /// Running total of raw bytes currently in `pending_encode`,
-    /// kept incrementally so flush_bucket doesn't have to walk
-    /// every queued cluster on every push.
-    pending_bytes: usize,
     uuid: [u8; 16],
     main_path: Option<String>,
     cluster_strategy: ClusterStrategy,
@@ -1036,7 +1052,7 @@ struct Streamer {
     // One in-flight cluster per bucket key (`""` for `Single` mode,
     // mime / extension / first path segment for the others). When a
     // bucket exceeds `cluster_size_target` it is flushed independently
-    // of the others — its blobs are queued for parallel-batch encode
+    // of the others — its blobs are handed to the encode pipeline
     // and its dirents are committed with the freshly-allocated
     // `cluster_idx`.
     buckets: BTreeMap<String, Bucket>,
@@ -1046,18 +1062,6 @@ struct Streamer {
     // when its encoded bytes are written. `cluster_offsets.len()`
     // doubles as the next cluster_idx allocator at flush time.
     cluster_offsets: Vec<u64>,
-
-    // Bounded queue of (cluster_idx, raw_blobs) waiting to be
-    // encode-and-written. When this fills to `rayon::current_num_threads()`
-    // we drain it as a single `par_iter` batch and write the encoded
-    // bytes in cluster_idx order. Cap is small
-    // (`cluster_size_target * thread_count` raw bytes) so peak RSS
-    // stays bounded.
-    /// Each entry: (cluster_idx, raw blobs, compression for this
-    /// cluster). Compression is per-cluster (driven by the bucket's
-    /// configured compression — see [`Bucket::compression`]) so a
-    /// single build can mix compressed and raw clusters.
-    pending_encode: Vec<(u32, Vec<Vec<u8>>, Compression)>,
 
     // Dirents committed for items whose cluster has been flushed.
     // Small (~50 B/item).
@@ -1081,13 +1085,13 @@ struct Streamer {
     /// cluster_idx order.
     streaming_tasks: Vec<StreamingTask>,
 
-    /// The in-flight parallel-batch encode+write task, if any. While
-    /// it runs it owns the output `File` (`self.file` is `None`), so
-    /// the producer thread can keep accepting items / filling the
-    /// next batch concurrently. Joined (and the file taken back)
-    /// before the next batch is spawned and before any other code
-    /// path needs the file.
-    encode_task: Option<std::thread::JoinHandle<Result<EncodeBatchDone>>>,
+    /// The continuous encode pipeline, if running. While it runs it
+    /// owns the output `File` (`self.file` is `None`); the producer
+    /// thread keeps accepting items and feeding cluster jobs without
+    /// ever blocking on compression (except for channel
+    /// backpressure). Shut down — and the file taken back — before
+    /// any other code path needs the file.
+    pipeline: Option<EncodePipeline>,
 
     // Per-build telemetry. Updated at every routing decision and
     // every encode call. Printed to stderr at finalize time if
@@ -1136,34 +1140,135 @@ struct PendingArticle {
 }
 
 impl Streamer {
-    /// Mutable access to the output file. Panics if called while a
-    /// background encode batch owns the file — callers must
-    /// `join_encode_task()` first. All file-touching paths in this
+    /// Mutable access to the output file. Panics if called while the
+    /// encode pipeline owns the file — callers must
+    /// `shutdown_pipeline()` first. All file-touching paths in this
     /// module do, so this never panics in practice.
     #[inline]
     fn file_mut(&mut self) -> &mut File {
         self.file
             .as_mut()
-            .expect("Streamer file is owned by a background encode batch")
+            .expect("Streamer file is owned by the encode pipeline")
     }
 
-    /// Wait for the in-flight parallel-batch encode+write (if any),
-    /// take the output file back, and fold the batch's results into
-    /// `cluster_offsets` / `file_pos` / stats. Must be called before
-    /// any access to `self.file` and before spawning the next batch.
-    fn join_encode_task(&mut self) -> Result<()> {
-        if let Some(handle) = self.encode_task.take() {
-            let done = handle
+    /// Spin up the encode pipeline: hand the output file to a writer
+    /// thread and start one encode worker per CPU. Called lazily on
+    /// the first cluster flush.
+    fn start_pipeline(&mut self) -> Result<()> {
+        use std::sync::mpsc::sync_channel;
+        let threads = rayon::current_num_threads().max(1);
+        // Job-channel bound = memory backpressure. With a byte cap
+        // configured, size the queue so queued raw clusters stay
+        // under the cap; otherwise allow 2 queued clusters per
+        // worker so encoders never starve while the producer reads
+        // ahead.
+        let bound = if self.max_in_flight_bytes > 0 {
+            (self.max_in_flight_bytes / self.cluster_size_target.max(1)).max(1)
+        } else {
+            threads * 2
+        };
+        let (job_tx, job_rx) = sync_channel::<EncodeJob>(bound);
+        let (out_tx, out_rx) = sync_channel::<Result<(u32, Vec<u8>)>>(threads * 2);
+        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+        let level = self.compression_level;
+
+        let mut workers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let job_rx = job_rx.clone();
+            let out_tx = out_tx.clone();
+            workers.push(std::thread::spawn(move || -> Duration {
+                let mut busy = Duration::ZERO;
+                loop {
+                    // Hold the lock only for the recv handshake, not
+                    // while encoding.
+                    let job = match job_rx.lock().unwrap().recv() {
+                        Ok(j) => j,
+                        Err(_) => break, // producer closed — done
+                    };
+                    let (idx, blobs, comp) = job;
+                    let t = Instant::now();
+                    let encoded = encode_cluster(&blobs, comp, level).map(|b| (idx, b));
+                    busy += t.elapsed();
+                    drop(blobs);
+                    if out_tx.send(encoded).is_err() {
+                        break; // writer died (error already recorded there)
+                    }
+                }
+                busy
+            }));
+        }
+        drop(out_tx); // writer's recv ends when the last worker exits
+
+        let mut file = self.file.take().expect("file present at pipeline start");
+        let file_pos = self.file_pos;
+        let writer = std::thread::spawn(move || -> Result<PipelineWriterDone> {
+            let mut pos = file_pos;
+            let mut offsets: Vec<(u32, u64)> = Vec::new();
+            let mut bytes_written = 0u64;
+            while let Ok(msg) = out_rx.recv() {
+                let (idx, bytes) = msg?;
+                offsets.push((idx, pos));
+                file.write_all(&bytes)?;
+                pos += bytes.len() as u64;
+                bytes_written += bytes.len() as u64;
+            }
+            let clusters = offsets.len() as u64;
+            Ok((file, pos, offsets, clusters, bytes_written))
+        });
+
+        self.pipeline = Some(EncodePipeline {
+            job_tx,
+            workers,
+            writer,
+        });
+        Ok(())
+    }
+
+    /// Queue one cluster for compression, starting the pipeline if
+    /// needed. Blocks only when the bounded job queue is full
+    /// (memory backpressure) — compression and file writes happen on
+    /// the pipeline's own threads.
+    fn send_cluster(&mut self, idx: u32, blobs: Vec<Vec<u8>>, comp: Compression) -> Result<()> {
+        if self.pipeline.is_none() {
+            self.start_pipeline()?;
+        }
+        let tx = &self.pipeline.as_ref().expect("pipeline running").job_tx;
+        if tx.send((idx, blobs, comp)).is_err() {
+            // Workers/writer went away — shut down to surface the
+            // underlying encode/write error.
+            self.shutdown_pipeline()?;
+            return Err(Error::Io(std::io::Error::other(
+                "encode pipeline terminated unexpectedly",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Stop the encode pipeline (if running): close the job channel,
+    /// join every worker and the writer thread, take the file back,
+    /// and fold the results into `cluster_offsets` / `file_pos` /
+    /// stats. Must be called before any access to `self.file`.
+    fn shutdown_pipeline(&mut self) -> Result<()> {
+        if let Some(p) = self.pipeline.take() {
+            drop(p.job_tx); // workers drain the queue then exit
+            let mut busy = Duration::ZERO;
+            for w in p.workers {
+                busy += w
+                    .join()
+                    .map_err(|_| Error::Io(std::io::Error::other("encode worker panicked")))?;
+            }
+            let (file, file_pos, offsets, clusters, bytes_written) = p
+                .writer
                 .join()
-                .map_err(|_| Error::Io(std::io::Error::other("encode batch thread panicked")))??;
-            self.file = Some(done.file);
-            self.file_pos = done.file_pos;
-            for (idx, off) in done.offsets {
+                .map_err(|_| Error::Io(std::io::Error::other("cluster writer panicked")))??;
+            self.file = Some(file);
+            self.file_pos = file_pos;
+            for (idx, off) in offsets {
                 self.cluster_offsets[idx as usize] = off;
             }
-            self.stats.parallel_encode += done.encode_time;
-            self.stats.clusters_buffered += done.clusters;
-            self.stats.bytes_clusters_written += done.bytes_written;
+            self.stats.parallel_encode += busy;
+            self.stats.clusters_buffered += clusters;
+            self.stats.bytes_clusters_written += bytes_written;
         }
         Ok(())
     }
@@ -1199,7 +1304,6 @@ impl Streamer {
             compression_level,
             cluster_size_target,
             max_in_flight_bytes,
-            pending_bytes: 0,
             uuid,
             main_path,
             cluster_strategy,
@@ -1207,14 +1311,13 @@ impl Streamer {
             mime_index: BTreeMap::new(),
             buckets: BTreeMap::new(),
             cluster_offsets: Vec::new(),
-            pending_encode: Vec::new(),
             dirents: Vec::new(),
             redirections: Vec::new(),
             metadata: Vec::new(),
             illustrations: Vec::new(),
             in_flight: None,
             streaming_tasks: Vec::new(),
-            encode_task: None,
+            pipeline: None,
             started: Instant::now(),
             stats: BuildStats::default(),
         })
@@ -1557,10 +1660,10 @@ impl Streamer {
     /// output in cluster_idx order, update cluster_offsets, and
     /// delete the temp file. Called once at finalize time.
     fn drain_streaming_tasks(&mut self) -> Result<()> {
-        // The splice below appends at `file_pos`, so any in-flight
-        // background batch must land first. This also reclaims the
-        // file handle for the finalize steps that follow.
-        self.join_encode_task()?;
+        // The splice below appends at `file_pos`, so every pipeline
+        // cluster must land first. This also reclaims the file
+        // handle for the finalize steps that follow.
+        self.shutdown_pipeline()?;
         if self.streaming_tasks.is_empty() {
             return Ok(());
         }
@@ -1723,97 +1826,23 @@ impl Streamer {
                 blob: pa.blob_idx,
             });
         }
-        // Track bytes incrementally; the cap-driven drain check
-        // doesn't have to walk every queued cluster.
-        let added_bytes: usize = bucket.blobs.iter().map(|b| b.len()).sum();
-        self.pending_bytes += added_bytes;
-        self.pending_encode
-            .push((cluster_idx, bucket.blobs, bucket.compression));
+        // Hand the cluster to the continuous encode pipeline. The
+        // bounded job channel provides the memory backpressure that
+        // the old batch-drain trigger used to.
+        let compression = bucket.compression;
+        self.send_cluster(cluster_idx, bucket.blobs, compression)?;
         // Reinsert empty bucket for reuse without map churn — keep
         // the same compression so subsequent items with this key
         // continue to land in compatible clusters.
-        self.buckets.insert(
-            key.to_string(),
-            Bucket::with_compression(bucket.compression),
-        );
-
-        // Drain trigger: either we hit thread-pool size (CPU-
-        // saturation default) OR the byte-cap is non-zero and the
-        // queue's running total exceeded it. Cap takes priority —
-        // a memory-conscious user wants a tight RSS bound even if
-        // it means smaller (fewer-thread) parallel batches.
-        let threads = rayon::current_num_threads().max(1);
-        let drain = if self.max_in_flight_bytes > 0 {
-            self.pending_bytes >= self.max_in_flight_bytes || self.pending_encode.len() >= threads
-        } else {
-            self.pending_encode.len() >= threads
-        };
-        if drain {
-            self.drain_pending_encode()?;
-        }
+        self.buckets
+            .insert(key.to_string(), Bucket::with_compression(compression));
         Ok(())
     }
 
-    /// Hand the queued clusters to a background task that encodes
-    /// them in parallel (rayon) and writes them sequentially in
-    /// cluster_idx order. The task owns the output file while it
-    /// runs, so the *producer* thread returns immediately and keeps
-    /// accepting items — compression of batch N overlaps with the
-    /// production (source reads, indexing, bin-packing) of batch
-    /// N+1. Results (final offsets, advanced file_pos, stats) are
-    /// folded back in at the next `join_encode_task`.
-    ///
-    /// At most one batch is in flight: we join the previous one
-    /// before spawning the next, so peak memory is bounded at two
-    /// batches (one encoding + one accumulating).
-    fn drain_pending_encode(&mut self) -> Result<()> {
-        if self.pending_encode.is_empty() {
-            return Ok(());
-        }
-        // Wait for the previous batch (also surfaces its errors) and
-        // reclaim the file handle before handing it to the new task.
-        self.join_encode_task()?;
-        let chunk = std::mem::take(&mut self.pending_encode);
-        // Queue is empty after the take — reset the running byte
-        // total so subsequent flushes start from zero.
-        self.pending_bytes = 0;
-        let level = self.compression_level;
-        let mut file = self.file.take().expect("file present after join");
-        let file_pos = self.file_pos;
-        self.encode_task = Some(std::thread::spawn(move || -> Result<EncodeBatchDone> {
-            let phase_start = Instant::now();
-            let clusters = chunk.len() as u64;
-            let mut encoded: Vec<(u32, Vec<u8>)> = chunk
-                .into_par_iter()
-                .map(|(idx, blobs, comp)| {
-                    encode_cluster(&blobs, comp, level).map(|bytes| (idx, bytes))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            encoded.sort_unstable_by_key(|(idx, _)| *idx);
-            let mut pos = file_pos;
-            let mut bytes_written = 0u64;
-            let mut offsets = Vec::with_capacity(encoded.len());
-            for (idx, bytes) in encoded {
-                offsets.push((idx, pos));
-                file.write_all(&bytes)?;
-                pos += bytes.len() as u64;
-                bytes_written += bytes.len() as u64;
-            }
-            Ok(EncodeBatchDone {
-                file,
-                file_pos: pos,
-                offsets,
-                clusters,
-                bytes_written,
-                encode_time: phase_start.elapsed(),
-            })
-        }));
-        Ok(())
-    }
-
-    /// Drain every non-empty bucket, in deterministic key order,
-    /// then drain the encode queue so all clusters are on disk.
-    /// Called once at finalize after all add_* work is done.
+    /// Flush every non-empty bucket into the encode pipeline, in
+    /// deterministic key order. Called at finalize after all add_*
+    /// work is done (the pipeline keeps running; `shutdown_pipeline`
+    /// is what lands everything on disk).
     fn flush_all_buckets(&mut self) -> Result<()> {
         let keys: Vec<String> = self
             .buckets
@@ -1824,7 +1853,6 @@ impl Streamer {
         for k in keys {
             self.flush_bucket(&k)?;
         }
-        self.drain_pending_encode()?;
         Ok(())
     }
 

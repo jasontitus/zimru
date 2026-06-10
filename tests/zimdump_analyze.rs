@@ -58,13 +58,27 @@ fn cluster_byte_ranges_cover_the_cluster_region() {
 
     let a = Archive::open(&out).expect("reopen");
     assert!(a.cluster_count() >= 2);
+    // Cluster *index* order is not guaranteed to match on-disk order
+    // (the writer emits clusters in encode-completion order), so
+    // collect every range and verify they tile the cluster region
+    // contiguously in *file* order with no gaps or overlaps.
+    let mut ranges: Vec<std::ops::Range<u64>> = (0..a.cluster_count())
+        .map(|idx| {
+            let r = a.cluster_byte_range(idx).unwrap();
+            assert!(r.end > r.start, "cluster {idx} has zero size");
+            r
+        })
+        .collect();
+    ranges.sort_by_key(|r| r.start);
     let mut total: u64 = 0;
     let mut prev_end: Option<u64> = None;
-    for idx in 0..a.cluster_count() {
-        let r = a.cluster_byte_range(idx).unwrap();
-        assert!(r.end > r.start, "cluster {idx} has zero size");
+    for r in &ranges {
         if let Some(prev) = prev_end {
-            assert_eq!(prev, r.start, "cluster {idx} not contiguous with previous");
+            assert_eq!(
+                prev, r.start,
+                "cluster region has a gap/overlap at offset {}",
+                r.start
+            );
         }
         total += r.end - r.start;
         prev_end = Some(r.end);
@@ -73,10 +87,8 @@ fn cluster_byte_ranges_cover_the_cluster_region() {
     // cluster region size. In the streaming-writer layout the cluster
     // region ends where the trailing url-pointer / title-pointer /
     // cluster-pointer / dirent tables begin, not at the checksum pos.
-    // The byte ranges returned by `cluster_byte_range` already encode
-    // that boundary; total of them is the region size.
-    let first = a.cluster_byte_range(0).unwrap().start;
-    let last = a.cluster_byte_range(a.cluster_count() - 1).unwrap().end;
+    let first = ranges.first().unwrap().start;
+    let last = ranges.last().unwrap().end;
     assert_eq!(total, last - first);
 
     let _ = std::fs::remove_file(&out);

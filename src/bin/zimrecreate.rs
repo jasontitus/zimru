@@ -297,6 +297,12 @@ fn run(
     while i < pending.len() {
         let cidx = pending[i].cluster;
         let cluster = source.cluster_uncached(cidx)?;
+        // Preserve the source cluster's compression choice: items the
+        // original writer left uncompressed (already-compressed media
+        // — JPEG, WebM, fonts …) stay uncompressed. Recompressing them
+        // costs the bulk of high-level zstd encode time for a ~2% size
+        // gain, and upstream zimrecreate keeps them raw too.
+        let keep_raw = cluster.compression() == Compression::None;
         while i < pending.len() && pending[i].cluster == cidx {
             let p = &pending[i];
             let data = cluster.blob(p.blob)?.to_vec();
@@ -307,12 +313,11 @@ fn run(
                     .unwrap_or_else(|_| String::from_utf8_lossy(&data));
                 indexer.feed_fulltext(&p.path, &p.title, &p.mime, &body, &language);
             }
-            creator.add_item(Item::new(
-                p.path.clone(),
-                p.title.clone(),
-                p.mime.clone(),
-                data,
-            ));
+            let mut item = Item::new(p.path.clone(), p.title.clone(), p.mime.clone(), data);
+            if keep_raw {
+                item = item.with_compress(false);
+            }
+            creator.add_item(item);
             i += 1;
         }
     }

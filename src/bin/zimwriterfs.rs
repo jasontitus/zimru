@@ -379,6 +379,11 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
         // Big non-HTML file → chunked-streaming path one-at-a-time.
         if !needs_full_read(e) && e.size >= STREAMING_THRESHOLD_BIN {
             let mime = mime_for_path(&e.path);
+            let compress_hint = if should_compress(&mime) {
+                None
+            } else {
+                Some(false)
+            };
             let mut f = fs::File::open(&e.path)?;
             // Hint the kernel: we're about to read this whole
             // file sequentially. On Linux this turns on aggressive
@@ -392,7 +397,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                 e.rel_str.clone(),
                 mime,
                 Some(e.size),
-                None,
+                compress_hint,
             )?;
             let mut buf = vec![0u8; 64 * 1024];
             loop {
@@ -474,7 +479,11 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                     .unwrap_or_else(|_| String::from_utf8_lossy(&it.content));
                 indexer.feed_fulltext(&it.rel_str, &it.title, &it.mime, &body, &language);
             }
-            creator.add_item(Item::new(it.rel_str, it.title, it.mime, it.content));
+            let mut item = Item::new(it.rel_str, it.title, it.mime, it.content);
+            if !should_compress(&item.mimetype) {
+                item = item.with_compress(false);
+            }
+            creator.add_item(item);
             count += 1;
             if o.verbose && count.is_multiple_of(100) {
                 eprintln!("[zimwriterfs] {count} items");
@@ -629,6 +638,31 @@ fn normalize_within(root: &Path, p: &Path) -> Option<String> {
     } else {
         Some(stack.join("/"))
     }
+}
+
+/// Whether content of this mimetype belongs in a compressed cluster.
+/// Mirrors upstream zimwriterfs/libzim behaviour: text-like formats
+/// compress; already-compressed media (JPEG, PNG, WebP, WebM, Ogg,
+/// fonts, archives …) goes into uncompressed clusters — recompressing
+/// it costs most of the high-level zstd encode time on media-heavy
+/// builds for a ~2% size gain.
+fn should_compress(mime: &str) -> bool {
+    let mime = mime.split(';').next().unwrap_or(mime).trim();
+    if mime.starts_with("text/") {
+        return true;
+    }
+    if mime.ends_with("+xml") || mime.ends_with("+json") {
+        return true;
+    }
+    matches!(
+        mime,
+        "application/javascript"
+            | "application/x-javascript"
+            | "application/ecmascript"
+            | "application/json"
+            | "application/xml"
+            | "application/wasm"
+    )
 }
 
 fn mime_for_path(p: &Path) -> String {
