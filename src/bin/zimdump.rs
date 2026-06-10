@@ -463,25 +463,39 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
             .unwrap()
             .push(format!("{}: {}", dest.display(), err));
     };
-    // Try `dest`; on a path collision retry under `_exceptions/`.
+    // Write an entry at its natural path, or — when `exiled` says its
+    // path is occupied by a shallower entry — directly under
+    // `_exceptions/`. A collision that slips through anyway (unusual
+    // filesystems) still falls back to `_exceptions/` at runtime.
     // `attempt` performs the actual filesystem operation (file write
     // or symlink creation) against the path it is given.
-    let write_with_fallback = |rel: &str, attempt: &dyn Fn(&PathBuf) -> io::Result<()>| {
-        let dest = dir.join(rel);
-        match attempt(&dest) {
-            Ok(()) => {}
-            Err(err) if is_collision(&err) => {
+    let write_with_fallback =
+        |rel: &str, exiled: bool, attempt: &dyn Fn(&PathBuf) -> io::Result<()>| {
+            let dest = dir.join(rel);
+            if exiled {
                 match exception_dest(&exceptions_dir, rel).and_then(|exc| {
                     attempt(&exc)?;
                     Ok(exc)
                 }) {
                     Ok(exc) => eprintln!("Wrote {} to {}", dest.display(), exc.display()),
-                    Err(err2) => log_failure(&dest, &err2),
+                    Err(err) => log_failure(&dest, &err),
                 }
+                return;
             }
-            Err(err) => log_failure(&dest, &err),
-        }
-    };
+            match attempt(&dest) {
+                Ok(()) => {}
+                Err(err) if is_collision(&err) => {
+                    match exception_dest(&exceptions_dir, rel).and_then(|exc| {
+                        attempt(&exc)?;
+                        Ok(exc)
+                    }) {
+                        Ok(exc) => eprintln!("Wrote {} to {}", dest.display(), exc.display()),
+                        Err(err2) => log_failure(&dest, &err2),
+                    }
+                }
+                Err(err) => log_failure(&dest, &err),
+            }
+        };
 
     // Pass 1 — dirents only, no cluster decompression: partition into
     // articles keyed by (cluster, blob) and redirects with their
@@ -504,6 +518,37 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
         }
     }
 
+    // Collision policy, decided up front so it's deterministic and
+    // independent of the parallel write order below: when an entry
+    // path is also a directory prefix of deeper entries (file `Foo`
+    // vs `Foo/bar`), the SHALLOW entry keeps its natural path and
+    // the nested entries are exiled to `_exceptions/`. Article links
+    // target `./Foo`, so letting the directory win (whichever write
+    // lost the race) used to dangle every link to the entry — on the
+    // Bashkir Wikipedia that was 243 articles linking to one exiled
+    // page.
+    let (exiled_articles, exiled_redirects) = {
+        let all_paths: std::collections::HashSet<&str> = articles
+            .iter()
+            .map(|(_, _, r)| r.as_str())
+            .chain(redirects.iter().map(|(r, _)| r.as_str()))
+            .collect();
+        let is_exiled = |rel: &str| -> bool {
+            let mut idx = 0;
+            while let Some(pos) = rel[idx..].find('/') {
+                idx += pos;
+                if all_paths.contains(&rel[..idx]) {
+                    return true;
+                }
+                idx += 1;
+            }
+            false
+        };
+        let a: Vec<bool> = articles.iter().map(|(_, _, r)| is_exiled(r)).collect();
+        let r: Vec<bool> = redirects.iter().map(|(r, _)| is_exiled(r)).collect();
+        (a, r)
+    };
+
     // Pass 2 — extract articles grouped by cluster so each cluster is
     // decompressed exactly once. URL order visits clusters in a near-
     // random sequence on real archives (the scraper packs clusters in
@@ -511,30 +556,35 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
     // re-decompress the same clusters hundreds of times. Clusters are
     // processed in parallel; `cluster_uncached` bypasses the shared
     // cache so peak memory is one decompressed cluster per thread.
-    articles.sort_unstable();
-    let mut groups: Vec<(u32, Vec<(u32, String)>)> = Vec::new();
-    for (cluster, blob, rel) in articles {
+    let mut arts: Vec<(u32, u32, String, bool)> = articles
+        .into_iter()
+        .zip(exiled_articles)
+        .map(|((c, b, r), e)| (c, b, r, e))
+        .collect();
+    arts.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let mut groups: Vec<(u32, Vec<(u32, String, bool)>)> = Vec::new();
+    for (cluster, blob, rel, exiled) in arts {
         match groups.last_mut() {
-            Some((c, v)) if *c == cluster => v.push((blob, rel)),
-            _ => groups.push((cluster, vec![(blob, rel)])),
+            Some((c, v)) if *c == cluster => v.push((blob, rel, exiled)),
+            _ => groups.push((cluster, vec![(blob, rel, exiled)])),
         }
     }
     groups
         .par_iter()
         .try_for_each(|(cluster_idx, blobs)| -> Result<(), Error> {
             let cluster = arc.cluster_uncached(*cluster_idx)?;
-            for (blob_idx, rel) in blobs {
+            for (blob_idx, rel, exiled) in blobs {
                 let data = cluster.blob(*blob_idx)?;
-                write_with_fallback(rel, &|dest| write_entry(dest, data));
+                write_with_fallback(rel, *exiled, &|dest| write_entry(dest, data));
             }
             Ok(())
         })?;
 
     // Pass 3 — redirects (no cluster access): symlinks or HTML stubs.
-    for (rel, target_rel) in &redirects {
+    for ((rel, target_rel), exiled) in redirects.iter().zip(exiled_redirects) {
         if opts.redirect {
             #[cfg(unix)]
-            write_with_fallback(rel, &|dest| {
+            write_with_fallback(rel, exiled, &|dest| {
                 // Symlink targets resolve relative to the *symlink's*
                 // directory, so prefix one `../` per directory level
                 // between the actual destination (which may be the
@@ -562,7 +612,7 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
                 "<html><head><meta http-equiv=\"refresh\" content=\"0; url={0}\"></head><body><a href=\"{0}\">{0}</a></body></html>",
                 target_rel
             );
-            write_with_fallback(rel, &|dest| write_entry(dest, html.as_bytes()));
+            write_with_fallback(rel, exiled, &|dest| write_entry(dest, html.as_bytes()));
         }
     }
 
