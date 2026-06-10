@@ -434,6 +434,10 @@ fn cmd_analyze(args: &[String]) -> Result<ExitCode, Error> {
 // ---------------- subcommand: dump ----------------
 
 fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
     let opts = parse_opts(args)?;
     let arc = open_archive(&opts)?;
     let dir = opts
@@ -442,8 +446,48 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
         .ok_or_else(|| io_err("dump requires --dir=DIR"))?;
     fs::create_dir_all(&dir)?;
     let target_ns = opts.ns;
-    let mut errors = 0usize;
-    let mut errlog = fs::File::create(dir.join("dump_errors.log")).ok();
+
+    // Filesystem path collisions are expected in real archives: an
+    // entry `Foo` (a file) can coexist with `Foo/bar` (which needs
+    // `Foo` to be a directory). Upstream zimdump resolves these by
+    // writing the colliding entry to `DIR/_exceptions/` with the
+    // path percent-escaped; we match that behaviour (and never
+    // abort the dump over a single entry).
+    let exceptions_dir = dir.join("_exceptions");
+    let errors = AtomicUsize::new(0);
+    let errlog: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let log_failure = |dest: &std::path::Path, err: &io::Error| {
+        errors.fetch_add(1, Ordering::Relaxed);
+        errlog
+            .lock()
+            .unwrap()
+            .push(format!("{}: {}", dest.display(), err));
+    };
+    // Try `dest`; on a path collision retry under `_exceptions/`.
+    // `attempt` performs the actual filesystem operation (file write
+    // or symlink creation) against the path it is given.
+    let write_with_fallback = |rel: &str, attempt: &dyn Fn(&PathBuf) -> io::Result<()>| {
+        let dest = dir.join(rel);
+        match attempt(&dest) {
+            Ok(()) => {}
+            Err(err) if is_collision(&err) => {
+                match exception_dest(&exceptions_dir, rel).and_then(|exc| {
+                    attempt(&exc)?;
+                    Ok(exc)
+                }) {
+                    Ok(exc) => eprintln!("Wrote {} to {}", dest.display(), exc.display()),
+                    Err(err2) => log_failure(&dest, &err2),
+                }
+            }
+            Err(err) => log_failure(&dest, &err),
+        }
+    };
+
+    // Pass 1 — dirents only, no cluster decompression: partition into
+    // articles keyed by (cluster, blob) and redirects with their
+    // resolved target paths.
+    let mut articles: Vec<(u32, u32, String)> = Vec::new();
+    let mut redirects: Vec<(String, String)> = Vec::new();
     for entry in arc.iter_by_path() {
         let e = entry?;
         if let Some(ns) = target_ns {
@@ -451,66 +495,124 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
                 continue;
             }
         }
-        if e.is_redirect() {
-            let target = e.get_redirect_entry()?;
-            let dest = dir.join(safe_path(e.path()));
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            if opts.redirect {
-                let _ = fs::remove_file(&dest);
-                let target_path = safe_path(target.path());
-                #[cfg(unix)]
-                {
-                    if let Err(err) = std::os::unix::fs::symlink(&target_path, &dest) {
-                        errors += 1;
-                        if let Some(f) = errlog.as_mut() {
-                            let _ = writeln!(
-                                f,
-                                "symlink {} -> {}: {}",
-                                dest.display(),
-                                target_path,
-                                err
-                            );
-                        }
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = (&target_path,);
-                }
-            } else {
-                // HTML redirect file
-                let html = format!(
-                    "<html><head><meta http-equiv=\"refresh\" content=\"0; url={0}\"></head><body><a href=\"{0}\">{0}</a></body></html>",
-                    safe_path(target.path())
-                );
-                if let Err(err) = fs::write(&dest, html) {
-                    errors += 1;
-                    if let Some(f) = errlog.as_mut() {
-                        let _ = writeln!(f, "write {}: {}", dest.display(), err);
-                    }
-                }
-            }
-        } else {
-            let item = e.get_item(false)?;
-            let dest = dir.join(safe_path(e.path()));
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            if let Err(err) = fs::write(&dest, item.get_data()?.data()) {
-                errors += 1;
-                if let Some(f) = errlog.as_mut() {
-                    let _ = writeln!(f, "write {}: {}", dest.display(), err);
-                }
+        match e.dirent() {
+            Dirent::Article(a) => articles.push((a.cluster, a.blob, safe_path(e.path()))),
+            Dirent::Redirect(_) => {
+                let target = e.get_redirect_entry()?;
+                redirects.push((safe_path(e.path()), safe_path(target.path())));
             }
         }
     }
-    if errors > 0 {
+
+    // Pass 2 — extract articles grouped by cluster so each cluster is
+    // decompressed exactly once. URL order visits clusters in a near-
+    // random sequence on real archives (the scraper packs clusters in
+    // crawl order, not URL order), which used to thrash the LRU and
+    // re-decompress the same clusters hundreds of times. Clusters are
+    // processed in parallel; `cluster_uncached` bypasses the shared
+    // cache so peak memory is one decompressed cluster per thread.
+    articles.sort_unstable();
+    let mut groups: Vec<(u32, Vec<(u32, String)>)> = Vec::new();
+    for (cluster, blob, rel) in articles {
+        match groups.last_mut() {
+            Some((c, v)) if *c == cluster => v.push((blob, rel)),
+            _ => groups.push((cluster, vec![(blob, rel)])),
+        }
+    }
+    groups
+        .par_iter()
+        .try_for_each(|(cluster_idx, blobs)| -> Result<(), Error> {
+            let cluster = arc.cluster_uncached(*cluster_idx)?;
+            for (blob_idx, rel) in blobs {
+                let data = cluster.blob(*blob_idx)?;
+                write_with_fallback(rel, &|dest| write_entry(dest, data));
+            }
+            Ok(())
+        })?;
+
+    // Pass 3 — redirects (no cluster access): symlinks or HTML stubs.
+    for (rel, target_rel) in &redirects {
+        if opts.redirect {
+            #[cfg(unix)]
+            write_with_fallback(rel, &|dest| {
+                // Symlink targets resolve relative to the *symlink's*
+                // directory, so prefix one `../` per directory level
+                // between the actual destination (which may be the
+                // `_exceptions/` fallback) and the dump root that
+                // `target_rel` is expressed against (matches upstream
+                // zimdump).
+                let depth = dest
+                    .strip_prefix(&dir)
+                    .map(|r| r.components().count().saturating_sub(1))
+                    .unwrap_or(0);
+                let mut link_target = String::new();
+                for _ in 0..depth {
+                    link_target.push_str("../");
+                }
+                link_target.push_str(target_rel);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let _ = fs::remove_file(dest);
+                std::os::unix::fs::symlink(&link_target, dest)
+            });
+        } else {
+            // HTML redirect file
+            let html = format!(
+                "<html><head><meta http-equiv=\"refresh\" content=\"0; url={0}\"></head><body><a href=\"{0}\">{0}</a></body></html>",
+                target_rel
+            );
+            write_with_fallback(rel, &|dest| write_entry(dest, html.as_bytes()));
+        }
+    }
+
+    let lines = errlog.into_inner().unwrap();
+    if let Ok(mut f) = fs::File::create(dir.join("dump_errors.log")) {
+        for l in &lines {
+            let _ = writeln!(f, "{l}");
+        }
+    }
+    if errors.into_inner() > 0 {
         Ok(ExitCode::from(2))
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// Create the parent directory chain and write `data` at `dest`.
+fn write_entry(dest: &PathBuf, data: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(dest, data)
+}
+
+/// True for errors caused by a file-vs-directory path collision:
+/// a parent component exists as a regular file (`NotADirectory` /
+/// `AlreadyExists` from create_dir_all) or the destination itself
+/// exists as a directory (`IsADirectory`).
+fn is_collision(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::AlreadyExists | io::ErrorKind::NotADirectory | io::ErrorKind::IsADirectory
+    )
+}
+
+/// `DIR/_exceptions/<escaped-rel-path>` — the fallback location for
+/// entries whose natural path collides. `/` is escaped as `%2f` (and
+/// `%` as `%25`) so the entry lands as a single flat file, matching
+/// upstream zimdump.
+fn exception_dest(exceptions_dir: &PathBuf, rel: &str) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(exceptions_dir)?;
+    let mut esc = String::with_capacity(rel.len());
+    for c in rel.chars() {
+        match c {
+            '%' => esc.push_str("%25"),
+            '/' => esc.push_str("%2f"),
+            _ => esc.push(c),
+        }
+    }
+    Ok(exceptions_dir.join(esc))
 }
 
 fn safe_path(p: &str) -> String {

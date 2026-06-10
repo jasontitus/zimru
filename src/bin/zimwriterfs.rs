@@ -340,7 +340,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
         size: u64,
         is_html: bool,
     }
-    let entries = walk_dir(html_dir)?;
+    let (entries, symlinks) = walk_dir(html_dir)?;
     let prepped: Vec<PrepEntry> = entries
         .into_iter()
         .map(|p| {
@@ -482,6 +482,54 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
         }
     }
 
+    // Symlinks become redirect entries, matching upstream
+    // zimwriterfs (and round-tripping `zimdump dump --redirect`
+    // output). Each link's target is resolved against the link's own
+    // directory, normalised, and re-expressed relative to
+    // HTML_DIRECTORY; links that point outside the tree or at
+    // nothing we walked are skipped with a warning.
+    if !symlinks.is_empty() {
+        use std::collections::HashSet;
+        let rel_of = |p: &Path| -> String {
+            let rel = p.strip_prefix(html_dir).unwrap_or(p);
+            if cfg!(windows) {
+                rel.to_string_lossy().replace('\\', "/")
+            } else {
+                rel.to_string_lossy().into_owned()
+            }
+        };
+        let mut known: HashSet<String> = prepped.iter().map(|e| e.rel_str.clone()).collect();
+        for link in &symlinks {
+            known.insert(rel_of(link));
+        }
+        for link in &symlinks {
+            let rel = rel_of(link);
+            let raw = match fs::read_link(link) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("zimwriterfs: skipping symlink {rel}: {e}");
+                    continue;
+                }
+            };
+            let joined = link.parent().unwrap_or(html_dir).join(&raw);
+            let target_rel = match normalize_within(html_dir, &joined) {
+                Some(t) if known.contains(&t) => t,
+                _ => {
+                    eprintln!(
+                        "zimwriterfs: skipping symlink {rel}: target {} not inside the html directory",
+                        raw.display()
+                    );
+                    continue;
+                }
+            };
+            creator.add_redirection(rel.clone(), rel.clone(), target_rel.clone());
+            // Redirects also go in the title index, with their
+            // target stored in value slot 1.
+            indexer.feed_title(&rel, &rel, &target_rel);
+            count += 1;
+        }
+    }
+
     // Drop the prepped list now that we're done with it.
     drop(prepped);
 
@@ -528,8 +576,13 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
 }
 
 /// Recursively yield every file under `dir`. Skips dotfiles (matches upstream).
-fn walk_dir(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+/// Recursively yield `(regular_files, symlinks)` under `dir`. Skips
+/// dotfiles (matches upstream). Symlinks are reported separately so
+/// the caller can turn them into redirect entries instead of either
+/// silently dropping them or duplicating the target's content.
+fn walk_dir(dir: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut out = Vec::new();
+    let mut links = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for entry in fs::read_dir(&d)? {
@@ -540,7 +593,9 @@ fn walk_dir(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
                 continue;
             }
             let ft = entry.file_type()?;
-            if ft.is_dir() {
+            if ft.is_symlink() {
+                links.push(path);
+            } else if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() {
                 out.push(path);
@@ -548,7 +603,32 @@ fn walk_dir(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         }
     }
     out.sort();
-    Ok(out)
+    links.sort();
+    Ok((out, links))
+}
+
+/// Normalise `p` (which may contain `.` / `..` components) and
+/// re-express it relative to `root` with `/` separators. Returns
+/// `None` if the path escapes `root` or normalises to nothing.
+fn normalize_within(root: &Path, p: &Path) -> Option<String> {
+    use std::path::Component;
+    let rel = p.strip_prefix(root).ok()?;
+    let mut stack: Vec<String> = Vec::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(x) => stack.push(x.to_string_lossy().into_owned()),
+            Component::ParentDir => {
+                stack.pop()?;
+            }
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if stack.is_empty() {
+        None
+    } else {
+        Some(stack.join("/"))
+    }
 }
 
 fn mime_for_path(p: &Path) -> String {
