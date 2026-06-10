@@ -208,6 +208,19 @@ fn run(
     //                        (the recreate isn't libzim's output).
     let ml = source.mime_list();
     let mut seen_metadata = std::collections::HashSet::new();
+
+    // Pass 1 — dirents only (no cluster decompression): redirects and
+    // small M-namespace entries are handled immediately; C-namespace
+    // articles are collected as (cluster, blob, path, title, mime)
+    // tuples for the cluster-grouped content pass below.
+    struct PendingContent {
+        cluster: u32,
+        blob: u32,
+        path: String,
+        title: String,
+        mime: String,
+    }
+    let mut pending: Vec<PendingContent> = Vec::new();
     for entry in source.iter_by_path() {
         let entry = entry?;
         let ns = entry.namespace();
@@ -243,28 +256,25 @@ fn run(
                 // Redirects in W/M/X namespaces are rebuilt implicitly by
                 // re-adding the underlying entries.
             }
-            Dirent::Article(_) => {
-                let item = entry.get_item(false)?;
+            Dirent::Article(a) => {
                 let mime = ml
-                    .get(match entry.dirent() {
-                        Dirent::Article(a) => a.mimetype,
-                        _ => 0,
-                    })
+                    .get(a.mimetype)
                     .unwrap_or("application/octet-stream")
                     .to_string();
-                let data = item.bytes()?;
                 if ns == b'C' {
-                    indexer.feed_title(path, title, "");
-                    if mime.starts_with("text/html") {
-                        let body = std::str::from_utf8(&data)
-                            .map(std::borrow::Cow::Borrowed)
-                            .unwrap_or_else(|_| String::from_utf8_lossy(&data));
-                        indexer.feed_fulltext(path, title, &mime, &body, &language);
-                    }
-                    creator.add_item(Item::new(path, title, mime, data));
+                    pending.push(PendingContent {
+                        cluster: a.cluster,
+                        blob: a.blob,
+                        path: path.to_string(),
+                        title: title.to_string(),
+                        mime,
+                    });
                 } else if ns == b'M' {
-                    // Strip the special illustration path back into add_illustration
-                    // where possible so the output is canonically shaped.
+                    // M-namespace entries are few and tiny; fetch them
+                    // directly. Strip the special illustration path back
+                    // into add_illustration where possible so the output
+                    // is canonically shaped.
+                    let data = entry.get_item(false)?.bytes()?;
                     if let Some(side) = parse_illustration_path(path) {
                         creator.add_illustration(side, data);
                     } else if seen_metadata.insert(path.to_string()) {
@@ -274,6 +284,39 @@ fn run(
             }
         }
     }
+
+    // Pass 2 — content, grouped by source cluster so each cluster is
+    // decompressed exactly once. Iterating in URL order instead visits
+    // clusters near-randomly (scrapers pack clusters in crawl order,
+    // not URL order) and thrashes the cluster LRU into re-decoding the
+    // same clusters dozens of times — on a 1.1 GB Wikipedia archive
+    // that was >5 minutes of redundant zstd work. `cluster_uncached`
+    // bypasses the shared cache, keeping memory at one decoded cluster.
+    pending.sort_unstable_by_key(|p| (p.cluster, p.blob));
+    let mut i = 0;
+    while i < pending.len() {
+        let cidx = pending[i].cluster;
+        let cluster = source.cluster_uncached(cidx)?;
+        while i < pending.len() && pending[i].cluster == cidx {
+            let p = &pending[i];
+            let data = cluster.blob(p.blob)?.to_vec();
+            indexer.feed_title(&p.path, &p.title, "");
+            if p.mime.starts_with("text/html") {
+                let body = std::str::from_utf8(&data)
+                    .map(std::borrow::Cow::Borrowed)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&data));
+                indexer.feed_fulltext(&p.path, &p.title, &p.mime, &body, &language);
+            }
+            creator.add_item(Item::new(
+                p.path.clone(),
+                p.title.clone(),
+                p.mime.clone(),
+                data,
+            ));
+            i += 1;
+        }
+    }
+    drop(pending);
 
     // Drain the helper, attach output blobs as X/* items.
     let blobs = indexer.finish(false);
