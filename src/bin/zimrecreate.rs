@@ -305,6 +305,17 @@ fn run(
         }
     }
 
+    // Stamp M/Scraper. We skipped the source's value above because the
+    // recreate isn't the original tool's output, but dropping it entirely
+    // loses provenance and leaves the archive a metadata key short of both
+    // the source and libzim's zimrecreate. Preserve the original value and
+    // record that zimru repackaged it.
+    let scraper = match read_metadata_string(&source, "Scraper") {
+        Some(orig) if !orig.is_empty() => format!("{orig}; recreated by {VERSION}"),
+        _ => VERSION.to_string(),
+    };
+    creator.add_metadata("Scraper", scraper);
+
     // Pass 2 — content, grouped by source cluster so each cluster is
     // decompressed exactly once. Iterating in URL order instead visits
     // clusters near-randomly (scrapers pack clusters in crawl order,
