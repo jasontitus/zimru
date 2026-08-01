@@ -22,7 +22,6 @@
 //! payload reaches `cluster_size_target` bytes (default 2 MiB, matching
 //! upstream `zimwriterfs`).
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write as _};
@@ -165,6 +164,39 @@ fn compression_tag(c: Compression) -> &'static str {
         Compression::None => "n",
         Compression::Zstd => "z",
         Compression::Xz => "x",
+    }
+}
+
+/// Render an item's bucket key into `dst` (cleared first): the
+/// compression tag, `|`, then the strategy component. Pure function of
+/// `path`, `mimetype`, and the item's effective compression — two items
+/// with the same strategy key but different effective compressions land
+/// in distinct buckets and therefore distinct clusters. The compression
+/// tag goes first so the BTreeMap iteration order interleaves cleanly
+/// when both compressed and raw clusters exist. Writing into a caller-
+/// owned buffer keeps the streaming hot path allocation-free (the
+/// buffer is reused across `push_item` calls).
+fn write_bucket_key(
+    dst: &mut String,
+    strategy: ClusterStrategy,
+    path: &str,
+    mimetype: &str,
+    compression: Compression,
+) {
+    dst.clear();
+    dst.push_str(compression_tag(compression));
+    dst.push('|');
+    match strategy {
+        ClusterStrategy::Single => {}
+        ClusterStrategy::ByMime => dst.push_str(mimetype),
+        ClusterStrategy::ByExtension => match path.rsplit_once('.') {
+            Some((_, ext)) if !ext.contains('/') => dst.push_str(ext),
+            _ => {}
+        },
+        ClusterStrategy::ByFirstPathSegment => match path.split_once('/') {
+            Some((head, _)) => dst.push_str(head),
+            None => dst.push_str(path),
+        },
     }
 }
 
@@ -1097,6 +1129,15 @@ struct Streamer {
     // `ZIMRU_STATS` is set in the environment.
     started: Instant,
     stats: BuildStats,
+    /// Whether `ZIMRU_STATS` was set when the build started. Gates the
+    /// per-chunk clock reads on the streaming paths — timing that only
+    /// feeds an opt-in report shouldn't cost two `Instant::now()` per
+    /// chunk on every build.
+    stats_enabled: bool,
+
+    /// Reusable buffer for `write_bucket_key` — one allocation for the
+    /// whole build instead of one per `push_item`.
+    key_scratch: String,
 }
 
 /// One in-flight cluster's worth of un-flushed work for a single
@@ -1325,6 +1366,8 @@ impl Streamer {
             pipeline: None,
             started: Instant::now(),
             stats: BuildStats::default(),
+            stats_enabled: std::env::var_os("ZIMRU_STATS").is_some(),
+            key_scratch: String::new(),
         })
     }
 
@@ -1506,11 +1549,13 @@ impl Streamer {
                         *expected_size
                     ))));
                 }
-                let phase_start = Instant::now();
+                let phase_start = self.stats_enabled.then(Instant::now);
                 let r = encoder
                     .write_all(chunk)
                     .map_err(|e| Error::Decompression(format!("zstd chunk write: {e}")));
-                self.stats.streaming_encode += phase_start.elapsed();
+                if let Some(t) = phase_start {
+                    self.stats.streaming_encode += t.elapsed();
+                }
                 r?;
                 if let Some(ChunkedInFlight::StreamingZstd { bytes_written, .. }) =
                     self.in_flight.as_mut()
@@ -1532,11 +1577,13 @@ impl Streamer {
                         *expected_size
                     ))));
                 }
-                let phase_start = Instant::now();
+                let phase_start = self.stats_enabled.then(Instant::now);
                 let r = temp_file
                     .write_all(chunk)
                     .map_err(|e| Error::Io(std::io::Error::other(format!("raw chunk write: {e}"))));
-                self.stats.streaming_encode += phase_start.elapsed();
+                if let Some(t) = phase_start {
+                    self.stats.streaming_encode += t.elapsed();
+                }
                 r?;
                 *bytes_written += chunk.len() as u64;
                 Ok(())
@@ -1713,44 +1760,6 @@ impl Streamer {
         Ok(())
     }
 
-    /// Pick which bucket an item joins under the active strategy.
-    /// Pure function of `path`, `mimetype`, and the item's effective
-    /// compression — so two items with the same strategy key but
-    /// different effective compressions land in distinct buckets and
-    /// therefore distinct clusters. The compression tag goes first so
-    /// the BTreeMap iteration order interleaves cleanly when both
-    /// compressed and raw clusters exist.
-    fn bucket_key(
-        &self,
-        path: &str,
-        mimetype: &str,
-        compression: Compression,
-    ) -> Cow<'static, str> {
-        let tag = compression_tag(compression);
-        let strat: &str = match self.cluster_strategy {
-            // Fast path for the default strategy: the key is one of
-            // three static strings, so the per-item allocation
-            // disappears entirely.
-            ClusterStrategy::Single => {
-                return Cow::Borrowed(match compression {
-                    Compression::None => "n|",
-                    Compression::Zstd => "z|",
-                    Compression::Xz => "x|",
-                });
-            }
-            ClusterStrategy::ByMime => mimetype,
-            ClusterStrategy::ByExtension => match path.rsplit_once('.') {
-                Some((_, ext)) if !ext.contains('/') => ext,
-                _ => "",
-            },
-            ClusterStrategy::ByFirstPathSegment => match path.split_once('/') {
-                Some((head, _)) => head,
-                None => path,
-            },
-        };
-        Cow::Owned(format!("{tag}|{strat}"))
-    }
-
     /// Stream-process one item: bin-pack its body into the bucket
     /// it belongs to, flush that bucket if it overflows, record the
     /// pending dirent (committed at the bucket's next flush).
@@ -1766,23 +1775,33 @@ impl Streamer {
         self.stats.items_buffered += 1;
         self.stats.raw_bytes_total += body_len as u64;
         let comp = effective_compression(self.compression, item.compress);
-        let key = self.bucket_key(&item.path, &item.mimetype, comp);
+        // Reusable key buffer — no per-item allocation on any strategy
+        // (the old shape paid a `format!` String per item for every
+        // non-default strategy).
+        let mut key = std::mem::take(&mut self.key_scratch);
+        write_bucket_key(
+            &mut key,
+            self.cluster_strategy,
+            &item.path,
+            &item.mimetype,
+            comp,
+        );
 
-        // Ensure the bucket exists, then check overflow against
-        // *this* bucket's running size (not a global running size).
-        let needs_flush = match self.buckets.get(key.as_ref()) {
-            Some(b) => !b.blobs.is_empty() && b.size_bytes + body_len > self.cluster_size_target,
-            None => false,
-        };
-        if needs_flush {
-            self.flush_bucket(key.as_ref())?;
+        // One immutable probe decides overflow against *this* bucket's
+        // running size. `flush_bucket` empties the bucket in place, so
+        // afterwards a single `get_mut` probe suffices in every case
+        // except the first item for a fresh key.
+        match self.buckets.get(key.as_str()) {
+            Some(b) if !b.blobs.is_empty() && b.size_bytes + body_len > self.cluster_size_target => {
+                self.flush_bucket(key.as_str())?;
+            }
+            Some(_) => {}
+            None => {
+                self.buckets
+                    .insert(key.clone(), Bucket::with_compression(comp));
+            }
         }
-
-        if !self.buckets.contains_key(key.as_ref()) {
-            self.buckets
-                .insert(key.clone().into_owned(), Bucket::with_compression(comp));
-        }
-        let bucket = self.buckets.get_mut(key.as_ref()).expect("just inserted");
+        let bucket = self.buckets.get_mut(key.as_str()).expect("bucket present");
         let blob_idx = bucket.blobs.len() as u32;
         bucket.blobs.push(body);
         bucket.size_bytes += body_len;
@@ -1793,6 +1812,7 @@ impl Streamer {
             mime_idx,
             blob_idx,
         });
+        self.key_scratch = key;
         Ok(())
     }
 
@@ -1802,25 +1822,25 @@ impl Streamer {
     /// compresses on worker threads and writes from its own writer
     /// thread; everything is on disk after `shutdown_pipeline`.
     fn flush_bucket(&mut self, key: &str) -> Result<()> {
-        let bucket = match self.buckets.remove(key) {
-            Some(b) if !b.blobs.is_empty() => b,
-            // Empty bucket — nothing to do; reinsert empty so the
-            // map shape is stable across call patterns. Carry the
-            // bucket's recorded compression forward so the next item
-            // landing in this key keeps the same target compression.
-            Some(b) => {
-                self.buckets
-                    .insert(key.to_string(), Bucket::with_compression(b.compression));
-                return Ok(());
+        // Empty the bucket in place (`mem::take`) rather than
+        // remove-then-reinsert: no BTreeMap node churn, no key
+        // re-allocation, and the bucket keeps its compression for
+        // subsequent items with this key.
+        let (blobs, pending, compression) = match self.buckets.get_mut(key) {
+            Some(b) if !b.blobs.is_empty() => {
+                let blobs = std::mem::take(&mut b.blobs);
+                let pending = std::mem::take(&mut b.pending);
+                b.size_bytes = 0;
+                (blobs, pending, b.compression)
             }
-            None => return Ok(()),
+            _ => return Ok(()),
         };
         let cluster_idx = self.cluster_offsets.len() as u32;
         // Reserve the slot now (offset filled in when we write).
         self.cluster_offsets.push(0);
         // Commit dirents — this cluster_idx is final regardless of
         // when the encode completes.
-        for pa in bucket.pending {
+        for pa in pending {
             self.dirents.push(RawDirent::Article {
                 namespace: pa.namespace,
                 url: pa.url,
@@ -1833,14 +1853,7 @@ impl Streamer {
         // Hand the cluster to the continuous encode pipeline. The
         // bounded job channel provides the memory backpressure that
         // the old batch-drain trigger used to.
-        let compression = bucket.compression;
-        self.send_cluster(cluster_idx, bucket.blobs, compression)?;
-        // Reinsert empty bucket for reuse without map churn — keep
-        // the same compression so subsequent items with this key
-        // continue to land in compatible clusters.
-        self.buckets
-            .insert(key.to_string(), Bucket::with_compression(compression));
-        Ok(())
+        self.send_cluster(cluster_idx, blobs, compression)
     }
 
     /// Flush every non-empty bucket into the encode pipeline, in
@@ -2089,17 +2102,47 @@ impl Streamer {
                 .then_with(|| a.url().cmp(b.url()))
         });
 
-        // 6d. Final title-pointer order — over all dirents
-        //     including the listing entry. This is what gets
-        //     written to the title pointer table.
-        let mut title_order: Vec<u32> = (0..self.dirents.len() as u32).collect();
-        title_order.sort_unstable_by(|&a, &b| {
-            let da = &self.dirents[a as usize];
-            let db = &self.dirents[b as usize];
-            da.namespace()
-                .cmp(&db.namespace())
-                .then_with(|| da.title().cmp(db.title()))
-        });
+        // 6d. Final title-pointer order — over all dirents including
+        //     the listing entry. The snapshot from 6a is already in
+        //     title order; the only dirent added since is the listing
+        //     entry (when we emitted one), so remap the snapshot's
+        //     URL indices around the listing's slot and binary-insert
+        //     that single entry instead of paying a second full
+        //     O(n log n) title sort over every dirent.
+        let title_order: Vec<u32> = if listing_already_set {
+            title_order_snapshot
+        } else {
+            let listing_idx = self
+                .dirents
+                .binary_search_by(|d| {
+                    d.namespace()
+                        .cmp(&b'X')
+                        .then_with(|| d.url().cmp("listing/titleOrdered/v1"))
+                })
+                .map_err(|_| {
+                    Error::Io(std::io::Error::other(
+                        "titleOrdered listing dirent missing after emit",
+                    ))
+                })? as u32;
+            // Old URL index i becomes i+1 for every dirent that now
+            // sorts after the listing entry.
+            let mut t: Vec<u32> = Vec::with_capacity(title_order_snapshot.len() + 1);
+            t.extend(
+                title_order_snapshot
+                    .iter()
+                    .map(|&i| if i >= listing_idx { i + 1 } else { i }),
+            );
+            let ld = &self.dirents[listing_idx as usize];
+            let pos = t.partition_point(|&i| {
+                let d = &self.dirents[i as usize];
+                d.namespace()
+                    .cmp(&ld.namespace())
+                    .then_with(|| d.title().cmp(ld.title()))
+                    .is_le()
+            });
+            t.insert(pos, listing_idx);
+            t
+        };
 
         // 7. Compute layout positions for the trailing tables.
         let entry_count = self.dirents.len() as u32;

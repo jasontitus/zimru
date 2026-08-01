@@ -9,10 +9,15 @@ use crate::Archive;
 /// cache used to give C callers stable `const char*` pointers.
 pub struct zimru_archive_t {
     pub(crate) inner: Archive,
-    /// Stable storage for paths/titles returned by `zimru_archive_metadata_key`
-    /// and similar lookup-by-index calls. Each call appends a CString and
-    /// returns its `.as_ptr()`; the storage lives until the archive is freed.
-    pub(crate) interned: std::sync::Mutex<Vec<CString>>,
+    /// Stable storage for strings returned by `zimru_archive_metadata`,
+    /// `zimru_archive_metadata_key`, and similar lookup calls, keyed by
+    /// what was looked up so repeated calls reuse the same CString
+    /// (returning the identical pointer) instead of growing the store
+    /// by one allocation per call for the archive's lifetime. Moving a
+    /// `CString` inside the map on rehash does not move its heap
+    /// buffer, so handed-out pointers stay valid until the archive is
+    /// freed.
+    pub(crate) interned: std::sync::Mutex<std::collections::HashMap<String, CString>>,
 }
 
 /// Open the archive at `path` (UTF-8, NUL-terminated). Returns NULL on
@@ -36,7 +41,7 @@ pub unsafe extern "C" fn zimru_archive_open(
     match Archive::open(PathBuf::from(path_str)) {
         Ok(a) => Box::into_raw(Box::new(zimru_archive_t {
             inner: a,
-            interned: std::sync::Mutex::new(Vec::new()),
+            interned: std::sync::Mutex::new(std::collections::HashMap::new()),
         })),
         Err(e) => {
             set_err(err, e);
@@ -699,24 +704,30 @@ pub unsafe extern "C" fn zimru_archive_metadata(
             return std::ptr::null();
         }
     };
+    // Cache hit: a previous call already read and interned this key's
+    // value — hand back the same stable pointer, no archive read, no
+    // new allocation.
+    let cache_key = format!("value:{name_str}");
+    {
+        let interned = (*arc).interned.lock().unwrap();
+        if let Some(cs) = interned.get(&cache_key) {
+            if !out_len.is_null() {
+                *out_len = cs.as_bytes().len();
+            }
+            return cs.as_ptr() as *const u8;
+        }
+    }
     match (*arc).inner.get_metadata(name_str) {
         Ok(bytes) => {
             // Stash the bytes in the interned cache so the pointer stays
-            // valid until the archive is freed. Wrap as a CString-ish
-            // (Vec) — we use CString's underlying allocation by going via
-            // Box<[u8]> kept alongside.
-            let mut interned = (*arc).interned.lock().unwrap();
-            // Use CString as a stable buffer; allow interior NULs by using
-            // CString::from_vec_with_nul_unchecked? Cleaner: just keep
-            // bytes in a Vec<u8> via a parallel store. For simplicity we
-            // make a CString with a trailing NUL appended, but only return
-            // the original byte length so callers don't see it.
+            // valid until the archive is freed. We make a CString with a
+            // trailing NUL appended, but only return the original byte
+            // length so callers don't see it.
             let mut bytes_with_nul = bytes.clone();
             bytes_with_nul.push(0);
             // CString::from_vec_with_nul requires no interior NULs; tolerate
-            // them by going through unchecked.
+            // them by falling back to lossy NUL replacement (same length).
             let cs = CString::from_vec_with_nul(bytes_with_nul).unwrap_or_else(|_| {
-                // Fall back to lossy NUL replacement for binary metadata.
                 let cleaned: Vec<u8> = bytes
                     .iter()
                     .map(|&b| if b == 0 { b' ' } else { b })
@@ -724,7 +735,7 @@ pub unsafe extern "C" fn zimru_archive_metadata(
                 CString::new(cleaned).unwrap()
             });
             let ptr = cs.as_ptr() as *const u8;
-            interned.push(cs);
+            (*arc).interned.lock().unwrap().insert(cache_key, cs);
             if !out_len.is_null() {
                 *out_len = bytes.len();
             }
@@ -826,6 +837,15 @@ pub unsafe extern "C" fn zimru_archive_metadata_key(
     if arc.is_null() {
         return std::ptr::null();
     }
+    // Repeated calls for the same index reuse the interned CString
+    // instead of appending a fresh allocation per call.
+    let cache_key = format!("key:{idx}");
+    {
+        let interned = (*arc).interned.lock().unwrap();
+        if let Some(cs) = interned.get(&cache_key) {
+            return cs.as_ptr();
+        }
+    }
     let keys = (*arc).inner.get_metadata_keys();
     let Some(k) = keys.get(idx) else {
         return std::ptr::null();
@@ -835,6 +855,6 @@ pub unsafe extern "C" fn zimru_archive_metadata_key(
         Err(_) => return std::ptr::null(),
     };
     let ptr = cs.as_ptr();
-    (*arc).interned.lock().unwrap().push(cs);
+    (*arc).interned.lock().unwrap().insert(cache_key, cs);
     ptr
 }

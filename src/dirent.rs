@@ -75,11 +75,10 @@ impl Dirent {
                     namespace,
                     redirect_index,
                     url: url.to_string(),
-                    title: if title.is_empty() {
-                        url.to_string()
-                    } else {
-                        title.to_string()
-                    },
+                    // Stored verbatim — an empty on-disk title (the common
+                    // case for writers that omit title == url) costs no
+                    // allocation; the url fallback happens in `title()`.
+                    title: title.to_string(),
                 }))
             }
             MIME_LINKTARGET | MIME_DELETED => {
@@ -95,11 +94,7 @@ impl Dirent {
                     cluster,
                     blob,
                     url: url.to_string(),
-                    title: if title.is_empty() {
-                        url.to_string()
-                    } else {
-                        title.to_string()
-                    },
+                    title: title.to_string(),
                 }))
             }
             _ => {
@@ -114,11 +109,7 @@ impl Dirent {
                     cluster,
                     blob,
                     url: url.to_string(),
-                    title: if title.is_empty() {
-                        url.to_string()
-                    } else {
-                        title.to_string()
-                    },
+                    title: title.to_string(),
                 }))
             }
         }
@@ -167,10 +158,26 @@ impl Dirent {
         }
     }
 
+    /// Display title, falling back to the url when the on-disk title
+    /// field is empty (writers omit the title when it equals the url).
+    /// The fallback lives here — not in `parse` — so parsing an
+    /// empty-title dirent doesn't allocate the url twice.
     pub fn title(&self) -> &str {
         match self {
-            Dirent::Article(a) => &a.title,
-            Dirent::Redirect(r) => &r.title,
+            Dirent::Article(a) => {
+                if a.title.is_empty() {
+                    &a.url
+                } else {
+                    &a.title
+                }
+            }
+            Dirent::Redirect(r) => {
+                if r.title.is_empty() {
+                    &r.url
+                } else {
+                    &r.title
+                }
+            }
         }
     }
 

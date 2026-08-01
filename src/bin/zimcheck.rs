@@ -661,6 +661,24 @@ fn scan_content(
         k
     };
 
+    // Existence set for the internal-link check, built in one pass over
+    // the C namespace (articles *and* redirects — links may target
+    // either). The old shape ran `entry_by_ns_path` — an O(log N)
+    // binary search with per-probe dirent key parsing — once per link
+    // across every HTML article in the archive.
+    let content_paths: Option<std::collections::HashSet<String>> = if do_internal {
+        let range = arc.namespace_range(b'C').unwrap_or(0..0);
+        let mut set = std::collections::HashSet::with_capacity(range.len());
+        for i in range {
+            if let Ok(e) = arc.entry_by_url_index(i) {
+                set.insert(e.path().to_string());
+            }
+        }
+        Some(set)
+    } else {
+        None
+    };
+
     #[derive(Default)]
     struct PerEntryFinding {
         url_index: u32,
@@ -725,7 +743,10 @@ fn scan_content(
                                         stripped.split(['#', '?']).next().unwrap_or(stripped);
                                     let decoded = percent_decode(no_frag);
                                     let resolved = resolve_relative(&b.path, &decoded);
-                                    if arc.entry_by_ns_path(b'C', &resolved).is_err() {
+                                    let exists = content_paths
+                                        .as_ref()
+                                        .is_some_and(|s| s.contains(resolved.as_str()));
+                                    if !exists {
                                         f.dangling.push((no_frag.to_string(), resolved));
                                     }
                                 }

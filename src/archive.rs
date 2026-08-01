@@ -633,11 +633,16 @@ impl Archive {
             }
         }
         // Linear fallback for non-content namespaces in modern archives.
-        let n = self.core.header.entry_count;
-        for i in 0..n {
+        // Bounded to the namespace's contiguous URL-pointer range (the
+        // URL-pointer list is sorted by `(ns, url)`) instead of scanning
+        // every dirent in the archive, and probed with the allocation-
+        // free key reader — the full dirent is only materialized on the
+        // match.
+        for i in self.namespace_range(ns)? {
             let off = self.url_pointer(i)?;
-            let d = Dirent::parse(&self.core.mmap, off as usize)?;
-            if d.namespace() == ns && d.title() == title {
+            let (_, d_title) = Dirent::title_key_at(&self.core.mmap, off as usize)?;
+            if d_title == title {
+                let d = Dirent::parse(&self.core.mmap, off as usize)?;
                 return Ok(Entry {
                     archive: self.clone(),
                     url_index: i,
@@ -730,18 +735,22 @@ impl Archive {
 
     /// List all metadata keys (entries in the `M` namespace).
     pub fn get_metadata_keys(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        let n = self.core.header.entry_count;
-        for i in 0..n {
+        // The M namespace is a contiguous slice of the sorted URL-pointer
+        // list — iterate just that range (a handful of entries) instead
+        // of parsing every dirent in the archive, and read only the url
+        // key rather than materializing full dirents.
+        let Ok(range) = self.namespace_range(NS_METADATA) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(range.len());
+        for i in range {
             let Ok(off) = self.url_pointer(i) else {
                 continue;
             };
-            let Ok(d) = Dirent::parse(&self.core.mmap, off as usize) else {
+            let Ok((_, url)) = Dirent::key_at(&self.core.mmap, off as usize) else {
                 continue;
             };
-            if d.namespace() == NS_METADATA {
-                out.push(d.url().to_string());
-            }
+            out.push(url.to_string());
         }
         out
     }
@@ -1039,21 +1048,20 @@ impl Archive {
     /// uncompressed by convention) to libxapian via `Database(int fd)`
     /// + `lseek` without copying any bytes.
     pub fn blob_direct_access(&self, cluster_idx: u32, blob_idx: u32) -> Result<DirectAccess> {
-        let cluster_range = self.cluster_byte_range(cluster_idx)?;
-        let cluster = self.cluster(cluster_idx)?;
-        match cluster.compression() {
-            crate::Compression::None => {
-                let r = cluster.blob_range(blob_idx)?;
-                let len = r.end - r.start;
-                // The cluster's payload starts immediately after the
-                // 1-byte info byte at the start of the on-disk cluster.
-                Ok(DirectAccess {
-                    is_direct: true,
-                    file_offset: cluster_range.start + 1 + r.start as u64,
-                    size: len as u64,
-                })
-            }
-            _ => Ok(DirectAccess {
+        // Read the blob offset table straight out of the mmap. The old
+        // shape ran `Cluster::parse`, which for uncompressed clusters
+        // heap-copies the whole cluster body into the LRU cache — a
+        // multi-GB copy (and hot-cluster eviction) on the one path whose
+        // purpose is to hand out an fd offset *without* touching bytes.
+        let cluster_start = self.cluster_pointer(cluster_idx)?;
+        let raw = self.cluster_raw(cluster_idx)?;
+        match crate::cluster::uncompressed_blob_range(raw, blob_idx)? {
+            Some(r) => Ok(DirectAccess {
+                is_direct: true,
+                file_offset: cluster_start + r.start,
+                size: r.end - r.start,
+            }),
+            None => Ok(DirectAccess {
                 is_direct: false,
                 file_offset: 0,
                 size: 0,
@@ -1487,7 +1495,11 @@ impl Item {
     }
 
     pub fn title(&self) -> &str {
-        &self.article.title
+        if self.article.title.is_empty() {
+            &self.article.url
+        } else {
+            &self.article.title
+        }
     }
 
     /// Single-byte namespace this item belongs to (e.g. `b'C'`, `b'A'`).
@@ -1527,6 +1539,15 @@ impl Item {
 
     /// Total decompressed size of the underlying blob in bytes.
     pub fn size(&self) -> Result<u64> {
+        // Uncompressed-cluster fast path: the size is computable from
+        // the on-disk offset table alone — don't materialize (and
+        // cache) the whole cluster just to answer a u64.
+        let direct = self
+            .archive
+            .blob_direct_access(self.article.cluster, self.article.blob)?;
+        if direct.is_direct {
+            return Ok(direct.size);
+        }
         let blob = self.get_data()?;
         Ok(blob.size() as u64)
     }

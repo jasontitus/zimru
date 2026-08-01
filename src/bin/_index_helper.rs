@@ -21,9 +21,15 @@
 //!   once via `feed_*`. Output is written to a temp file passed on the
 //!   CLI; on `finish()` we close stdin, wait, and read the file back.
 
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
+
+/// Buffer in front of each child's stdin pipe. One entry-doc per
+/// `write(2)` syscall (the old shape) costs millions of pipe writes on
+/// a Wikipedia-scale build; batching to 256 KiB amortises that to a
+/// few writes per MB of index feed.
+const STDIN_BUF_CAP: usize = 256 * 1024;
 
 /// Output of one `xapianbuilder` run.
 pub struct IndexBlob {
@@ -37,9 +43,12 @@ pub struct IndexBlob {
 /// path it'll write to.
 struct Job {
     child: Child,
-    stdin: Option<ChildStdin>,
+    stdin: Option<BufWriter<ChildStdin>>,
     out_path: PathBuf,
     url: &'static str,
+    /// Reusable per-job serialisation buffer — one allocation for the
+    /// whole build instead of a fresh `Vec` per fed entry.
+    scratch: Vec<u8>,
 }
 
 /// Public face of the helper. Internally either holds two live
@@ -50,6 +59,9 @@ pub struct IndexHelper {
     state: State,
 }
 
+// One IndexHelper exists per process, so the size gap between the
+// variants (Job grew a BufWriter + scratch Vec) is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum State {
     Active { fulltext: Job, title: Job },
     Disabled,
@@ -83,42 +95,42 @@ fn write_json_string(out: &mut Vec<u8>, s: &str) {
     out.push(b'"');
 }
 
-fn encode_title_doc(path: &str, title: &str, target_path: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(path.len() + title.len() + 64);
+fn encode_title_doc(buf: &mut Vec<u8>, path: &str, title: &str, target_path: &str) {
+    buf.clear();
     buf.push(b'{');
     buf.extend_from_slice(b"\"path\":");
-    write_json_string(&mut buf, path);
+    write_json_string(buf, path);
     buf.extend_from_slice(b",\"title\":");
-    write_json_string(&mut buf, title);
+    write_json_string(buf, title);
     if !target_path.is_empty() {
         buf.extend_from_slice(b",\"target_path\":");
-        write_json_string(&mut buf, target_path);
+        write_json_string(buf, target_path);
     }
     buf.extend_from_slice(b"}\n");
-    buf
 }
 
 fn encode_fulltext_doc(
+    buf: &mut Vec<u8>,
     path: &str,
     title: &str,
     mimetype: &str,
     body: &str,
     language: &str,
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(body.len() + path.len() + 128);
+) {
+    buf.clear();
+    buf.reserve(body.len() + path.len() + 128);
     buf.push(b'{');
     buf.extend_from_slice(b"\"path\":");
-    write_json_string(&mut buf, path);
+    write_json_string(buf, path);
     buf.extend_from_slice(b",\"title\":");
-    write_json_string(&mut buf, title);
+    write_json_string(buf, title);
     buf.extend_from_slice(b",\"mimetype\":");
-    write_json_string(&mut buf, mimetype);
+    write_json_string(buf, mimetype);
     buf.extend_from_slice(b",\"language\":");
-    write_json_string(&mut buf, language);
+    write_json_string(buf, language);
     buf.extend_from_slice(b",\"body\":");
-    write_json_string(&mut buf, body);
+    write_json_string(buf, body);
     buf.extend_from_slice(b"}\n");
-    buf
 }
 
 impl IndexHelper {
@@ -185,8 +197,10 @@ impl IndexHelper {
         let State::Active { title: t, .. } = &mut self.state else {
             return;
         };
-        let buf = encode_title_doc(path, title, target_path);
+        let mut buf = std::mem::take(&mut t.scratch);
+        encode_title_doc(&mut buf, path, title, target_path);
         write_raw(t, &buf);
+        t.scratch = buf;
     }
 
     /// Feed one entry to the fulltext index. Skip non-HTML entries:
@@ -212,8 +226,10 @@ impl IndexHelper {
         let State::Active { fulltext, .. } = &mut self.state else {
             return;
         };
-        let buf = encode_fulltext_doc(path, title, mimetype, body, language);
+        let mut buf = std::mem::take(&mut fulltext.scratch);
+        encode_fulltext_doc(&mut buf, path, title, mimetype, body, language);
         write_raw(fulltext, &buf);
+        fulltext.scratch = buf;
     }
 
     /// Close stdin on both children, wait, and return the produced
@@ -229,9 +245,13 @@ impl IndexHelper {
             return Vec::new();
         };
 
-        // Close stdin pipes so the children see EOF and finalise.
-        fulltext.stdin.take();
-        title.stdin.take();
+        // Flush the write buffers, then close stdin pipes so the
+        // children see EOF and finalise.
+        for j in [&mut fulltext, &mut title] {
+            if let Some(mut s) = j.stdin.take() {
+                let _ = s.flush();
+            }
+        }
 
         let mut blobs = Vec::with_capacity(2);
         for job in [fulltext, title] {
@@ -321,12 +341,16 @@ fn spawn_one(
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()?;
-    let stdin = child.stdin.take();
+    let stdin = child
+        .stdin
+        .take()
+        .map(|s| BufWriter::with_capacity(STDIN_BUF_CAP, s));
     Ok(Job {
         child,
         stdin,
         out_path: out_path.to_path_buf(),
         url,
+        scratch: Vec::new(),
     })
 }
 

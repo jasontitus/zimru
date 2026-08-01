@@ -139,6 +139,55 @@ impl Cluster {
     }
 }
 
+/// For an *uncompressed* on-disk cluster (`raw` includes the leading
+/// info byte), compute blob `idx`'s byte range **relative to the start
+/// of `raw`** straight from the offset table — no payload copy, no
+/// cache insertion. Returns `Ok(None)` when the cluster is compressed
+/// (callers fall back to the decode path).
+///
+/// This is the zero-copy primitive behind
+/// [`crate::Archive::blob_direct_access`]: previously that path ran a
+/// full `Cluster::parse`, which for `Compression::None` heap-copies the
+/// entire cluster body and pins it in the LRU cache — the exact
+/// materialization direct access exists to avoid.
+pub(crate) fn uncompressed_blob_range(raw: &[u8], idx: u32) -> Result<Option<Range<u64>>> {
+    if raw.is_empty() {
+        return Err(Error::Truncated(0));
+    }
+    let info = raw[0];
+    let compression_id = info & 0x0F;
+    if compression_id != COMPRESSION_NONE_LEGACY && compression_id != COMPRESSION_NONE {
+        return Ok(None);
+    }
+    let extended = info & EXTENDED_FLAG != 0;
+    let body = &raw[1..];
+    let ptr_size = if extended { 8usize } else { 4 };
+    let first = read_off(body, 0, extended)?;
+    if first == 0 || first as usize > body.len() {
+        return Err(Error::Truncated(first));
+    }
+    let total_ptrs = first as usize / ptr_size;
+    if total_ptrs == 0 {
+        return Err(Error::Truncated(0));
+    }
+    let blob_count = (total_ptrs - 1) as u32;
+    if idx >= blob_count {
+        return Err(Error::BadBlobIndex {
+            cluster: u32::MAX,
+            blob: idx,
+            count: blob_count,
+        });
+    }
+    let off_pos = idx as usize * ptr_size;
+    let start = read_off(body, off_pos, extended)?;
+    let end = read_off(body, off_pos + ptr_size, extended)?;
+    if end < start || end as usize > body.len() {
+        return Err(Error::Truncated(end));
+    }
+    // +1 converts payload-relative offsets to raw-relative (info byte).
+    Ok(Some(1 + start..1 + end))
+}
+
 fn read_off(buf: &[u8], off: usize, extended: bool) -> Result<u64> {
     if extended {
         let s = buf.get(off..off + 8).ok_or(Error::Truncated(off as u64))?;

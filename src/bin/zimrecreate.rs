@@ -335,7 +335,7 @@ fn run(
         // gain, and upstream zimrecreate keeps them raw too.
         let keep_raw = cluster.compression() == Compression::None;
         while i < pending.len() && pending[i].cluster == cidx {
-            let p = &pending[i];
+            let p = &mut pending[i];
             let data = cluster.blob(p.blob)?.to_vec();
             // Only front articles (text/html) belong in the title /
             // suggestion index — same gate as fulltext below. libzim
@@ -352,7 +352,15 @@ fn run(
                     .unwrap_or_else(|_| String::from_utf8_lossy(&data));
                 indexer.feed_fulltext(&p.path, &p.title, &p.mime, &body, &language);
             }
-            let mut item = Item::new(p.path.clone(), p.title.clone(), p.mime.clone(), data);
+            // Move the strings out of the pending slot instead of
+            // cloning all three — `pending` is dropped right after
+            // this loop, so nothing reads them again.
+            let mut item = Item::new(
+                std::mem::take(&mut p.path),
+                std::mem::take(&mut p.title),
+                std::mem::take(&mut p.mime),
+                data,
+            );
             if keep_raw {
                 item = item.with_compress(false);
             }

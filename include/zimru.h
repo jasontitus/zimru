@@ -84,6 +84,15 @@
 #define DEFAULT_CLUSTER_SIZE_TARGET ((2 * 1024) * 1024)
 
 /**
+ * Default zstd compression level when the caller pins none and no
+ * `ZSTD_CLEVEL` env override is set. Level 19 is the high-ratio
+ * default we benchmark against libzim (still ~1.5× faster than
+ * libzim at the same level); callers wanting fast-but-large output
+ * can drop it via [`Creator::set_compression_level`] or `ZSTD_CLEVEL`.
+ */
+#define DEFAULT_ZSTD_LEVEL 19
+
+/**
  * Opaque handle wrapping a [`crate::Archive`] plus the per-entry-string
  * cache used to give C callers stable `const char*` pointers.
  */

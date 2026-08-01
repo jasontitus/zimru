@@ -227,15 +227,16 @@ fn cmd_list(args: &[String]) -> Result<ExitCode, Error> {
     let arc = open_archive(&opts)?;
     let target_ns = opts.ns.unwrap_or(b'C');
 
+    let mut memo = BlobSizeMemo::new();
     if let Some(idx) = opts.idx {
         let e = entry_by_filtered_index(&arc, target_ns, idx)?;
-        print_list_entry(&e, opts.details, idx);
+        print_list_entry(&arc, &e, opts.details, idx, &mut memo);
         return Ok(ExitCode::SUCCESS);
     }
     if let Some(url) = &opts.url {
         let e = arc.entry_by_ns_path(target_ns, url)?;
         let idx = filtered_index_of(&arc, target_ns, e.index())?;
-        print_list_entry(&e, opts.details, idx);
+        print_list_entry(&arc, &e, opts.details, idx, &mut memo);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -246,7 +247,7 @@ fn cmd_list(args: &[String]) -> Result<ExitCode, Error> {
         if e.namespace() != target_ns {
             continue;
         }
-        print_list_entry(&e, opts.details, local_idx);
+        print_list_entry(&arc, &e, opts.details, local_idx, &mut memo);
         local_idx += 1;
     }
     Ok(ExitCode::SUCCESS)
@@ -280,7 +281,33 @@ fn filtered_index_of(arc: &Archive, ns: u8, target_global: u32) -> Result<u32, E
     Err(Error::EntryNotFound)
 }
 
-fn print_list_entry(e: &Entry, details: bool, local_idx: u32) {
+/// Per-invocation memo of decompressed blob sizes, filled one cluster
+/// at a time. A whole-namespace `list --details` walks entries in URL
+/// order, which visits clusters near-randomly; sizing each entry via
+/// `item.size()` re-decoded clusters through the LRU cache once per
+/// blob as the cache evicted. With the memo each cluster is decoded
+/// exactly once per listing, and only its sizes (8 B/blob) are kept.
+type BlobSizeMemo = std::collections::HashMap<u32, Vec<u64>>;
+
+fn blob_size_memoized(
+    arc: &Archive,
+    memo: &mut BlobSizeMemo,
+    cluster_idx: u32,
+    blob_idx: u32,
+) -> Option<u64> {
+    let sizes = memo.entry(cluster_idx).or_insert_with(|| {
+        arc.cluster_uncached(cluster_idx)
+            .map(|c| {
+                (0..c.blob_count())
+                    .map(|b| c.blob_range(b).map(|r| (r.end - r.start) as u64).unwrap_or(0))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    sizes.get(blob_idx as usize).copied()
+}
+
+fn print_list_entry(arc: &Archive, e: &Entry, details: bool, local_idx: u32, memo: &mut BlobSizeMemo) {
     if !details {
         println!("{}", e.path());
         return;
@@ -299,7 +326,7 @@ fn print_list_entry(e: &Entry, details: bool, local_idx: u32) {
     } else if let Ok(item) = e.get_item(false) {
         println!("* type:           item");
         println!("* mime-type:      {}", item.mimetype());
-        if let Ok(sz) = item.size() {
+        if let Some(sz) = blob_size_memoized(arc, memo, item.cluster_index(), item.blob_index()) {
             println!("* item size:      {sz}");
         }
     }
@@ -342,21 +369,25 @@ fn cmd_analyze(args: &[String]) -> Result<ExitCode, Error> {
         decompressed: u64,
         blob_count: u32,
         compression: zimru::Compression,
+        /// Per-blob decompressed sizes, captured during this single
+        /// decode so `--by-item` never has to touch the cluster again.
+        blob_sizes: Vec<u64>,
     }
     let mut clusters: Vec<ClusterInfo> = Vec::with_capacity(n_clusters as usize);
     for idx in 0..n_clusters {
         let range = arc.cluster_byte_range(idx)?;
         let compressed = range.end - range.start;
         let c = arc.cluster_uncached(idx)?;
-        let decompressed: u64 = (0..c.blob_count())
-            .filter_map(|b| c.blob(b).ok())
-            .map(|b| b.len() as u64)
-            .sum();
+        let blob_sizes: Vec<u64> = (0..c.blob_count())
+            .map(|b| c.blob_range(b).map(|r| (r.end - r.start) as u64).unwrap_or(0))
+            .collect();
+        let decompressed: u64 = blob_sizes.iter().sum();
         clusters.push(ClusterInfo {
             compressed,
             decompressed,
             blob_count: c.blob_count(),
             compression: c.compression(),
+            blob_sizes,
         });
     }
 
@@ -372,11 +403,16 @@ fn cmd_analyze(args: &[String]) -> Result<ExitCode, Error> {
                 Dirent::Redirect(_) => continue,
             };
             let info = &clusters[cluster_idx as usize];
-            let item = match e.get_item(false) {
-                Ok(it) => it,
-                Err(_) => continue,
-            };
-            let blob_size = item.size().unwrap_or(0);
+            // Size comes from the first pass's single decode of each
+            // cluster. The old shape called `item.size()` here, which
+            // re-decompressed the entry's cluster through the LRU
+            // cache — in URL order that thrashes the cache into
+            // decoding each cluster roughly once per blob it holds.
+            let blob_size = info
+                .blob_sizes
+                .get(blob_idx as usize)
+                .copied()
+                .unwrap_or(0);
             let share = if info.decompressed == 0 {
                 0.0
             } else {
@@ -633,8 +669,25 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
 
 /// Create the parent directory chain and write `data` at `dest`.
 fn write_entry(dest: &PathBuf, data: &[u8]) -> std::io::Result<()> {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    // Per-thread memo of directories already ensured. A dump touches
+    // each directory once per file it contains; unmemoized,
+    // `create_dir_all` re-stats the entire ancestor chain for every
+    // single entry — O(depth) syscalls per file across millions of
+    // files. Only successful creations are memoized, so collision
+    // errors still surface per entry.
+    thread_local! {
+        static ENSURED: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
+    }
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        let known = ENSURED.with(|s| s.borrow().contains(parent));
+        if !known {
+            fs::create_dir_all(parent)?;
+            ENSURED.with(|s| {
+                s.borrow_mut().insert(parent.to_path_buf());
+            });
+        }
     }
     fs::write(dest, data)
 }
