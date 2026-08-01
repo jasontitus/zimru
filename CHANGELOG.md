@@ -34,5 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with an ABBA cache-controlled benchmark
   (`docs/perf-fixes-4gb-bench.md`): end-to-end wall time is
   compression-bound and statistically unchanged (−1.1 %, within noise).
+- All findings from the DS4 performance review: namespace-bounded reader
+  scans (`entry_by_ns_title` fallback, `get_metadata_keys`), zero-copy
+  `blob_direct_access` / `Item::size` on uncompressed clusters, no double
+  url allocation for empty-title dirents, allocation-free writer bucket
+  keys with in-place bucket flush and no redundant finalize title sort,
+  single-decode-per-cluster `zimdump analyze --by-item` / `list
+  --details`, memoized dump directory creation, one-pass zimcheck
+  link-existence set, moved (not cloned) zimrecreate item strings,
+  buffered xapianbuilder stdin feeds, and a deduplicating cffi
+  interned-string store. A second ABBA round on the same 4.8 GB build
+  confirms creation wall time stays compression-bound (unchanged within
+  noise); the biggest wins are in read/tooling paths.
 
 [Unreleased]: https://github.com/jasontitus/zimru/compare/main...HEAD

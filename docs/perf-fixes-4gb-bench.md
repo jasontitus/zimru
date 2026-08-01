@@ -1,9 +1,17 @@
 # Performance-fix validation: 4.8 GB `zimwriterfs` build, before vs after
 
-Validates the five hot-path fixes from the writer performance review
-(commit `eebcd92`) on a realistic >4 GB ZIM creation workload.
+Validates the performance-review fixes on a realistic >4 GB ZIM
+creation workload. Two rounds were run with the same corpus, method,
+and baseline:
 
-## Fixes under test
+* **Round 1** — the five hot-path fixes from the independent writer
+  review (commit `eebcd92`); results in the tables below.
+* **Round 2** — those five fixes **plus every finding from the DS4
+  perf review** (`DS4_REVIEW_PERF.md` on branch
+  `ds4/zimru-20260801-035149`; fixes in commit `80ac42b`); results in
+  the round-2 section at the end.
+
+## Fixes under test (round 1)
 
 1. `zimwriterfs::mime_for_path` — was rebuilding a `HashMap` from the
    static mime table on **every call** (once per input file); now a
@@ -87,3 +95,35 @@ grows; here they are dwarfed by compression.
 Output correctness is unaffected: all four runs produced the same
 output size, every build passed the writer's post-write structural
 verify, and the full test suite passes on the fixed code.
+
+## Round 2 — full DS4 fix set
+
+Same corpus, same ABBA + cache-drop + re-warm protocol. A = the
+original pre-fix baseline binary, B = commit `80ac42b` with all
+DS4 findings fixed on top of round 1 (writer bucket-key scratch
+buffer, in-place bucket flush, single-probe bucket lookup, no second
+title sort in finalize, gated per-chunk timing — plus the reader,
+zimdump, zimcheck, zimrecreate, index-helper, and C-ABI fixes, which
+this creation workload does not exercise).
+
+| run | binary | wall (s) | peak RSS (MB) | encode busy (s) |
+|---|---|---|---|---|
+| A1 | before    | 149.96 | 5,174 | 491.4 |
+| B1 | all fixes | 149.70 | 5,021 | 483.0 |
+| B2 | all fixes | 149.11 | 5,139 | 478.3 |
+| A2 | before    | 147.81 | 5,066 | 481.7 |
+
+* before mean: **148.89 s** — after mean: **149.41 s** (+0.3 %, noise)
+* output byte-identical again: 5,108,151,522 bytes on every run
+
+Round 2 confirms round 1's conclusion: on a zstd-19,
+compression-bound build the end-to-end wall time is unchanged within
+the ~2 % run-to-run spread (all eight A/B runs across both rounds
+land in 147.4–151.4 s). The DS4 fixes that target this workload's
+default configuration (Single strategy, large items) sit off the
+dominant cost, and the biggest DS4 wins — zimdump cluster-thrash,
+zimcheck link checks, cffi direct access, reader lookups — are in
+read/tooling paths that a creation benchmark cannot show. Encoder
+busy-time is nominally ~1.5 % lower with the fixes (478–483 s vs
+481–491 s), consistent with small real savings that vanish into the
+compression envelope.
