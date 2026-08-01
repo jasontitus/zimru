@@ -1223,17 +1223,19 @@ impl Archive {
     /// lookup on the archive.
     pub fn check_dirent_order(&self) -> Result<bool> {
         let n = self.core.header.entry_count;
-        let mut prev: Option<(u8, String)> = None;
+        // Keys borrow straight from the mmap, so the previous key is
+        // kept as a borrow too — no per-entry String allocation.
+        let mut prev: Option<(u8, &str)> = None;
         for i in 0..n {
             let off = self.url_pointer(i)?;
             let (ns, url) = Dirent::key_at(&self.core.mmap, off as usize)?;
-            if let Some((prev_ns, prev_url)) = &prev {
-                let cmp = prev_ns.cmp(&ns).then_with(|| prev_url.as_str().cmp(url));
+            if let Some((prev_ns, prev_url)) = prev {
+                let cmp = prev_ns.cmp(&ns).then_with(|| prev_url.cmp(url));
                 if cmp.is_gt() {
                     return Ok(false);
                 }
             }
-            prev = Some((ns, url.to_string()));
+            prev = Some((ns, url));
         }
         Ok(true)
     }
@@ -1244,19 +1246,18 @@ impl Archive {
     /// search over this ordering.
     pub fn check_title_index(&self) -> Result<bool> {
         let listing = self.title_listing()?;
-        let mut prev: Option<(u8, String)> = None;
+        // Same borrow-don't-own trick as `check_dirent_order`.
+        let mut prev: Option<(u8, &str)> = None;
         for &url_idx in listing.iter() {
             let off = self.url_pointer(url_idx)?;
             let (ns, title) = Dirent::title_key_at(&self.core.mmap, off as usize)?;
-            if let Some((prev_ns, prev_title)) = &prev {
-                let cmp = prev_ns
-                    .cmp(&ns)
-                    .then_with(|| prev_title.as_str().cmp(title));
+            if let Some((prev_ns, prev_title)) = prev {
+                let cmp = prev_ns.cmp(&ns).then_with(|| prev_title.cmp(title));
                 if cmp.is_gt() {
                     return Ok(false);
                 }
             }
-            prev = Some((ns, title.to_string()));
+            prev = Some((ns, title));
         }
         Ok(true)
     }

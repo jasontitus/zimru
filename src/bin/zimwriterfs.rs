@@ -12,7 +12,6 @@
 //!               --creator=Me --publisher=Kiwix --name=myzim \
 //!               HTML_DIR OUT.zim
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -413,7 +412,10 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                 Some(e.size),
                 compress_hint,
             )?;
-            let mut buf = vec![0u8; 64 * 1024];
+            // 1 MiB chunks: these files are >= 4 MiB by definition, and
+            // 64 KiB chunks cost 16x the read syscalls and encoder
+            // calls per GB for zero benefit.
+            let mut buf = vec![0u8; 1024 * 1024];
             loop {
                 let n = f.read(&mut buf)?;
                 if n == 0 {
@@ -689,51 +691,53 @@ fn should_compress(mime: &str) -> bool {
 }
 
 fn mime_for_path(p: &Path) -> String {
+    // Sorted by extension so lookup is a binary search over the
+    // static table — no per-call map construction.
     static TABLE: &[(&str, &str)] = &[
-        ("html", "text/html"),
-        ("htm", "text/html"),
-        ("xhtml", "application/xhtml+xml"),
-        ("css", "text/css"),
-        ("js", "application/javascript"),
-        ("mjs", "application/javascript"),
-        ("json", "application/json"),
-        ("xml", "application/xml"),
-        ("svg", "image/svg+xml"),
-        ("png", "image/png"),
-        ("jpg", "image/jpeg"),
-        ("jpeg", "image/jpeg"),
-        ("gif", "image/gif"),
-        ("webp", "image/webp"),
-        ("ico", "image/x-icon"),
         ("bmp", "image/bmp"),
-        ("pdf", "application/pdf"),
+        ("css", "text/css"),
+        ("csv", "text/csv"),
         ("epub", "application/epub+zip"),
-        ("zip", "application/zip"),
+        ("gif", "image/gif"),
         ("gz", "application/gzip"),
+        ("htm", "text/html"),
+        ("html", "text/html"),
+        ("ico", "image/x-icon"),
+        ("jpeg", "image/jpeg"),
+        ("jpg", "image/jpeg"),
+        ("js", "application/javascript"),
+        ("json", "application/json"),
+        ("md", "text/markdown"),
+        ("mjs", "application/javascript"),
+        ("mp3", "audio/mpeg"),
+        ("mp4", "video/mp4"),
+        ("ogg", "audio/ogg"),
+        ("ogv", "video/ogg"),
+        ("opus", "audio/ogg"),
+        ("otf", "font/otf"),
+        ("pdf", "application/pdf"),
+        ("png", "image/png"),
+        ("svg", "image/svg+xml"),
+        ("tsv", "text/tab-separated-values"),
+        ("ttf", "font/ttf"),
+        ("txt", "text/plain"),
+        ("wav", "audio/wav"),
+        ("webm", "video/webm"),
+        ("webp", "image/webp"),
         ("woff", "font/woff"),
         ("woff2", "font/woff2"),
-        ("ttf", "font/ttf"),
-        ("otf", "font/otf"),
-        ("mp3", "audio/mpeg"),
-        ("ogg", "audio/ogg"),
-        ("opus", "audio/ogg"),
-        ("wav", "audio/wav"),
-        ("mp4", "video/mp4"),
-        ("webm", "video/webm"),
-        ("ogv", "video/ogg"),
-        ("txt", "text/plain"),
-        ("md", "text/markdown"),
-        ("csv", "text/csv"),
-        ("tsv", "text/tab-separated-values"),
+        ("xhtml", "application/xhtml+xml"),
+        ("xml", "application/xml"),
+        ("zip", "application/zip"),
     ];
+    debug_assert!(TABLE.windows(2).all(|w| w[0].0 < w[1].0));
     let ext = p
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
     if let Some(ref e) = ext {
-        let map: HashMap<&str, &str> = TABLE.iter().copied().collect();
-        if let Some(&m) = map.get(e.as_str()) {
-            return m.to_string();
+        if let Ok(i) = TABLE.binary_search_by_key(&e.as_str(), |&(ext, _)| ext) {
+            return TABLE[i].1.to_string();
         }
     }
     "application/octet-stream".to_string()
@@ -810,11 +814,29 @@ fn sniff_mime(head: &[u8]) -> Option<&'static str> {
 /// same file (Wikipedia-shaped builds saved ~15 GB of redundant
 /// disk reads on top-1000-articles when this was wired in).
 fn derive_title_from_bytes(bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let lower = text.to_ascii_lowercase();
-    let s = lower.find("<title>")? + "<title>".len();
-    let e = lower[s..].find("</title>")?;
-    Some(text[s..s + e].trim().to_string())
+    let s = find_ascii_ci(bytes, b"<title>", 0)? + "<title>".len();
+    let e = find_ascii_ci(bytes, b"</title>", s)?;
+    let text = std::str::from_utf8(&bytes[s..e]).ok()?;
+    Some(text.trim().to_string())
+}
+
+/// ASCII-case-insensitive substring search starting at `from`.
+/// Allocation-free: earlier this scan lowercased the whole body
+/// (a full extra copy of every HTML file) just to run `str::find`.
+/// `needle` must be non-empty and start with a byte that has no
+/// case (e.g. `<`), which lets the hot loop skip on a single
+/// byte-equality test before the full window compare.
+fn find_ascii_ci(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    let first = needle[0];
+    if haystack.len() < needle.len() || from > haystack.len() - needle.len() {
+        return None;
+    }
+    for i in from..=haystack.len() - needle.len() {
+        if haystack[i] == first && haystack[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some(i);
+        }
+    }
+    None
 }
 
 fn chrono_today_iso() -> String {

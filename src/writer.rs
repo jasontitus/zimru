@@ -1177,6 +1177,11 @@ impl Streamer {
             let out_tx = out_tx.clone();
             workers.push(std::thread::spawn(move || -> Duration {
                 let mut busy = Duration::ZERO;
+                // Reusable zstd context, created on the first zstd
+                // cluster and kept across jobs: re-creating the
+                // context (workspace allocation + table init) for
+                // every 2 MiB cluster is pure overhead.
+                let mut zstd_ctx: Option<zstd::bulk::Compressor<'static>> = None;
                 loop {
                     // Hold the lock only for the recv handshake, not
                     // while encoding.
@@ -1186,7 +1191,8 @@ impl Streamer {
                     };
                     let (idx, blobs, comp) = job;
                     let t = Instant::now();
-                    let encoded = encode_cluster(&blobs, comp, level).map(|b| (idx, b));
+                    let encoded =
+                        encode_cluster(&blobs, comp, level, &mut zstd_ctx).map(|b| (idx, b));
                     busy += t.elapsed();
                     drop(blobs);
                     if out_tx.send(encoded).is_err() {
@@ -2400,6 +2406,7 @@ fn encode_cluster(
     blobs: &[Vec<u8>],
     compression: Compression,
     level: Option<i32>,
+    zstd_ctx: &mut Option<zstd::bulk::Compressor<'static>>,
 ) -> Result<Vec<u8>> {
     let n = blobs.len();
     let payload_bytes_sum: usize = blobs.iter().map(|b| b.len()).sum();
@@ -2476,8 +2483,22 @@ fn encode_cluster(
             // zimru's own `decode_zstd` fast path, libzim, fzstd —
             // use it to pre-allocate the exact decompressed size and
             // skip the streaming-decoder hop entirely.
-            let mut enc = zstd::bulk::Compressor::new(lvl)
-                .map_err(|e| Error::Decompression(format!("zstd encoder: {e}")))?;
+            //
+            // The context lives in `zstd_ctx` across calls (one per
+            // pipeline worker): ZSTD_compress2 resets the session but
+            // keeps the workspace, so consecutive clusters skip the
+            // workspace allocation + init. WindowLog varies with the
+            // payload, so it is (cheaply) re-pinned per cluster.
+            let enc = match zstd_ctx {
+                Some(c) => c,
+                None => {
+                    let c = zstd::bulk::Compressor::new(lvl)
+                        .map_err(|e| Error::Decompression(format!("zstd encoder: {e}")))?;
+                    zstd_ctx.insert(c)
+                }
+            };
+            enc.set_parameter(zstd::stream::raw::CParameter::CompressionLevel(lvl))
+                .map_err(|e| Error::Decompression(format!("zstd level: {e}")))?;
             enc.set_parameter(zstd::stream::raw::CParameter::WindowLog(window_log))
                 .map_err(|e| Error::Decompression(format!("zstd window_log: {e}")))?;
             let body = enc
