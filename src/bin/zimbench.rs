@@ -108,11 +108,18 @@ fn run(file: &str, n: usize, r: usize, d: usize) -> Result<(), zimru::Error> {
     println!("collect random urls");
     let actual_d = d.min(urls.len());
     let mut rng = SplitMix64::new(0xDEADBEEFCAFEF00D);
-    let mut random_urls: Vec<(u8, String)> = Vec::with_capacity(actual_d);
-    while random_urls.len() < actual_d {
-        let idx = (rng.next_u64() as usize) % urls.len();
-        random_urls.push(urls[idx].clone());
+    // Partial Fisher–Yates so exactly `actual_d` DISTINCT urls are
+    // chosen — sampling with replacement would over-read hot articles
+    // and skew the random-access numbers.
+    let mut indices: Vec<usize> = (0..urls.len()).collect();
+    for i in 0..actual_d {
+        let j = i + (rng.next_u64() as usize) % (indices.len() - i);
+        indices.swap(i, j);
     }
+    let random_urls: Vec<(u8, String)> = indices[..actual_d]
+        .iter()
+        .map(|&i| urls[i].clone())
+        .collect();
 
     // ---- Phase 2: linear access ----
     let start = Instant::now();
@@ -132,6 +139,12 @@ fn run(file: &str, n: usize, r: usize, d: usize) -> Result<(), zimru::Error> {
     );
 
     // ---- Phase 3: random access ----
+    if random_urls.is_empty() {
+        // `-d 0` leaves nothing to sample; skip rather than panic on
+        // the modulo below.
+        println!("random access: skipped (no random urls selected)");
+        return Ok(());
+    }
     let start = Instant::now();
     let mut bytes: u64 = 0;
     for _ in 0..r {

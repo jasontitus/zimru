@@ -550,11 +550,15 @@ fn check_integrity(arc: &Archive) -> Result<(), Error> {
     Ok(())
 }
 
-fn touch_cluster(arc: &Archive, _c: u32) -> Result<(), Error> {
-    // Look for any article in cluster `_c` to force its load via the public API.
-    // Rather than scanning all dirents, we accept a small false-negative risk
-    // and rely on the redundant/empty checks to traverse the full file.
-    let _ = arc.entry_by_url_index(0)?; // ensures archive open + first dirent
+fn touch_cluster(arc: &Archive, c: u32) -> Result<(), Error> {
+    // Decode the cluster (bypassing the shared cache, so memory stays
+    // bounded) and walk its blob-offset table, so a corrupt or
+    // undecompressible cluster payload actually fails `-I` instead of
+    // false-Passing on checksum-less archives.
+    let cluster = arc.cluster_uncached(c)?;
+    for b in 0..cluster.blob_count() {
+        cluster.blob_range(b)?;
+    }
     Ok(())
 }
 
@@ -621,11 +625,11 @@ fn scan_content(
     do_internal: bool,
     do_external: bool,
 ) {
-    // (cluster_index, blob_index, dirent metadata, mimetype, url-pointer index)
+    // (cluster_index, blob_index, dirent metadata, url-pointer index)
     struct BlobRef {
         url_index: u32,
         path: String,
-        mimetype: String,
+        is_html: bool,
         blob: u32,
     }
     let mime_list = arc.mime_list();
@@ -635,17 +639,20 @@ fn scan_content(
         if e.is_redirect() || e.namespace() != b'C' {
             continue;
         }
-        let Dirent::Article(a) = e.dirent().clone() else {
+        // Borrow the dirent (cloning it would copy url + title Strings
+        // per entry) and reduce the mimetype to the one bit this scan
+        // needs, instead of allocating a mimetype String per entry.
+        let Dirent::Article(a) = e.dirent() else {
             continue;
         };
-        let mt = mime_list
+        let is_html = mime_list
             .get(a.mimetype)
             .unwrap_or("application/octet-stream")
-            .to_string();
+            .starts_with("text/html");
         by_cluster.entry(a.cluster).or_default().push(BlobRef {
             url_index: e.index(),
-            path: a.url,
-            mimetype: mt,
+            path: a.url.clone(),
+            is_html,
             blob: a.blob,
         });
     }
@@ -700,7 +707,7 @@ fn scan_content(
                     h.update(bytes);
                     f.md5 = Some(h.finalize().into());
                 }
-                if (do_internal || do_external) && b.mimetype.starts_with("text/html") {
+                if (do_internal || do_external) && b.is_html {
                     if let Ok(text) = std::str::from_utf8(bytes) {
                         for (kind, target) in extract_link_targets(text) {
                             if !looks_like_url(target) {

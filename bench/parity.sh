@@ -23,7 +23,7 @@ mkdir -p "$OUT_UP" "$OUT_US"
 SED="sed"
 command -v gsed >/dev/null 2>&1 && SED="gsed"
 
-cargo build --release --quiet
+cargo build --release --quiet || { echo "cargo build failed — aborting (stale/missing binaries would misreport as DIFF/FAIL rows)" >&2; exit 1; }
 
 # Normalize differences that aren't substantive (version strings, "<3 seconds"
 # vs "1 seconds", trailing whitespace).

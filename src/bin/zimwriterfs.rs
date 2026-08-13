@@ -252,10 +252,13 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     // Spin up xapianbuilder helpers (one each for fulltext + title)
     // unless the user opted out. The helpers run in parallel with the
     // ZIM writer; we feed each entry via stdin as we add it. On
-    // finish() we slurp the output files back and add them as
-    // X/* items before the creator finalises.
+    // finish() we stream the output files back in bounded chunks and
+    // add them as X/* items before the creator finalises.
     let language = o.language.clone().unwrap_or_default();
     let index_tmp = make_index_tmp_dir(zim_file)?;
+    // Removes the temp dir on every exit path, including early `?`
+    // returns while walking the input tree.
+    let _index_tmp_cleanup = index_helper::TmpDirCleanup(index_tmp.clone());
     let mut indexer = if o.without_ft_index {
         IndexHelper::disabled()
     } else {
@@ -453,12 +456,16 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
             .map(|e| -> Result<ReadyItem, zimru::Error> {
                 let mut content = fs::read(&e.path)?;
                 if o.inflate_html && e.is_html && content.starts_with(&[0x1f, 0x8b]) {
-                    if let Ok(mut dec) = flate2_decoder(&content) {
-                        let mut out = Vec::new();
-                        if dec.read_to_end(&mut out).is_ok() {
-                            content = out;
-                        }
-                    }
+                    // Inflate so the packed item, title derivation, and
+                    // fulltext indexing all see real HTML — the user
+                    // asked for -x, so a corrupt .gz is a hard error,
+                    // not a silent gzip-bytes-as-text/html item.
+                    content = inflate_gzip(&content).map_err(|err| {
+                        zimru::Error::Io(std::io::Error::other(format!(
+                            "--inflateHtml {}: {err}",
+                            e.path.display()
+                        )))
+                    })?;
                 }
                 // Resolve the mimetype: extension first, then content
                 // sniff for extensionless files (dumped wiki articles).
@@ -591,11 +598,10 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     // directly into the index.
     let blobs = indexer.finish(o.verbose);
     for blob in blobs {
-        creator.add_item(
-            Item::in_namespace(b'X', blob.url, "", blob.mimetype, blob.bytes).with_compress(false),
-        );
+        if let Err(e) = blob.add_to(&mut creator) {
+            eprintln!("[zimwriterfs] attaching index {} failed: {e}", blob.url);
+        }
     }
-    let _ = std::fs::remove_dir_all(&index_tmp);
 
     if o.verbose {
         eprintln!("[zimwriterfs] {count} items collected; finalising…");
@@ -726,12 +732,16 @@ fn mime_for_path(p: &Path) -> String {
         ("csv", "text/csv"),
         ("tsv", "text/tab-separated-values"),
     ];
+    // Built once — this runs per input file, so rebuilding the map on
+    // every call was one HashMap allocation + ~38 hashes per file.
+    static MAP: std::sync::OnceLock<HashMap<&'static str, &'static str>> =
+        std::sync::OnceLock::new();
     let ext = p
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase());
     if let Some(ref e) = ext {
-        let map: HashMap<&str, &str> = TABLE.iter().copied().collect();
+        let map = MAP.get_or_init(|| TABLE.iter().copied().collect());
         if let Some(&m) = map.get(e.as_str()) {
             return m.to_string();
         }
@@ -811,10 +821,22 @@ fn sniff_mime(head: &[u8]) -> Option<&'static str> {
 /// disk reads on top-1000-articles when this was wired in).
 fn derive_title_from_bytes(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
-    let lower = text.to_ascii_lowercase();
-    let s = lower.find("<title>")? + "<title>".len();
-    let e = lower[s..].find("</title>")?;
+    // Case-insensitive byte search — lowercasing the whole body just to
+    // locate one tag allocated a full copy of every HTML file (tens of
+    // GB of transient churn on a large build).
+    let s = find_ascii_ci(text.as_bytes(), b"<title>")? + "<title>".len();
+    let e = find_ascii_ci(&text.as_bytes()[s..], b"</title>")?;
     Some(text[s..s + e].trim().to_string())
+}
+
+/// Position of the ASCII-case-insensitive `needle` in `hay`; `needle`
+/// must already be lowercase.
+fn find_ascii_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len())
+        .position(|w| w.iter().zip(needle).all(|(a, b)| a.eq_ignore_ascii_case(b)))
 }
 
 fn chrono_today_iso() -> String {
@@ -839,14 +861,14 @@ fn chrono_today_iso() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Lightweight gzip decoder fallback. We don't have flate2 as a dep, so
-/// just signal "no inflate" if the call site requested it. For users who
-/// truly need -x, a future commit can add flate2.
-fn flate2_decoder(_buf: &[u8]) -> std::io::Result<std::io::Empty> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "--inflateHtml requires the flate2 feature (not yet enabled)",
-    ))
+/// Inflate a gzipped buffer for `-x/--inflateHtml`. `MultiGzDecoder`
+/// handles multi-member gzip streams (concatenated .gz files).
+fn inflate_gzip(buf: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::with_capacity(buf.len().saturating_mul(4));
+    let mut dec = flate2::read::MultiGzDecoder::new(buf);
+    dec.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 /// Allocate a per-run temp directory next to the output ZIM for the

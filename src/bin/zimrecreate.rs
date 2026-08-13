@@ -201,6 +201,9 @@ fn run(
     let language = read_metadata_string(&source, "Language").unwrap_or_default();
     let dst_path = std::path::Path::new(dst);
     let index_tmp = make_index_tmp_dir(dst_path)?;
+    // Removes the temp dir on every exit path, including early `?`
+    // returns (a corrupt source entry mid-iteration, say).
+    let _index_tmp_cleanup = index_helper::TmpDirCleanup(index_tmp.clone());
     let mut indexer = if without_ft_index {
         IndexHelper::disabled()
     } else {
@@ -218,21 +221,38 @@ fn run(
     let ml = source.mime_list();
     let mut seen_metadata = std::collections::HashSet::new();
 
+    // Legacy (major-5) archives store user content spread over the old
+    // namespaces — 'A' articles, 'B' article meta, 'I'/'J' media, '-'
+    // layout, 'U'/'V' categories — instead of the unified 'C'. Normalize
+    // those to 'C' before gating, so legacy input recreates with its
+    // content instead of silently producing a metadata-only archive
+    // whose regenerated `W/mainPage` redirect then dangles.
+    let legacy = !source.header().uses_new_namespaces();
+    let effective_ns = |ns: u8| -> u8 {
+        if legacy && matches!(ns, b'A' | b'B' | b'I' | b'J' | b'-' | b'U' | b'V') {
+            b'C'
+        } else {
+            ns
+        }
+    };
+
     // Pass 1 — dirents only (no cluster decompression): redirects and
-    // small M-namespace entries are handled immediately; C-namespace
-    // articles are collected as (cluster, blob, path, title, mime)
-    // tuples for the cluster-grouped content pass below.
+    // small M-namespace entries are handled immediately; content
+    // articles are collected as compact (cluster, blob, url_index)
+    // triples for the cluster-grouped content pass below. Keeping the
+    // path/title/mime Strings here instead would hold ~150–200 B per
+    // entry for the whole archive (gigabytes on a 10M-entry Wikipedia),
+    // undermining the streaming writer's bounded-RSS design; pass 2
+    // re-resolves them from the mmap with one cheap dirent parse each.
     struct PendingContent {
         cluster: u32,
         blob: u32,
-        path: String,
-        title: String,
-        mime: String,
+        url_index: u32,
     }
     let mut pending: Vec<PendingContent> = Vec::new();
     for entry in source.iter_by_path() {
         let entry = entry?;
-        let ns = entry.namespace();
+        let ns = effective_ns(entry.namespace());
         let path = entry.path();
         let title = entry.title();
 
@@ -252,53 +272,67 @@ fn run(
                     // Look up the target's path so we can add it via the
                     // public redirection API.
                     let target = source.entry_by_url_index(r.redirect_index)?;
-                    let target_path = target.path().to_string();
-                    creator.add_redirection(
-                        path.to_string(),
-                        title.to_string(),
-                        target_path.clone(),
-                    );
-                    // Redirects belong in the title index only when their
-                    // target is a front article (text/html), mirroring the
-                    // content gate above and libzim's FRONT_ARTICLE rule.
-                    // Without this, redirects pointing at assets (tiles,
-                    // fonts, vector chunks) pollute the suggestion index.
-                    let target_is_front = match target.dirent() {
-                        Dirent::Article(a) => ml
-                            .get(a.mimetype)
-                            .is_some_and(|m| m.starts_with("text/html")),
-                        Dirent::Redirect(_) => false,
-                    };
-                    if target_is_front {
-                        indexer.feed_title(path, title, &target_path);
+                    // `add_redirection` targets the content namespace —
+                    // a redirect whose target lives elsewhere would be
+                    // rewritten as C/<path>, never resolve, and fail the
+                    // build at finish_writing. Skip those instead.
+                    if effective_ns(target.namespace()) != b'C' {
+                        eprintln!(
+                            "zimrecreate: skipping redirect {} -> {}/{} (target outside the content namespace)",
+                            path,
+                            char::from(target.namespace()),
+                            target.path()
+                        );
+                    } else {
+                        let target_path = target.path().to_string();
+                        creator.add_redirection(
+                            path.to_string(),
+                            title.to_string(),
+                            target_path.clone(),
+                        );
+                        // Redirects belong in the title index only when their
+                        // target is a front article (text/html), mirroring the
+                        // content gate above and libzim's FRONT_ARTICLE rule.
+                        // Without this, redirects pointing at assets (tiles,
+                        // fonts, vector chunks) pollute the suggestion index.
+                        let target_is_front = match target.dirent() {
+                            Dirent::Article(a) => ml
+                                .get(a.mimetype)
+                                .is_some_and(|m| m.starts_with("text/html")),
+                            Dirent::Redirect(_) => false,
+                        };
+                        if target_is_front {
+                            indexer.feed_title(path, title, &target_path);
+                        }
                     }
                 }
                 // Redirects in W/M/X namespaces are rebuilt implicitly by
                 // re-adding the underlying entries.
             }
             Dirent::Article(a) => {
-                let mime = ml
-                    .get(a.mimetype)
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
                 if ns == b'C' {
                     pending.push(PendingContent {
                         cluster: a.cluster,
                         blob: a.blob,
-                        path: path.to_string(),
-                        title: title.to_string(),
-                        mime,
+                        url_index: entry.index(),
                     });
                 } else if ns == b'M' {
                     // M-namespace entries are few and tiny; fetch them
                     // directly. Strip the special illustration path back
                     // into add_illustration where possible so the output
-                    // is canonically shaped.
+                    // is canonically shaped; everything else keeps its
+                    // original mimetype (illustrations and favicons are
+                    // binary — recording them as text/plain would corrupt
+                    // them for downstream readers).
+                    let mime = ml
+                        .get(a.mimetype)
+                        .unwrap_or("application/octet-stream")
+                        .to_string();
                     let data = entry.get_item(false)?.bytes()?;
                     if let Some(side) = parse_illustration_path(path) {
                         creator.add_illustration(side, data);
                     } else if seen_metadata.insert(path.to_string()) {
-                        creator.add_metadata(path, data);
+                        creator.add_metadata_with_mimetype(path, mime, data);
                     }
                 }
             }
@@ -336,6 +370,21 @@ fn run(
         let keep_raw = cluster.compression() == Compression::None;
         while i < pending.len() && pending[i].cluster == cidx {
             let p = &pending[i];
+            // Re-resolve path/title/mime from the source dirent — one
+            // cheap mmap-backed parse per item, in exchange for not
+            // holding those Strings for the whole archive during pass 1.
+            let entry = source.entry_by_url_index(p.url_index)?;
+            let Dirent::Article(a) = entry.dirent() else {
+                i += 1;
+                continue;
+            };
+            let path = entry.path();
+            let title = entry.title();
+            let mime = ml.get(a.mimetype).unwrap_or("application/octet-stream");
+            // The blob copy here is a known extra memcpy: the bytes
+            // already live in the decoded cluster payload, but `Item`
+            // owns its body, so threading a borrowed slice through the
+            // writer would be a lifetime refactor of Item/Bucket/encode.
             let data = cluster.blob(p.blob)?.to_vec();
             // Only front articles (text/html) belong in the title /
             // suggestion index — same gate as fulltext below. libzim
@@ -345,14 +394,14 @@ fn run(
             // chunks) instead bloated the title index by ~1000× (e.g.
             // 822k docs / 130 MB on a Hawaii OSM archive vs libzim's
             // handful of real place pages).
-            if p.mime.starts_with("text/html") {
-                indexer.feed_title(&p.path, &p.title, "");
+            if mime.starts_with("text/html") {
+                indexer.feed_title(path, title, "");
                 let body = std::str::from_utf8(&data)
                     .map(std::borrow::Cow::Borrowed)
                     .unwrap_or_else(|_| String::from_utf8_lossy(&data));
-                indexer.feed_fulltext(&p.path, &p.title, &p.mime, &body, &language);
+                indexer.feed_fulltext(path, title, mime, &body, &language);
             }
-            let mut item = Item::new(p.path.clone(), p.title.clone(), p.mime.clone(), data);
+            let mut item = Item::new(path.to_string(), title.to_string(), mime.to_string(), data);
             if keep_raw {
                 item = item.with_compress(false);
             }
@@ -362,14 +411,14 @@ fn run(
     }
     drop(pending);
 
-    // Drain the helper, attach output blobs as X/* items.
+    // Drain the helper, stream output blobs in as X/* items (the
+    // fulltext DB can be multi-GB — never buffer it whole).
     let blobs = indexer.finish(false);
     for blob in blobs {
-        creator.add_item(
-            Item::in_namespace(b'X', blob.url, "", blob.mimetype, blob.bytes).with_compress(false),
-        );
+        if let Err(e) = blob.add_to(&mut creator) {
+            eprintln!("zimrecreate: attaching index {} failed: {e}", blob.url);
+        }
     }
-    let _ = std::fs::remove_dir_all(&index_tmp);
 
     creator.finish_writing()?;
     Ok(())

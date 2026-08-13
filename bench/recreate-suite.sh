@@ -21,7 +21,7 @@ ZIMRU=./target/release/zimru
 ZIMDUMP=./target/release/zimdump
 ZIMRECREATE=./target/release/zimrecreate
 
-cargo build --release --quiet
+cargo build --release --quiet || { echo "cargo build failed — aborting (stale/missing binaries would misreport as DIFF/FAIL rows)" >&2; exit 1; }
 
 GLOB="${1:-zim-cache/*.zim}"
 RESULTS=()

@@ -20,7 +20,7 @@ UP_CHECK="$UPSTREAM_DIR/zimcheck"
 ZIMRU_RECREATE=./target/release/zimrecreate
 GLOB="${1:-zim-cache/*.zim}"
 
-cargo build --release --quiet
+cargo build --release --quiet || { echo "cargo build failed — aborting (stale/missing binaries would misreport as DIFF/FAIL rows)" >&2; exit 1; }
 
 shopt -s nullglob
 mapfile -t FILES < <(ls -S $GLOB 2>/dev/null)

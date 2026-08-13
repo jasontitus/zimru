@@ -5,14 +5,21 @@ use crate::cffi::entry::{zimru_entry_t, ENTRY_VTABLE};
 use crate::cffi::error::{set_err, zimru_error_t};
 use crate::Archive;
 
-/// Opaque handle wrapping a [`crate::Archive`] plus the per-entry-string
-/// cache used to give C callers stable `const char*` pointers.
+/// Opaque handle wrapping a [`crate::Archive`] plus the caches used to
+/// give C callers stable pointers.
 pub struct zimru_archive_t {
     pub(crate) inner: Archive,
-    /// Stable storage for paths/titles returned by `zimru_archive_metadata_key`
-    /// and similar lookup-by-index calls. Each call appends a CString and
-    /// returns its `.as_ptr()`; the storage lives until the archive is freed.
-    pub(crate) interned: std::sync::Mutex<Vec<CString>>,
+    /// Stable per-key storage for metadata values returned by
+    /// `zimru_archive_metadata`: the raw bytes plus a trailing NUL,
+    /// keyed by metadata name. One slot per distinct key — repeat calls
+    /// return the cached pointer instead of appending, so a long-lived
+    /// handle serving many metadata reads doesn't grow without bound.
+    /// `Box<[u8]>` keeps the data pointer stable while the map grows.
+    pub(crate) metadata_values: std::sync::Mutex<std::collections::HashMap<String, Box<[u8]>>>,
+    /// Metadata key names (NUL-terminated), computed once on first use
+    /// by `zimru_archive_metadata_key` — enumerating k keys is then k
+    /// pointer reads instead of k full-archive scans.
+    pub(crate) metadata_keys: std::sync::OnceLock<Vec<CString>>,
 }
 
 /// Open the archive at `path` (UTF-8, NUL-terminated). Returns NULL on
@@ -36,7 +43,8 @@ pub unsafe extern "C" fn zimru_archive_open(
     match Archive::open(PathBuf::from(path_str)) {
         Ok(a) => Box::into_raw(Box::new(zimru_archive_t {
             inner: a,
-            interned: std::sync::Mutex::new(Vec::new()),
+            metadata_values: std::sync::Mutex::new(std::collections::HashMap::new()),
+            metadata_keys: std::sync::OnceLock::new(),
         })),
         Err(e) => {
             set_err(err, e);
@@ -699,36 +707,29 @@ pub unsafe extern "C" fn zimru_archive_metadata(
             return std::ptr::null();
         }
     };
+    // Serve repeat reads of the same key from the per-key cache.
+    let mut store = (*arc).metadata_values.lock().unwrap();
+    if let Some(slot) = store.get(name_str) {
+        if !out_len.is_null() {
+            *out_len = slot.len() - 1;
+        }
+        return slot.as_ptr();
+    }
     match (*arc).inner.get_metadata(name_str) {
-        Ok(bytes) => {
-            // Stash the bytes in the interned cache so the pointer stays
-            // valid until the archive is freed. Wrap as a CString-ish
-            // (Vec) — we use CString's underlying allocation by going via
-            // Box<[u8]> kept alongside.
-            let mut interned = (*arc).interned.lock().unwrap();
-            // Use CString as a stable buffer; allow interior NULs by using
-            // CString::from_vec_with_nul_unchecked? Cleaner: just keep
-            // bytes in a Vec<u8> via a parallel store. For simplicity we
-            // make a CString with a trailing NUL appended, but only return
-            // the original byte length so callers don't see it.
-            let mut bytes_with_nul = bytes.clone();
-            bytes_with_nul.push(0);
-            // CString::from_vec_with_nul requires no interior NULs; tolerate
-            // them by going through unchecked.
-            let cs = CString::from_vec_with_nul(bytes_with_nul).unwrap_or_else(|_| {
-                // Fall back to lossy NUL replacement for binary metadata.
-                let cleaned: Vec<u8> = bytes
-                    .iter()
-                    .map(|&b| if b == 0 { b' ' } else { b })
-                    .collect();
-                CString::new(cleaned).unwrap()
-            });
-            let ptr = cs.as_ptr() as *const u8;
-            interned.push(cs);
+        Ok(mut bytes) => {
+            // Store the raw bytes verbatim (interior NULs included —
+            // binary metadata like `M/Illustration_*` PNGs must round-
+            // trip exactly) with a trailing NUL appended for C string
+            // convenience; `*out_len` reports the original length.
+            let len = bytes.len();
+            bytes.push(0);
+            let slot = store
+                .entry(name_str.to_string())
+                .or_insert_with(|| bytes.into_boxed_slice());
             if !out_len.is_null() {
-                *out_len = bytes.len();
+                *out_len = len;
             }
-            ptr
+            slot.as_ptr()
         }
         Err(e) => {
             set_err(err, e);
@@ -807,17 +808,26 @@ pub unsafe extern "C" fn zimru_archive_random_entry(
     }
 }
 
-/// Number of metadata keys in the archive.
+/// Number of metadata keys in the archive. O(log n) — counts the
+/// `M`-namespace range without scanning or allocating the key list.
 #[no_mangle]
 pub unsafe extern "C" fn zimru_archive_metadata_keys_count(arc: *const zimru_archive_t) -> usize {
     if arc.is_null() {
         return 0;
     }
-    (*arc).inner.get_metadata_keys().len()
+    (*arc)
+        .inner
+        .entry_count_in_namespace(crate::NS_METADATA)
+        .map(|n| n as usize)
+        .unwrap_or(0)
 }
 
 /// Borrowed pointer to the i'th metadata key as a NUL-terminated string.
 /// Lifetime tied to `arc`. Returns NULL if `idx` is out of range.
+///
+/// The key list is computed once on first call and cached on the
+/// archive handle, so enumerating k keys costs one metadata-range walk
+/// total instead of one per call.
 #[no_mangle]
 pub unsafe extern "C" fn zimru_archive_metadata_key(
     arc: *const zimru_archive_t,
@@ -826,15 +836,16 @@ pub unsafe extern "C" fn zimru_archive_metadata_key(
     if arc.is_null() {
         return std::ptr::null();
     }
-    let keys = (*arc).inner.get_metadata_keys();
-    let Some(k) = keys.get(idx) else {
-        return std::ptr::null();
-    };
-    let cs = match CString::new(k.as_str()) {
-        Ok(c) => c,
-        Err(_) => return std::ptr::null(),
-    };
-    let ptr = cs.as_ptr();
-    (*arc).interned.lock().unwrap().push(cs);
-    ptr
+    let keys = (*arc).metadata_keys.get_or_init(|| {
+        (*arc)
+            .inner
+            .get_metadata_keys()
+            .into_iter()
+            .filter_map(|k| CString::new(k).ok())
+            .collect()
+    });
+    match keys.get(idx) {
+        Some(cs) => cs.as_ptr(),
+        None => std::ptr::null(),
+    }
 }

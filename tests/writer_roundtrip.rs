@@ -498,3 +498,40 @@ fn rejects_dangling_redirect() {
     // File may exist but partial — don't try to read it.
     let _ = std::fs::remove_file(&out);
 }
+
+#[test]
+fn caller_supplied_counter_suppresses_auto_generated_one() {
+    // A caller-supplied M/Counter arrives in finalize step 1 and sits
+    // in a pending bucket when the auto-Counter guard runs — the guard
+    // must see it there (not only in committed dirents), or the output
+    // carries two (M, Counter) dirents and violates the unique-URL
+    // invariant.
+    let out = tmp_path("caller-counter");
+    let mut c = Creator::new();
+    c.set_main_path("home");
+    c.start_writing(&out).expect("start_writing");
+    c.add_item(Item::html("home", "Home", "<html><body>hi</body></html>"));
+    c.add_metadata("Title", "counter dedup");
+    c.add_metadata("Language", "eng");
+    c.add_metadata("Counter", "text/html=1");
+    c.finish_writing().expect("finish_writing");
+
+    let arc = Archive::open(&out).expect("reopen");
+    let counters: Vec<_> = arc
+        .iter_by_path()
+        .map(|e| e.unwrap())
+        .filter(|e| e.namespace() == b'M' && e.path() == "Counter")
+        .collect();
+    assert_eq!(
+        counters.len(),
+        1,
+        "exactly one M/Counter dirent must exist (caller's copy wins)"
+    );
+    let bytes = counters[0].get_item(false).unwrap().bytes().unwrap();
+    assert_eq!(
+        bytes, b"text/html=1",
+        "the caller-supplied Counter value must be preserved verbatim"
+    );
+
+    let _ = std::fs::remove_file(&out);
+}

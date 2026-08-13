@@ -253,31 +253,24 @@ fn cmd_list(args: &[String]) -> Result<ExitCode, Error> {
 }
 
 fn entry_by_filtered_index(arc: &Archive, ns: u8, idx: u32) -> Result<Entry, Error> {
-    let mut local: u32 = 0;
-    for entry in arc.iter_by_path() {
-        let e = entry?;
-        if e.namespace() == ns {
-            if local == idx {
-                return Ok(e);
-            }
-            local += 1;
-        }
-    }
-    Err(Error::EntryNotFound)
+    // A namespace occupies one contiguous run of the URL-pointer list,
+    // so the idx-th entry of a namespace is just an offset into that
+    // O(log n) range — no linear scan over every dirent.
+    let range = arc.namespace_range(ns)?;
+    let global = range
+        .start
+        .checked_add(idx)
+        .filter(|&g| g < range.end)
+        .ok_or(Error::EntryNotFound)?;
+    arc.entry_by_url_index(global)
 }
 
 fn filtered_index_of(arc: &Archive, ns: u8, target_global: u32) -> Result<u32, Error> {
-    let mut local: u32 = 0;
-    for entry in arc.iter_by_path() {
-        let e = entry?;
-        if e.namespace() == ns {
-            if e.index() == target_global {
-                return Ok(local);
-            }
-            local += 1;
-        }
+    let range = arc.namespace_range(ns)?;
+    if !range.contains(&target_global) {
+        return Err(Error::EntryNotFound);
     }
-    Err(Error::EntryNotFound)
+    Ok(target_global - range.start)
 }
 
 fn print_list_entry(e: &Entry, details: bool, local_idx: u32) {
@@ -336,27 +329,34 @@ fn cmd_analyze(args: &[String]) -> Result<ExitCode, Error> {
     let n_clusters = arc.cluster_count();
 
     // First pass: per-cluster compressed size (cheap — pointer arithmetic)
-    // and decompressed total (needs decoding each cluster once).
+    // and decompressed total (needs decoding each cluster once). For
+    // `--by-item`, per-blob sizes are retained here so the item loop
+    // below never has to re-decode a cluster: URL order visits clusters
+    // near-randomly, so answering `item.size()` from the cluster cache
+    // instead would thrash the LRU and re-decompress the same clusters
+    // up to once per blob.
     struct ClusterInfo {
         compressed: u64,
         decompressed: u64,
         blob_count: u32,
         compression: zimru::Compression,
+        blob_sizes: Vec<u64>,
     }
     let mut clusters: Vec<ClusterInfo> = Vec::with_capacity(n_clusters as usize);
     for idx in 0..n_clusters {
         let range = arc.cluster_byte_range(idx)?;
         let compressed = range.end - range.start;
         let c = arc.cluster_uncached(idx)?;
-        let decompressed: u64 = (0..c.blob_count())
-            .filter_map(|b| c.blob(b).ok())
-            .map(|b| b.len() as u64)
-            .sum();
+        let blob_sizes: Vec<u64> = (0..c.blob_count())
+            .map(|b| c.blob(b).map(|d| d.len() as u64).unwrap_or(0))
+            .collect();
+        let decompressed: u64 = blob_sizes.iter().sum();
         clusters.push(ClusterInfo {
             compressed,
             decompressed,
             blob_count: c.blob_count(),
             compression: c.compression(),
+            blob_sizes: if opts.by_item { blob_sizes } else { Vec::new() },
         });
     }
 
@@ -371,12 +371,13 @@ fn cmd_analyze(args: &[String]) -> Result<ExitCode, Error> {
                 Dirent::Article(a) => (a.cluster, a.blob),
                 Dirent::Redirect(_) => continue,
             };
-            let info = &clusters[cluster_idx as usize];
-            let item = match e.get_item(false) {
-                Ok(it) => it,
-                Err(_) => continue,
+            // `cluster_idx` comes from an untrusted dirent field — a
+            // corrupt archive can point past the cluster table, so skip
+            // (never index) out-of-range values.
+            let Some(info) = clusters.get(cluster_idx as usize) else {
+                continue;
             };
-            let blob_size = item.size().unwrap_or(0);
+            let blob_size = info.blob_sizes.get(blob_idx as usize).copied().unwrap_or(0);
             let share = if info.decompressed == 0 {
                 0.0
             } else {
@@ -667,9 +668,23 @@ fn exception_dest(exceptions_dir: &PathBuf, rel: &str) -> std::io::Result<PathBu
     Ok(exceptions_dir.join(esc))
 }
 
+/// Sanitize an entry path for use relative to the dump root. Entry
+/// paths come from the (untrusted) archive, so rebuild from the
+/// segments, dropping empty ones, `.` and `..` — otherwise a crafted
+/// path like `../../home/user/.bashrc` would traverse out of `--dir`
+/// and overwrite arbitrary files.
 fn safe_path(p: &str) -> String {
-    // Strip leading slashes; otherwise keep as-is (dirs are made above).
-    p.trim_start_matches('/').to_string()
+    let out: Vec<&str> = p
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect();
+    if out.is_empty() {
+        // A path made entirely of traversal segments still needs a
+        // filename so the entry dumps somewhere inside the root.
+        "_".to_string()
+    } else {
+        out.join("/")
+    }
 }
 
 // ---------------- helpers ----------------

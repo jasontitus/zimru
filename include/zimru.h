@@ -65,6 +65,22 @@
  */
 #define DEFAULT_CLUSTER_CACHE_MAX_BYTES ((64 * 1024) * 1024)
 
+/**
+ * Decompressed-size ceiling for standard (u32 blob offsets) clusters.
+ * The format cannot address payload bytes past `u32::MAX` with 4-byte
+ * offsets, so anything larger is corrupt input or a decompression bomb.
+ */
+#define MAX_STANDARD_CLUSTER_BYTES (uint64_t)UINT32_MAX
+
+/**
+ * Decompressed-size ceiling for extended (u64 blob offsets) clusters —
+ * a defensive bound so a crafted cluster in an untrusted archive cannot
+ * grow the decode buffer without limit and OOM the process. 16 GiB,
+ * spelled as a decimal literal so the cbindgen-exported C macro stays a
+ * well-defined `long long` constant (a `16 << 30` would overflow `int`).
+ */
+#define MAX_EXTENDED_CLUSTER_BYTES 17179869184
+
 #define MIME_REDIRECT 65535
 
 #define MIME_LINKTARGET 65534
@@ -84,8 +100,17 @@
 #define DEFAULT_CLUSTER_SIZE_TARGET ((2 * 1024) * 1024)
 
 /**
- * Opaque handle wrapping a [`crate::Archive`] plus the per-entry-string
- * cache used to give C callers stable `const char*` pointers.
+ * Default zstd compression level when the caller pins none and no
+ * `ZSTD_CLEVEL` env override is set. Level 19 is the high-ratio
+ * default we benchmark against libzim (still ~1.5× faster than
+ * libzim at the same level); callers wanting fast-but-large output
+ * can drop it via [`Creator::set_compression_level`] or `ZSTD_CLEVEL`.
+ */
+#define DEFAULT_ZSTD_LEVEL 19
+
+/**
+ * Opaque handle wrapping a [`crate::Archive`] plus the caches used to
+ * give C callers stable pointers.
  */
 typedef struct zimru_archive_t zimru_archive_t;
 
@@ -529,13 +554,18 @@ struct zimru_entry_t *zimru_archive_random_entry(const struct zimru_archive_t *a
                                                  struct zimru_error_t **err);
 
 /**
- * Number of metadata keys in the archive.
+ * Number of metadata keys in the archive. O(log n) — counts the
+ * `M`-namespace range without scanning or allocating the key list.
  */
  uintptr_t zimru_archive_metadata_keys_count(const struct zimru_archive_t *arc);
 
 /**
  * Borrowed pointer to the i'th metadata key as a NUL-terminated string.
  * Lifetime tied to `arc`. Returns NULL if `idx` is out of range.
+ *
+ * The key list is computed once on first call and cached on the
+ * archive handle, so enumerating k keys costs one metadata-range walk
+ * total instead of one per call.
  */
  const char *zimru_archive_metadata_key(const struct zimru_archive_t *arc, uintptr_t idx);
 

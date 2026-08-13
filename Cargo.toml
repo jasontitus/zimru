@@ -18,8 +18,8 @@ autobins = false
 default = ["writer"]
 # Enable the ZIM file writer (`zimru::writer::Creator`) and the
 # `zimrecreate` / `zimwriterfs` binaries. With default features disabled
-# the crate is reader-only.
-writer = []
+# the crate is reader-only. flate2 backs `zimwriterfs -x/--inflateHtml`.
+writer = ["dep:flate2"]
 # Compile the `extern "C"` API surface (`zimru::cffi`) and emit the
 # generated `include/zimru.h` from build.rs. Required when consuming
 # zimru as a `cdylib` / `staticlib` from C, C++, or other FFI callers.
@@ -81,6 +81,8 @@ md-5 = { version = "0.10", features = ["asm"] }
 rayon = "1"
 thiserror = "2"
 lru = "0.12"
+# Pure-Rust gzip (miniz_oxide backend) for `zimwriterfs --inflateHtml`.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Used for portable I/O hints: posix_fadvise on Linux, fcntl(F_RDAHEAD)

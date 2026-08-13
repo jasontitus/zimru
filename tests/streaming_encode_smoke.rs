@@ -1,7 +1,11 @@
 //! Smoke test for the streaming-encode path through the chunked
-//! C ABI: items above `STREAMING_ENCODE_THRESHOLD` (4 MiB) feed
-//! straight through a zstd encoder onto disk one chunk at a time
-//! without ever materialising the full body in `Vec<u8>`.
+//! C ABI: items at or above the streaming threshold (256 MiB by
+//! default) feed straight through a zstd encoder onto disk one chunk
+//! at a time without ever materialising the full body in `Vec<u8>`.
+//! The test lowers the threshold to 1 MiB via
+//! `Creator::set_streaming_encode_threshold` so a 6 MiB payload
+//! genuinely exercises the streaming path instead of silently taking
+//! the buffered one.
 //!
 //! The test pushes a 6 MiB item via the public `Creator::begin_chunked_item`
 //! / `chunked_item_chunk` / `end_chunked_item` shape, alongside a
@@ -30,8 +34,8 @@ fn huge_item_streams_through_zstd_encoder_without_buffering() {
     let out = tmp_path("stream-encode");
 
     // Reproducible payload: 6 MiB of a deterministic byte pattern.
-    // 6 MiB > the 4 MiB streaming threshold so begin_chunked_item
-    // should pick the StreamingZstd variant, not Buffered.
+    // 6 MiB > the 1 MiB threshold set below, so begin_chunked_item
+    // picks the StreamingZstd variant, not Buffered.
     let payload: Vec<u8> = (0u32..(6 * 1024 * 1024 / 4))
         .flat_map(|i| i.to_le_bytes())
         .collect();
@@ -41,6 +45,11 @@ fn huge_item_streams_through_zstd_encoder_without_buffering() {
     c.set_compression(Compression::Zstd);
     c.set_compression_level(3);
     c.set_main_path("home");
+    // Lower the streaming cutoff (default 256 MiB) so this test's
+    // 6 MiB item actually takes the streaming-encode path — with the
+    // default it would silently fall into the buffered path and this
+    // test would cover nothing.
+    c.set_streaming_encode_threshold(1024 * 1024);
     c.start_writing(&out).expect("start_writing");
 
     // Two small bin-packed items first — these go through the
@@ -104,6 +113,19 @@ fn huge_item_streams_through_zstd_encoder_without_buffering() {
     assert_eq!(body.len(), payload.len(), "huge body size mismatch");
     assert_eq!(&body[..], &payload[..], "huge body content mismatch");
 
+    // Streaming items get a dedicated single-blob cluster — assert that
+    // shape so a regression back to the bin-packed buffered path fails
+    // loudly here.
+    let zimru::Dirent::Article(a) = huge.dirent() else {
+        panic!("huge.bin should be an article dirent");
+    };
+    let huge_cluster = arc.cluster(a.cluster).expect("load huge cluster");
+    assert_eq!(
+        huge_cluster.blob_count(),
+        1,
+        "streamed item should live alone in its own cluster"
+    );
+
     // The other items still round-trip.
     let home = arc
         .get_entry_by_path("home")
@@ -132,8 +154,8 @@ fn huge_item_streams_through_zstd_encoder_without_buffering() {
 
 #[test]
 fn small_chunked_item_uses_buffered_path_and_bin_packs() {
-    // Small chunked item (well below the 4 MiB threshold) goes
-    // through the Buffered path, so it shares a cluster with
+    // Small chunked item (well below the default 256 MiB threshold)
+    // goes through the Buffered path, so it shares a cluster with
     // neighbouring small items rather than getting its own.
     let out = tmp_path("stream-encode-small");
 

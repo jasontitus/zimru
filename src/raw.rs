@@ -11,21 +11,21 @@ pub fn u8_at(buf: &[u8], off: usize) -> Result<u8> {
 
 #[inline]
 pub fn u16_at(buf: &[u8], off: usize) -> Result<u16> {
-    let end = off + 2;
+    let end = off.checked_add(2).ok_or(Error::Truncated(off as u64))?;
     let s = buf.get(off..end).ok_or(Error::Truncated(off as u64))?;
     Ok(u16::from_le_bytes(s.try_into().unwrap()))
 }
 
 #[inline]
 pub fn u32_at(buf: &[u8], off: usize) -> Result<u32> {
-    let end = off + 4;
+    let end = off.checked_add(4).ok_or(Error::Truncated(off as u64))?;
     let s = buf.get(off..end).ok_or(Error::Truncated(off as u64))?;
     Ok(u32::from_le_bytes(s.try_into().unwrap()))
 }
 
 #[inline]
 pub fn u64_at(buf: &[u8], off: usize) -> Result<u64> {
-    let end = off + 8;
+    let end = off.checked_add(8).ok_or(Error::Truncated(off as u64))?;
     let s = buf.get(off..end).ok_or(Error::Truncated(off as u64))?;
     Ok(u64::from_le_bytes(s.try_into().unwrap()))
 }
@@ -42,5 +42,8 @@ pub fn cstr_at(buf: &[u8], off: usize) -> Result<(&str, usize)> {
         .ok_or(Error::Truncated(off as u64))?;
     let bytes = &tail[..nul];
     let s = std::str::from_utf8(bytes).map_err(|_| Error::BadUtf8(off as u64))?;
-    Ok((s, start + nul + 1))
+    let next = start
+        .checked_add(nul + 1)
+        .ok_or(Error::Truncated(off as u64))?;
+    Ok((s, next))
 }

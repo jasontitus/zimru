@@ -22,7 +22,6 @@
 //! payload reaches `cluster_size_target` bytes (default 2 MiB, matching
 //! upstream `zimwriterfs`).
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write as _};
@@ -530,6 +529,12 @@ pub struct Creator {
     max_in_flight_bytes: usize,
     uuid: [u8; 16],
     cluster_strategy: ClusterStrategy,
+    /// Chunked items whose `expected_size` is at least this many bytes
+    /// take the bounded-memory streaming-encode path instead of being
+    /// buffered. See [`STREAMING_ENCODE_THRESHOLD`] for the default and
+    /// the trade-off; overridable via
+    /// [`Creator::set_streaming_encode_threshold`].
+    streaming_encode_threshold: usize,
 
     /// Set when `start_writing` is called. Once set, all `add_*` and
     /// `set_main_path` calls route directly into the streamer; any
@@ -558,8 +563,23 @@ impl Creator {
             max_in_flight_bytes: 0,
             uuid: default_uuid(),
             cluster_strategy: ClusterStrategy::Single,
+            streaming_encode_threshold: STREAMING_ENCODE_THRESHOLD,
             stream: None,
         }
+    }
+
+    /// Override the chunked-item size cutoff above which bodies take the
+    /// bounded-memory streaming-encode path instead of being buffered
+    /// (default: [`STREAMING_ENCODE_THRESHOLD`], 256 MiB). Mainly for
+    /// tests and memory-constrained builds; must be called before
+    /// [`Creator::start_writing`].
+    pub fn set_streaming_encode_threshold(&mut self, bytes: usize) -> &mut Self {
+        assert!(
+            self.stream.is_none(),
+            "set_streaming_encode_threshold called after start_writing",
+        );
+        self.streaming_encode_threshold = bytes;
+        self
     }
 
     /// Pick how items are grouped into clusters during streaming.
@@ -883,6 +903,7 @@ impl Creator {
             self.uuid,
             self.main_path.take(),
             self.cluster_strategy,
+            self.streaming_encode_threshold,
         )?;
         // Drain anything the caller buffered through add_* before
         // they decided to stream.
@@ -958,14 +979,24 @@ impl RawDirent {
     }
 }
 
-fn intern_mime(m: &str, mimes: &mut Vec<String>, index: &mut BTreeMap<String, u16>) -> u16 {
+fn intern_mime(m: &str, mimes: &mut Vec<String>, index: &mut BTreeMap<String, u16>) -> Result<u16> {
     if let Some(&i) = index.get(m) {
-        return i;
+        return Ok(i);
+    }
+    // Mime indices share the dirent u16 field with the reserved values
+    // 0xFFFD..=0xFFFF (deletedentry/linktarget/redirect), so the list
+    // must stay below 0xFFFD entries — reject explicitly rather than
+    // letting the `as u16` cast wrap into a colliding index.
+    if mimes.len() >= crate::dirent::MIME_DELETED as usize {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "too many distinct mimetypes (limit {})",
+            crate::dirent::MIME_DELETED
+        ))));
     }
     let i = mimes.len() as u16;
     mimes.push(m.to_string());
     index.insert(m.to_string(), i);
-    i
+    Ok(i)
 }
 
 /// Build the `M/Counter` body: `mime=count;mime=count;…`. Counts
@@ -1043,6 +1074,9 @@ struct Streamer {
     uuid: [u8; 16],
     main_path: Option<String>,
     cluster_strategy: ClusterStrategy,
+    /// Chunked-item size cutoff for the streaming-encode path. See
+    /// [`Creator::set_streaming_encode_threshold`].
+    streaming_threshold: usize,
 
     // Mime list, accumulating as items arrive.
     mimes: Vec<String>,
@@ -1055,6 +1089,11 @@ struct Streamer {
     // and its dirents are committed with the freshly-allocated
     // `cluster_idx`.
     buckets: BTreeMap<String, Bucket>,
+
+    /// Reusable scratch buffer for composing bucket keys, so the
+    /// per-item hot path (`push_item`) does not allocate a fresh key
+    /// String for the non-`Single` cluster strategies.
+    key_scratch: String,
 
     // Per-cluster offsets in the output file. Each closed cluster
     // gets a slot here; the slot is filled with the actual offset
@@ -1282,6 +1321,7 @@ impl Streamer {
         uuid: [u8; 16],
         main_path: Option<String>,
         cluster_strategy: ClusterStrategy,
+        streaming_threshold: usize,
     ) -> Result<Self> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -1306,9 +1346,11 @@ impl Streamer {
             uuid,
             main_path,
             cluster_strategy,
+            streaming_threshold,
             mimes: Vec::new(),
             mime_index: BTreeMap::new(),
             buckets: BTreeMap::new(),
+            key_scratch: String::new(),
             cluster_offsets: Vec::new(),
             dirents: Vec::new(),
             redirections: Vec::new(),
@@ -1336,7 +1378,7 @@ impl Streamer {
             )));
         }
         let comp = effective_compression(self.compression, meta.compress);
-        let big_enough = expected_size.is_some_and(|s| s as usize >= STREAMING_ENCODE_THRESHOLD);
+        let big_enough = expected_size.is_some_and(|s| s as usize >= self.streaming_threshold);
         let stream_zstd = big_enough && matches!(comp, Compression::Zstd);
         let stream_raw = big_enough && matches!(comp, Compression::None);
 
@@ -1356,7 +1398,7 @@ impl Streamer {
             self.cluster_offsets.push(0);
 
             // Intern this item's mime so we can record it in the dirent.
-            let mime_idx = intern_mime(&meta.mimetype, &mut self.mimes, &mut self.mime_index);
+            let mime_idx = intern_mime(&meta.mimetype, &mut self.mimes, &mut self.mime_index)?;
 
             // Build the cluster's in-band header: ptr table with one
             // blob. ptr[0] = header_len (start of blob 0), ptr[1] =
@@ -1714,23 +1756,22 @@ impl Streamer {
     /// therefore distinct clusters. The compression tag goes first so
     /// the BTreeMap iteration order interleaves cleanly when both
     /// compressed and raw clusters exist.
-    fn bucket_key(
+    fn bucket_key<'k>(
         &self,
+        scratch: &'k mut String,
         path: &str,
         mimetype: &str,
         compression: Compression,
-    ) -> Cow<'static, str> {
-        let tag = compression_tag(compression);
+    ) -> &'k str {
+        // Fast path for the default strategy: the key is one of three
+        // static strings, so nothing is written into the scratch buffer.
         let strat: &str = match self.cluster_strategy {
-            // Fast path for the default strategy: the key is one of
-            // three static strings, so the per-item allocation
-            // disappears entirely.
             ClusterStrategy::Single => {
-                return Cow::Borrowed(match compression {
+                return match compression {
                     Compression::None => "n|",
                     Compression::Zstd => "z|",
                     Compression::Xz => "x|",
-                });
+                };
             }
             ClusterStrategy::ByMime => mimetype,
             ClusterStrategy::ByExtension => match path.rsplit_once('.') {
@@ -1742,14 +1783,21 @@ impl Streamer {
                 None => path,
             },
         };
-        Cow::Owned(format!("{tag}|{strat}"))
+        // Compose into the caller's reusable scratch buffer — this is
+        // the per-item hot path, and a `format!` here would mean one
+        // heap alloc/free per item at multi-million-item scale.
+        scratch.clear();
+        scratch.push_str(compression_tag(compression));
+        scratch.push('|');
+        scratch.push_str(strat);
+        scratch.as_str()
     }
 
     /// Stream-process one item: bin-pack its body into the bucket
     /// it belongs to, flush that bucket if it overflows, record the
     /// pending dirent (committed at the bucket's next flush).
     fn push_item(&mut self, item: Item) -> Result<()> {
-        let mime_idx = intern_mime(&item.mimetype, &mut self.mimes, &mut self.mime_index);
+        let mime_idx = intern_mime(&item.mimetype, &mut self.mimes, &mut self.mime_index)?;
         let title = if item.title.is_empty() {
             item.path.clone()
         } else {
@@ -1760,23 +1808,27 @@ impl Streamer {
         self.stats.items_buffered += 1;
         self.stats.raw_bytes_total += body_len as u64;
         let comp = effective_compression(self.compression, item.compress);
-        let key = self.bucket_key(&item.path, &item.mimetype, comp);
+        // Take the scratch buffer out of `self` so composing the key can
+        // borrow it while the rest of `self` stays free for the calls
+        // below; it goes back at the end, keeping its capacity.
+        let mut scratch = std::mem::take(&mut self.key_scratch);
+        let key = self.bucket_key(&mut scratch, &item.path, &item.mimetype, comp);
 
         // Ensure the bucket exists, then check overflow against
         // *this* bucket's running size (not a global running size).
-        let needs_flush = match self.buckets.get(key.as_ref()) {
+        let needs_flush = match self.buckets.get(key) {
             Some(b) => !b.blobs.is_empty() && b.size_bytes + body_len > self.cluster_size_target,
             None => false,
         };
         if needs_flush {
-            self.flush_bucket(key.as_ref())?;
+            self.flush_bucket(key)?;
         }
 
-        if !self.buckets.contains_key(key.as_ref()) {
+        if !self.buckets.contains_key(key) {
             self.buckets
-                .insert(key.clone().into_owned(), Bucket::with_compression(comp));
+                .insert(key.to_string(), Bucket::with_compression(comp));
         }
-        let bucket = self.buckets.get_mut(key.as_ref()).expect("just inserted");
+        let bucket = self.buckets.get_mut(key).expect("just inserted");
         let blob_idx = bucket.blobs.len() as u32;
         bucket.blobs.push(body);
         bucket.size_bytes += body_len;
@@ -1787,6 +1839,7 @@ impl Streamer {
             mime_idx,
             blob_idx,
         });
+        self.key_scratch = scratch;
         Ok(())
     }
 
@@ -1898,10 +1951,19 @@ impl Streamer {
         // value, or a test that wants exact bytes). We always
         // trust caller-supplied metadata over our auto-generated
         // version.
+        // Caller-supplied metadata was pushed through `push_item` in
+        // step 1 and is typically still sitting un-flushed in a bucket's
+        // `pending` list at this point (buckets flush in step 2b), so
+        // committed dirents alone are not enough — scan both.
         let counter_already_set = self
             .dirents
             .iter()
-            .any(|d| d.namespace() == b'M' && d.url() == "Counter");
+            .any(|d| d.namespace() == b'M' && d.url() == "Counter")
+            || self
+                .buckets
+                .values()
+                .flat_map(|b| b.pending.iter())
+                .any(|pa| pa.namespace == b'M' && pa.url == "Counter");
         if !counter_already_set {
             let counter_str = build_counter_string(&self.mimes, &self.dirents);
             self.push_item(Item {

@@ -728,20 +728,23 @@ impl Archive {
         Ok(item.get_data()?.to_vec())
     }
 
-    /// List all metadata keys (entries in the `M` namespace).
+    /// List all metadata keys (entries in the `M` namespace). Binary-
+    /// searches for the `M`-namespace range instead of scanning every
+    /// dirent, so cost scales with the (small) metadata count, not the
+    /// archive's entry count.
     pub fn get_metadata_keys(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        let n = self.core.header.entry_count;
-        for i in 0..n {
+        let Ok(range) = self.namespace_range(NS_METADATA) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity((range.end - range.start) as usize);
+        for i in range {
             let Ok(off) = self.url_pointer(i) else {
                 continue;
             };
-            let Ok(d) = Dirent::parse(&self.core.mmap, off as usize) else {
+            let Ok((_, url)) = Dirent::key_at(&self.core.mmap, off as usize) else {
                 continue;
             };
-            if d.namespace() == NS_METADATA {
-                out.push(d.url().to_string());
-            }
+            out.push(url.to_string());
         }
         out
     }
@@ -1040,20 +1043,22 @@ impl Archive {
     /// + `lseek` without copying any bytes.
     pub fn blob_direct_access(&self, cluster_idx: u32, blob_idx: u32) -> Result<DirectAccess> {
         let cluster_range = self.cluster_byte_range(cluster_idx)?;
-        let cluster = self.cluster(cluster_idx)?;
-        match cluster.compression() {
-            crate::Compression::None => {
-                let r = cluster.blob_range(blob_idx)?;
-                let len = r.end - r.start;
+        // Answer straight from the on-disk bytes: the info byte gives the
+        // compression id, and for uncompressed clusters the blob-offset
+        // table is read in place from the mmap. Going through
+        // `self.cluster` here would copy (and cache) the entire payload —
+        // multi-GB for the conventionally-uncompressed Xapian index
+        // clusters — just to answer an offset/size query.
+        let raw = self.cluster_raw(cluster_idx)?;
+        match crate::cluster::raw_blob_range(raw, blob_idx)? {
+            Some(r) => Ok(DirectAccess {
+                is_direct: true,
                 // The cluster's payload starts immediately after the
                 // 1-byte info byte at the start of the on-disk cluster.
-                Ok(DirectAccess {
-                    is_direct: true,
-                    file_offset: cluster_range.start + 1 + r.start as u64,
-                    size: len as u64,
-                })
-            }
-            _ => Ok(DirectAccess {
+                file_offset: cluster_range.start + 1 + r.start as u64,
+                size: (r.end - r.start) as u64,
+            }),
+            None => Ok(DirectAccess {
                 is_direct: false,
                 file_offset: 0,
                 size: 0,
@@ -1223,17 +1228,19 @@ impl Archive {
     /// lookup on the archive.
     pub fn check_dirent_order(&self) -> Result<bool> {
         let n = self.core.header.entry_count;
-        let mut prev: Option<(u8, String)> = None;
+        // `key_at` borrows from the mmap, so the previous key can be held
+        // across iterations without a per-dirent String allocation.
+        let mut prev: Option<(u8, &str)> = None;
         for i in 0..n {
             let off = self.url_pointer(i)?;
             let (ns, url) = Dirent::key_at(&self.core.mmap, off as usize)?;
-            if let Some((prev_ns, prev_url)) = &prev {
-                let cmp = prev_ns.cmp(&ns).then_with(|| prev_url.as_str().cmp(url));
+            if let Some((prev_ns, prev_url)) = prev {
+                let cmp = prev_ns.cmp(&ns).then_with(|| prev_url.cmp(url));
                 if cmp.is_gt() {
                     return Ok(false);
                 }
             }
-            prev = Some((ns, url.to_string()));
+            prev = Some((ns, url));
         }
         Ok(true)
     }
@@ -1244,19 +1251,18 @@ impl Archive {
     /// search over this ordering.
     pub fn check_title_index(&self) -> Result<bool> {
         let listing = self.title_listing()?;
-        let mut prev: Option<(u8, String)> = None;
+        // Same borrow-from-mmap trick as `check_dirent_order`.
+        let mut prev: Option<(u8, &str)> = None;
         for &url_idx in listing.iter() {
             let off = self.url_pointer(url_idx)?;
             let (ns, title) = Dirent::title_key_at(&self.core.mmap, off as usize)?;
-            if let Some((prev_ns, prev_title)) = &prev {
-                let cmp = prev_ns
-                    .cmp(&ns)
-                    .then_with(|| prev_title.as_str().cmp(title));
+            if let Some((prev_ns, prev_title)) = prev {
+                let cmp = prev_ns.cmp(&ns).then_with(|| prev_title.cmp(title));
                 if cmp.is_gt() {
                     return Ok(false);
                 }
             }
-            prev = Some((ns, title.to_string()));
+            prev = Some((ns, title));
         }
         Ok(true)
     }
@@ -1486,7 +1492,7 @@ impl Item {
     }
 
     pub fn title(&self) -> &str {
-        &self.article.title
+        self.article.title()
     }
 
     /// Single-byte namespace this item belongs to (e.g. `b'C'`, `b'A'`).

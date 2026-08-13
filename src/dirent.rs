@@ -47,7 +47,20 @@ pub struct ArticleEntry {
     pub cluster: u32,
     pub blob: u32,
     pub url: String,
+    /// Raw on-disk title — empty when the dirent reuses `url` as its title.
+    /// Use [`Dirent::title`] (or [`ArticleEntry::title`]) for the effective title.
     pub title: String,
+}
+
+impl ArticleEntry {
+    /// Effective title: falls back to `url` when the on-disk title is empty.
+    pub fn title(&self) -> &str {
+        if self.title.is_empty() {
+            &self.url
+        } else {
+            &self.title
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +68,20 @@ pub struct RedirectEntry {
     pub namespace: u8,
     pub redirect_index: u32,
     pub url: String,
+    /// Raw on-disk title — empty when the dirent reuses `url` as its title.
+    /// Use [`Dirent::title`] (or [`RedirectEntry::title`]) for the effective title.
     pub title: String,
+}
+
+impl RedirectEntry {
+    /// Effective title: falls back to `url` when the on-disk title is empty.
+    pub fn title(&self) -> &str {
+        if self.title.is_empty() {
+            &self.url
+        } else {
+            &self.title
+        }
+    }
 }
 
 impl Dirent {
@@ -75,11 +101,9 @@ impl Dirent {
                     namespace,
                     redirect_index,
                     url: url.to_string(),
-                    title: if title.is_empty() {
-                        url.to_string()
-                    } else {
-                        title.to_string()
-                    },
+                    // Empty stays empty (no allocation); the accessors fall
+                    // back to `url` so behaviour is unchanged for callers.
+                    title: title.to_string(),
                 }))
             }
             MIME_LINKTARGET | MIME_DELETED => {
@@ -95,11 +119,7 @@ impl Dirent {
                     cluster,
                     blob,
                     url: url.to_string(),
-                    title: if title.is_empty() {
-                        url.to_string()
-                    } else {
-                        title.to_string()
-                    },
+                    title: title.to_string(),
                 }))
             }
             _ => {
@@ -114,11 +134,7 @@ impl Dirent {
                     cluster,
                     blob,
                     url: url.to_string(),
-                    title: if title.is_empty() {
-                        url.to_string()
-                    } else {
-                        title.to_string()
-                    },
+                    title: title.to_string(),
                 }))
             }
         }
@@ -167,10 +183,13 @@ impl Dirent {
         }
     }
 
+    /// Effective title: falls back to `url` when the on-disk title is empty
+    /// (the common case for content entries), without having allocated a
+    /// second copy of the url at parse time.
     pub fn title(&self) -> &str {
         match self {
-            Dirent::Article(a) => &a.title,
-            Dirent::Redirect(r) => &r.title,
+            Dirent::Article(a) => a.title(),
+            Dirent::Redirect(r) => r.title(),
         }
     }
 

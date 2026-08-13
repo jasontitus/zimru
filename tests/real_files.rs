@@ -60,9 +60,13 @@ fn exercise_archive(label: &str, archive: &Archive) {
     }
 
     // 2. Walk every entry by path; round-trip via binary search.
+    // Sample ~200 entries for the spot-check up front instead of
+    // materialising a String path for every entry (millions on real
+    // ZIMs) only to use a couple hundred of them.
     let mut articles = 0usize;
     let mut redirects = 0usize;
-    let mut by_url: Vec<(u32, u8, String)> = Vec::with_capacity(h.entry_count as usize);
+    let stride = (h.entry_count as usize / 200).max(1);
+    let mut by_url: Vec<(u32, u8, String)> = Vec::with_capacity(201);
     for (i, e) in archive.iter_by_path().enumerate() {
         let e = e.expect("path iter");
         assert_eq!(e.index() as usize, i, "path-iter index drift");
@@ -71,13 +75,14 @@ fn exercise_archive(label: &str, archive: &Archive) {
         } else {
             articles += 1;
         }
-        by_url.push((e.index(), e.namespace(), e.path().to_string()));
+        if i % stride == 0 {
+            by_url.push((e.index(), e.namespace(), e.path().to_string()));
+        }
     }
     println!("[{label}]   path-iter articles={articles} redirects={redirects}");
 
-    // Spot-check binary search (sample to keep runtime sane on large files).
-    let stride = (by_url.len() / 200).max(1);
-    for (idx, ns, url) in by_url.iter().step_by(stride) {
+    // Spot-check binary search on the sampled entries.
+    for (idx, ns, url) in by_url.iter() {
         let found = archive
             .entry_by_ns_path(*ns, url)
             .unwrap_or_else(|_| panic!("binary-search miss for {}/{url}", char::from(*ns)));
@@ -95,10 +100,13 @@ fn exercise_archive(label: &str, archive: &Archive) {
         if let Some(p) = &prev {
             assert!(p <= &key, "title order broken at {i}: {p:?} -> {key:?}");
         }
-        prev = Some(key.clone());
+        // Clone only for the ~50 sampled titles; `key` itself moves
+        // into `prev` (the unconditional clone doubled allocation
+        // churn across millions of titles for no benefit).
         if i.is_multiple_of(title_count.max(1) / 50 + 1) {
-            sample_titles.push(key);
+            sample_titles.push(key.clone());
         }
+        prev = Some(key);
     }
     println!("[{label}]   title-iter count={title_count}");
     for (ns, title) in &sample_titles {

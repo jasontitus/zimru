@@ -99,7 +99,12 @@ fn parse_size(s: &str) -> Option<u64> {
     } else {
         (s, 1u64)
     };
-    num_str.parse::<u64>().ok().map(|n| n * mult)
+    // checked_mul: a huge suffixed value like `20000000000G` must be
+    // rejected, not silently wrapped into a tiny (or bogus) split size.
+    num_str
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
 }
 
 fn run(file: &str, prefix: &str, size: u64, force: bool) -> Result<(), Error> {

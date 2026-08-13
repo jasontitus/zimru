@@ -21,16 +21,60 @@
 //!   once via `feed_*`. Output is written to a temp file passed on the
 //!   CLI; on `finish()` we close stdin, wait, and read the file back.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
-/// Output of one `xapianbuilder` run.
+/// Output of one `xapianbuilder` run. The built index stays in its
+/// temp file — a fulltext DB is multi-GB on large archives, so it is
+/// streamed into the writer in bounded chunks (see [`IndexBlob::add_to`])
+/// instead of being slurped into one `Vec<u8>`.
 pub struct IndexBlob {
     /// ZIM URL (without namespace), e.g. "fulltext/xapian".
     pub url: &'static str,
     pub mimetype: &'static str,
-    pub bytes: Vec<u8>,
+    /// Temp file holding the built index. Owned by the caller's temp
+    /// dir; consumed by [`IndexBlob::add_to`].
+    pub path: PathBuf,
+    /// Byte size of `path`.
+    pub size: u64,
+}
+
+impl IndexBlob {
+    /// Stream this blob's temp file into the writer as an uncompressed
+    /// `X`-namespace item, in bounded chunks.
+    pub fn add_to(&self, creator: &mut zimru::writer::Creator) -> Result<(), zimru::Error> {
+        let mut f = std::fs::File::open(&self.path)?;
+        zimru::io_hints::hint_sequential(&f);
+        creator.begin_chunked_item(
+            Some(b'X'),
+            self.url.to_string(),
+            String::new(),
+            self.mimetype.to_string(),
+            Some(self.size),
+            Some(false),
+        )?;
+        let mut buf = vec![0u8; 4 * 1024 * 1024];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            creator.chunked_item_chunk(&buf[..n])?;
+        }
+        creator.end_chunked_item()
+    }
+}
+
+/// Removes a temp directory (recursively) when dropped, so early error
+/// returns in the callers don't strand `.{stem}.xapianbuilder.{pid}`
+/// directories on disk.
+pub struct TmpDirCleanup(pub PathBuf);
+
+impl Drop for TmpDirCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// One running `xapianbuilder` child + its stdin handle + the temp
@@ -38,8 +82,21 @@ pub struct IndexBlob {
 struct Job {
     child: Child,
     stdin: Option<ChildStdin>,
+    /// Drains the child's piped stderr concurrently with feeding, so a
+    /// chatty child can never fill the ~64 KB pipe buffer, stop reading
+    /// stdin, and deadlock our `write_all`.
+    stderr_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
     out_path: PathBuf,
     url: &'static str,
+}
+
+impl Job {
+    fn take_stderr(&mut self) -> Vec<u8> {
+        self.stderr_thread
+            .take()
+            .and_then(|t| t.join().ok())
+            .unwrap_or_default()
+    }
 }
 
 /// Public face of the helper. Internally either holds two live
@@ -168,7 +225,13 @@ impl IndexHelper {
             Ok(j) => j,
             Err(e) => {
                 eprintln!("[zimwriterfs] xapianbuilder title spawn failed: {e}; skipping indexes");
+                let mut fulltext = fulltext;
+                fulltext.stdin.take();
+                let stderr_thread = fulltext.stderr_thread.take();
                 let _ = fulltext.child.wait_with_killing();
+                if let Some(t) = stderr_thread {
+                    let _ = t.join();
+                }
                 return Self::disabled();
             }
         };
@@ -217,14 +280,16 @@ impl IndexHelper {
     }
 
     /// Close stdin on both children, wait, and return the produced
-    /// blobs. On any error returns an empty Vec — the caller proceeds
-    /// without indexes, matching libzim's "indexes are best-effort"
-    /// posture.
-    pub fn finish(self, verbose: bool) -> Vec<IndexBlob> {
+    /// blobs (as temp-file references — see [`IndexBlob::add_to`]). On
+    /// any error returns an empty Vec — the caller proceeds without
+    /// indexes, matching libzim's "indexes are best-effort" posture.
+    pub fn finish(mut self, verbose: bool) -> Vec<IndexBlob> {
+        // Take the state out so the `Drop` impl (which kills children
+        // on early-error paths) sees `Disabled` and no-ops.
         let State::Active {
             mut fulltext,
             mut title,
-        } = self.state
+        } = std::mem::replace(&mut self.state, State::Disabled)
         else {
             return Vec::new();
         };
@@ -234,19 +299,22 @@ impl IndexHelper {
         title.stdin.take();
 
         let mut blobs = Vec::with_capacity(2);
-        for job in [fulltext, title] {
+        for mut job in [fulltext, title] {
             let url = job.url;
             let out_path = job.out_path.clone();
-            match job.child.wait_with_output() {
-                Ok(out) if out.status.success() => match std::fs::read(&out_path) {
-                    Ok(bytes) if !bytes.is_empty() => {
+            let status = job.child.wait();
+            let stderr = job.take_stderr();
+            match status {
+                Ok(status) if status.success() => match std::fs::metadata(&out_path) {
+                    Ok(m) if m.len() > 0 => {
                         if verbose {
-                            eprintln!("[zimwriterfs] xapianbuilder {url}: {} bytes", bytes.len());
+                            eprintln!("[zimwriterfs] xapianbuilder {url}: {} bytes", m.len());
                         }
                         blobs.push(IndexBlob {
                             url,
                             mimetype: "application/octet-stream+xapian",
-                            bytes,
+                            path: out_path,
+                            size: m.len(),
                         });
                     }
                     Ok(_) => {
@@ -256,32 +324,59 @@ impl IndexHelper {
                     }
                     Err(e) => {
                         eprintln!(
-                            "[zimwriterfs] xapianbuilder {url}: cannot read {}: {e}",
+                            "[zimwriterfs] xapianbuilder {url}: cannot stat {}: {e}",
                             out_path.display()
                         );
                     }
                 },
-                Ok(out) => {
+                Ok(status) => {
                     eprintln!(
                         "[zimwriterfs] xapianbuilder {url} exited {}: {}",
-                        out.status,
-                        String::from_utf8_lossy(&out.stderr).trim_end()
+                        status,
+                        String::from_utf8_lossy(&stderr).trim_end()
                     );
                 }
                 Err(e) => {
                     eprintln!("[zimwriterfs] xapianbuilder {url} wait failed: {e}");
                 }
             }
-            // Output file is consumed; remove eagerly. Errors
-            // ignored — the caller cleans up tmp_dir on its way out
-            // anyway.
-            let _ = std::fs::remove_file(&out_path);
         }
         blobs
     }
 }
 
+impl Drop for IndexHelper {
+    /// Early-error cleanup: without this, a `?` return in the caller
+    /// after `spawn` leaks two un-reaped `xapianbuilder` children (with
+    /// nobody ever reading their output). The normal path goes through
+    /// `finish`, which replaces the state with `Disabled` first.
+    fn drop(&mut self) {
+        if let State::Active { fulltext, title } = &mut self.state {
+            for job in [fulltext, title] {
+                job.stdin.take();
+                let _ = job.child.kill();
+                let _ = job.child.wait();
+                let _ = job.take_stderr();
+            }
+        }
+    }
+}
+
 fn write_raw(job: &mut Job, buf: &[u8]) {
+    if job.stdin.is_none() {
+        return;
+    }
+    // A child that already exited will never drain the pipe again —
+    // stop feeding instead of blocking forever in `write_all` once the
+    // 64 KB pipe buffer fills. (Mirrors the broken-pipe error path.)
+    if let Ok(Some(status)) = job.child.try_wait() {
+        eprintln!(
+            "[zimwriterfs] xapianbuilder {} exited early ({status}); disabling feed",
+            job.url
+        );
+        job.stdin.take();
+        return;
+    }
     let Some(stdin) = job.stdin.as_mut() else {
         return;
     };
@@ -322,9 +417,21 @@ fn spawn_one(
         .stdout(Stdio::null())
         .spawn()?;
     let stdin = child.stdin.take();
+    // Drain stderr from a dedicated thread for the whole feeding phase
+    // — leaving it in the pipe until `finish` would let a chatty child
+    // fill the pipe buffer, block on its own stderr writes, stop
+    // reading stdin, and deadlock the parent.
+    let stderr_thread = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
     Ok(Job {
         child,
         stdin,
+        stderr_thread,
         out_path: out_path.to_path_buf(),
         url,
     })
