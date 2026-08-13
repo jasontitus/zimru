@@ -131,7 +131,7 @@ fn run(file: &str, prefix: &str, size: u64, force: bool) -> Result<(), Error> {
     let mut input = File::open(file)?;
     let mut buf = vec![0u8; READ_BUF];
     let mut written = 0u64;
-    let mut suffix = [b'a', b'a'];
+    let mut suffix = *b"aa";
     let mut part_path = format!("{prefix}{}{}", suffix[0] as char, suffix[1] as char);
     eprintln!("opening new file {part_path}");
     let mut part = OpenOptions::new()
