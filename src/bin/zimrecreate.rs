@@ -222,18 +222,41 @@ fn run(
     let mut seen_metadata = std::collections::HashSet::new();
 
     // Legacy (major-5) archives store user content spread over the old
-    // namespaces — 'A' articles, 'B' article meta, 'I'/'J' media, '-'
-    // layout, 'U'/'V' categories — instead of the unified 'C'. Normalize
-    // those to 'C' before gating, so legacy input recreates with its
-    // content instead of silently producing a metadata-only archive
-    // whose regenerated `W/mainPage` redirect then dangles.
+    // namespaces — 'A' articles, 'I'/'J' media, '-' layout — instead of
+    // the unified 'C'. Normalize those to 'C' before gating, so legacy
+    // input recreates with its content instead of silently producing a
+    // metadata-only archive whose regenerated `W/mainPage` redirect
+    // then dangles. The old 'B' (article meta) and 'U'/'V' (category)
+    // namespaces are deliberately NOT folded in: they key entries by
+    // the same url as their 'A' article, so folding them would mint
+    // duplicate C/<url> dirents; they're auxiliary data with no
+    // new-namespace equivalent and are dropped like 'X'.
     let legacy = !source.header().uses_new_namespaces();
     let effective_ns = |ns: u8| -> u8 {
-        if legacy && matches!(ns, b'A' | b'B' | b'I' | b'J' | b'-' | b'U' | b'V') {
+        if legacy && matches!(ns, b'A' | b'I' | b'J' | b'-') {
             b'C'
         } else {
             ns
         }
+    };
+    // Folding several legacy namespaces into one can still collide
+    // (e.g. 'A/foo' vs 'I/foo'); the writer has no duplicate-path
+    // detection, so dedupe here — first entry wins, matching the
+    // URL-pointer sort order of the source.
+    let mut seen_content_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut note_content_path = |ns: u8, path: &str| -> bool {
+        if !legacy {
+            return true;
+        }
+        let fresh = seen_content_paths.insert(path.to_string());
+        if !fresh {
+            eprintln!(
+                "zimrecreate: skipping duplicate content path {}/{path} (legacy namespace fold)",
+                char::from(ns)
+            );
+        }
+        fresh
     };
 
     // Pass 1 — dirents only (no cluster decompression): redirects and
@@ -283,6 +306,8 @@ fn run(
                             char::from(target.namespace()),
                             target.path()
                         );
+                    } else if !note_content_path(entry.namespace(), path) {
+                        // duplicate path after legacy namespace fold — skipped
                     } else {
                         let target_path = target.path().to_string();
                         creator.add_redirection(
@@ -311,11 +336,13 @@ fn run(
             }
             Dirent::Article(a) => {
                 if ns == b'C' {
-                    pending.push(PendingContent {
-                        cluster: a.cluster,
-                        blob: a.blob,
-                        url_index: entry.index(),
-                    });
+                    if note_content_path(entry.namespace(), path) {
+                        pending.push(PendingContent {
+                            cluster: a.cluster,
+                            blob: a.blob,
+                            url_index: entry.index(),
+                        });
+                    }
                 } else if ns == b'M' {
                     // M-namespace entries are few and tiny; fetch them
                     // directly. Strip the special illustration path back
@@ -412,12 +439,13 @@ fn run(
     drop(pending);
 
     // Drain the helper, stream output blobs in as X/* items (the
-    // fulltext DB can be multi-GB — never buffer it whole).
+    // fulltext DB can be multi-GB — never buffer it whole). A failure
+    // mid-stream leaves the writer with an in-flight chunked item, so
+    // it must abort the build — continuing would finalize a corrupt
+    // archive while exiting 0.
     let blobs = indexer.finish(false);
     for blob in blobs {
-        if let Err(e) = blob.add_to(&mut creator) {
-            eprintln!("zimrecreate: attaching index {} failed: {e}", blob.url);
-        }
+        blob.add_to(&mut creator)?;
     }
 
     creator.finish_writing()?;

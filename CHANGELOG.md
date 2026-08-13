@@ -72,10 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   original mimetype (PNG favicons were being re-labelled text/plain);
   redirects whose target is outside the content namespace are skipped with
   a warning instead of failing the build.
-- `writer`: a caller-supplied `M/Counter` now suppresses the auto-generated
-  one even while it sits in an un-flushed bucket (previously the output
-  could carry two `(M, Counter)` dirents); interning more than 65,532
-  distinct mimetypes errors explicitly instead of silently wrapping.
+- `writer`: the auto-generated `M/Counter` now counts still-pending bucket
+  entries (it was empty on small archives and undercounted every build's
+  tail) and counts only `C`-namespace articles, matching libzim; a
+  caller-supplied `M/Counter` suppresses the auto-generated one even while
+  it sits in an un-flushed bucket (previously the output could carry two
+  `(M, Counter)` dirents); `finish_writing` refuses to finalize with a
+  chunked item still in flight; interning more than 65,532 distinct
+  mimetypes errors explicitly instead of silently wrapping.
 - `zimcheck -I`: cluster validation actually decodes every cluster (the
   old `touch_cluster` was a no-op, letting corrupt payloads Pass on
   checksum-less archives).

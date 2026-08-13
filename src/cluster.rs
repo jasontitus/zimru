@@ -202,6 +202,43 @@ pub(crate) fn raw_blob_range(raw: &[u8], blob_idx: u32) -> Result<Option<Range<u
     Ok(Some(start..end))
 }
 
+/// Validate the whole blob-offset table of the on-disk cluster bytes
+/// `raw` in place, without copying the payload. Returns `Ok(true)` when
+/// the cluster is uncompressed and its table checked out; `Ok(false)`
+/// when the cluster is xz/zstd (the caller must decode to validate);
+/// `Err` for a corrupt table or unsupported compression id.
+pub(crate) fn validate_raw_offsets(raw: &[u8]) -> Result<bool> {
+    if raw.is_empty() {
+        return Err(Error::Truncated(0));
+    }
+    let info = raw[0];
+    match info & 0x0F {
+        COMPRESSION_NONE_LEGACY | COMPRESSION_NONE => {}
+        COMPRESSION_XZ | COMPRESSION_ZSTD => return Ok(false),
+        other => return Err(Error::UnsupportedCompression(other)),
+    }
+    let extended = info & EXTENDED_FLAG != 0;
+    let body = &raw[1..];
+    let ptr_size = if extended { 8 } else { 4 };
+    let first = read_off(body, 0, extended)?;
+    if first == 0 || first as usize > body.len() {
+        return Err(Error::Truncated(first));
+    }
+    let total_ptrs = first as usize / ptr_size;
+    if total_ptrs == 0 {
+        return Err(Error::Truncated(0));
+    }
+    let mut prev = first;
+    for i in 1..total_ptrs {
+        let off = read_off(body, i * ptr_size, extended)?;
+        if off < prev || off as usize > body.len() {
+            return Err(Error::Truncated(off));
+        }
+        prev = off;
+    }
+    Ok(true)
+}
+
 fn read_off(buf: &[u8], off: usize, extended: bool) -> Result<u64> {
     if extended {
         let s = buf.get(off..off + 8).ok_or(Error::Truncated(off as u64))?;

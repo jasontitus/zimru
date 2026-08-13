@@ -62,6 +62,40 @@ finding is skipped, the two partials are handled per their corrected detail.
 | [low] zimrecreate.rs:339 + cluster.rs:73 | decoded-payload extra memcpy | **Documented as known** — per the review, the fix is a lifetime-threading refactor of `Cluster`/`Item`/encode (not a localized change); a comment marks the copy. The worst case (direct-access of huge uncompressed clusters) is eliminated by the archive.rs:1043 fix |
 | [low] dirent.rs:114 | double url alloc for empty titles | **Fixed** — raw title stored (empty `String` doesn't allocate); fallback deferred to the `title()` accessors, per the verdict's correction |
 
+## Post-review adjustments (second pass)
+
+An adversarial review of this branch itself surfaced seven further issues,
+all addressed:
+
+- **Auto `M/Counter` undercount (pre-existing, empirically confirmed)** —
+  the histogram was computed from committed dirents before the final
+  bucket flush, so small archives got an empty Counter and every archive
+  undercounted its tail. It now counts committed + pending articles, and
+  only `C`-namespace ones (matching libzim/zimcheck semantics).
+  Regression test: `auto_counter_counts_pending_content`.
+- **Index-attach failures were swallowed** — a mid-stream error while
+  attaching a Xapian blob left the writer with an in-flight chunked item
+  and could finalize a corrupt archive with exit 0. Both bins now
+  propagate the error, and `finalize` refuses to run with a chunked item
+  still in flight.
+- **Legacy namespace fold could mint duplicate URLs** — the fold is now
+  limited to the real content namespaces (`A I J -`; the url-shadowing
+  `B U V` aux namespaces are dropped), and remaining collisions are
+  deduped first-wins with a warning (legacy sources only).
+- **`safe_path` Windows traversal** — `\`-separated and drive-prefixed
+  (`C:`) segments are neutralized on Windows builds; Unix behaviour
+  (where both are ordinary filename bytes) is unchanged.
+- **cffi metadata count/list mismatch** — `zimru_archive_metadata_keys_count`
+  now derives from the same cached key list `zimru_archive_metadata_key`
+  indexes, so the documented `for (i = 0; i < count; i++)` enumeration can
+  never dereference a NULL for a valid index.
+- **`zimcheck -I` cluster copy** — new `Archive::validate_cluster`
+  validates uncompressed clusters against the offset table in place (no
+  multi-GB payload copy); compressed clusters are decoded once, uncached.
+- **Helper feed-path syscall overhead** — the `try_wait` liveness probe
+  is amortized to every 256th write (the EPIPE error path already covers
+  the common dead-child case).
+
 ## Validation
 
 `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,

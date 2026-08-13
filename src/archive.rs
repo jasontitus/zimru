@@ -1033,6 +1033,23 @@ impl Archive {
         self.load_cluster(idx)
     }
 
+    /// Validate that cluster `idx` decodes and its blob-offset table is
+    /// self-consistent, without touching the shared cache. Uncompressed
+    /// clusters are checked against the offset table in place (no copy
+    /// of the possibly multi-GB payload out of the mmap); compressed
+    /// clusters are decoded once and every blob range walked.
+    pub fn validate_cluster(&self, idx: u32) -> Result<()> {
+        let raw = self.cluster_raw(idx)?;
+        if crate::cluster::validate_raw_offsets(raw)? {
+            return Ok(());
+        }
+        let c = Cluster::parse(raw)?;
+        for b in 0..c.blob_count() {
+            c.blob_range(b)?;
+        }
+        Ok(())
+    }
+
     /// Direct-access info for a single blob: where its bytes physically
     /// live in the on-disk ZIM file, when the surrounding cluster is
     /// stored uncompressed (compression-id 0 or 1). For compressed

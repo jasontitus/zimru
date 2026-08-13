@@ -86,6 +86,9 @@ struct Job {
     /// chatty child can never fill the ~64 KB pipe buffer, stop reading
     /// stdin, and deadlock our `write_all`.
     stderr_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
+    /// Counts writes between `try_wait` liveness probes — see
+    /// [`write_raw`].
+    writes_since_liveness_check: u32,
     out_path: PathBuf,
     url: &'static str,
 }
@@ -107,6 +110,10 @@ pub struct IndexHelper {
     state: State,
 }
 
+// One IndexHelper exists per build, so the size gap between the two
+// variants (a couple hundred bytes of Job state vs nothing) is
+// irrelevant — not worth the indirection of boxing the jobs.
+#[allow(clippy::large_enum_variant)]
 enum State {
     Active { fulltext: Job, title: Job },
     Disabled,
@@ -367,15 +374,24 @@ fn write_raw(job: &mut Job, buf: &[u8]) {
         return;
     }
     // A child that already exited will never drain the pipe again —
-    // stop feeding instead of blocking forever in `write_all` once the
-    // 64 KB pipe buffer fills. (Mirrors the broken-pipe error path.)
-    if let Ok(Some(status)) = job.child.try_wait() {
-        eprintln!(
-            "[zimwriterfs] xapianbuilder {} exited early ({status}); disabling feed",
-            job.url
-        );
-        job.stdin.take();
-        return;
+    // stop feeding instead of blocking in `write_all` once the 64 KB
+    // pipe buffer fills. A dead direct child is normally caught by the
+    // EPIPE error path below, so this probe only backstops the case
+    // where another process still holds the pipe's read end (e.g. an
+    // inherited fd in a grandchild); probing every N writes keeps the
+    // waitpid syscall off the per-document hot path (feeds number in
+    // the tens of millions on large archives).
+    job.writes_since_liveness_check += 1;
+    if job.writes_since_liveness_check >= 256 {
+        job.writes_since_liveness_check = 0;
+        if let Ok(Some(status)) = job.child.try_wait() {
+            eprintln!(
+                "[zimwriterfs] xapianbuilder {} exited early ({status}); disabling feed",
+                job.url
+            );
+            job.stdin.take();
+            return;
+        }
     }
     let Some(stdin) = job.stdin.as_mut() else {
         return;
@@ -432,6 +448,7 @@ fn spawn_one(
         child,
         stdin,
         stderr_thread,
+        writes_since_liveness_check: 0,
         out_path: out_path.to_path_buf(),
         url,
     })

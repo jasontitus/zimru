@@ -535,3 +535,43 @@ fn caller_supplied_counter_suppresses_auto_generated_one() {
 
     let _ = std::fs::remove_file(&out);
 }
+
+#[test]
+fn auto_counter_counts_pending_content() {
+    // When the auto M/Counter is generated (finalize step 2a), a small
+    // archive's entire content is still sitting in un-flushed buckets —
+    // the histogram must count those pending articles too (it used to
+    // come out empty), and must count only C-namespace articles
+    // (metadata / index entries excluded, matching libzim).
+    let out = tmp_path("auto-counter");
+    let mut c = Creator::new();
+    c.set_main_path("home");
+    c.add_item(Item::html("home", "Home", "<html><body>a</body></html>"));
+    c.add_item(Item::html("about", "About", "<html><body>b</body></html>"));
+    c.add_item(Item::new(
+        "logo.png",
+        "Logo",
+        "image/png",
+        vec![1u8, 2, 3, 4],
+    ));
+    c.add_metadata("Title", "auto counter");
+    c.add_metadata("Language", "eng");
+    c.write_to(&out).expect("write");
+
+    let arc = Archive::open(&out).expect("reopen");
+    let counter = String::from_utf8(arc.get_metadata("Counter").expect("Counter present"))
+        .expect("Counter is utf8");
+    assert!(
+        counter.contains("text/html=2"),
+        "counter should count both html articles, got {counter:?}"
+    );
+    assert!(
+        counter.contains("image/png=1"),
+        "counter should count the png item, got {counter:?}"
+    );
+    assert!(
+        !counter.contains("text/plain"),
+        "M-namespace metadata must not be counted, got {counter:?}"
+    );
+    let _ = std::fs::remove_file(&out);
+}

@@ -673,10 +673,19 @@ fn exception_dest(exceptions_dir: &PathBuf, rel: &str) -> std::io::Result<PathBu
 /// segments, dropping empty ones, `.` and `..` — otherwise a crafted
 /// path like `../../home/user/.bashrc` would traverse out of `--dir`
 /// and overwrite arbitrary files.
+///
+/// On Windows, `\` is also a separator and `:` marks a drive-absolute
+/// path (`PathBuf::join("C:\\…")` REPLACES the dump root entirely), so
+/// both are neutralized there too. On Unix they are ordinary filename
+/// bytes and are left alone to keep dump fidelity for real archive
+/// paths like `Category:Foo`.
 fn safe_path(p: &str) -> String {
+    let is_sep = |c: char| c == '/' || (cfg!(windows) && c == '\\');
     let out: Vec<&str> = p
-        .split('/')
-        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .split(is_sep)
+        .filter(|seg| {
+            !seg.is_empty() && *seg != "." && *seg != ".." && !(cfg!(windows) && seg.contains(':'))
+        })
         .collect();
     if out.is_empty() {
         // A path made entirely of traversal segments still needs a

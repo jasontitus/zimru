@@ -1000,18 +1000,28 @@ fn intern_mime(m: &str, mimes: &mut Vec<String>, index: &mut BTreeMap<String, u1
 }
 
 /// Build the `M/Counter` body: `mime=count;mime=count;…`. Counts
-/// only `Article` dirents (redirect dirents have no body / no
-/// mime). Returned in the order mimes were interned, which is
-/// also the order they appear in the trailing mime list — so
-/// `Counter` parses one-pass alongside the mime list.
-fn build_counter_string(mimes: &[String], dirents: &[RawDirent]) -> String {
+/// only content-namespace (`C`) article dirents — redirect dirents
+/// have no body / no mime, and metadata / index entries are excluded
+/// to match libzim's Counter semantics (and zimcheck's counter
+/// validation). `article_mimes` must yield the `(namespace,
+/// mime_idx)` of every article that will land in the archive —
+/// committed dirents AND still-pending bucket entries, since Counter
+/// is generated before the final flush. Returned in the order mimes
+/// were interned, which is also the order they appear in the
+/// trailing mime list — so `Counter` parses one-pass alongside the
+/// mime list.
+fn build_counter_string(
+    mimes: &[String],
+    article_mimes: impl Iterator<Item = (u8, u16)>,
+) -> String {
     let mut counts: Vec<u64> = vec![0; mimes.len()];
-    for d in dirents {
-        if let RawDirent::Article { mime_idx, .. } = d {
-            let i = *mime_idx as usize;
-            if i < counts.len() {
-                counts[i] += 1;
-            }
+    for (ns, mime_idx) in article_mimes {
+        if ns != b'C' {
+            continue;
+        }
+        let i = mime_idx as usize;
+        if i < counts.len() {
+            counts[i] += 1;
         }
     }
     let mut out = String::new();
@@ -1911,6 +1921,15 @@ impl Streamer {
     /// into clusters and dirents, sort, render tables, fill mime
     /// list, write final header, MD5.
     fn finalize(mut self) -> Result<()> {
+        // A chunked item that was begun but never end_chunked_item'd
+        // means a dirent is missing and (on the streaming path) a
+        // cluster_offsets slot would stay at its placeholder 0 —
+        // refuse to finalize into a silently-corrupt archive.
+        if self.in_flight.is_some() {
+            return Err(Error::Io(std::io::Error::other(
+                "finish_writing: a chunked item is still in flight (begin_chunked_item without end_chunked_item)",
+            )));
+        }
         // 1. Funnel buffered metadata + illustrations through the
         //    same bin-packing path as items so they share clusters
         //    with the tail of the user-content stream.
@@ -1965,7 +1984,25 @@ impl Streamer {
                 .flat_map(|b| b.pending.iter())
                 .any(|pa| pa.namespace == b'M' && pa.url == "Counter");
         if !counter_already_set {
-            let counter_str = build_counter_string(&self.mimes, &self.dirents);
+            // Count committed dirents AND every bucket's pending
+            // articles: at this point most (on small archives, all)
+            // content is still sitting in un-flushed buckets, so
+            // counting `self.dirents` alone produced an empty or
+            // heavily undercounted histogram.
+            let committed = self.dirents.iter().filter_map(|d| match d {
+                RawDirent::Article {
+                    namespace,
+                    mime_idx,
+                    ..
+                } => Some((*namespace, *mime_idx)),
+                RawDirent::Redirect { .. } => None,
+            });
+            let pending = self
+                .buckets
+                .values()
+                .flat_map(|b| b.pending.iter())
+                .map(|pa| (pa.namespace, pa.mime_idx));
+            let counter_str = build_counter_string(&self.mimes, committed.chain(pending));
             self.push_item(Item {
                 path: "Counter".to_string(),
                 title: "Counter".to_string(),

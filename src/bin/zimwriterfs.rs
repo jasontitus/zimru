@@ -597,10 +597,11 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     // convention so libzim/kiwix-serve can mmap and Database(int fd)
     // directly into the index.
     let blobs = indexer.finish(o.verbose);
+    // A failure mid-stream leaves the writer with an in-flight chunked
+    // item, so it must abort the build — continuing would finalize a
+    // corrupt archive while exiting 0.
     for blob in blobs {
-        if let Err(e) = blob.add_to(&mut creator) {
-            eprintln!("[zimwriterfs] attaching index {} failed: {e}", blob.url);
-        }
+        blob.add_to(&mut creator)?;
     }
 
     if o.verbose {

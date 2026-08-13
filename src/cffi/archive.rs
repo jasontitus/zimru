@@ -808,18 +808,17 @@ pub unsafe extern "C" fn zimru_archive_random_entry(
     }
 }
 
-/// Number of metadata keys in the archive. O(log n) — counts the
-/// `M`-namespace range without scanning or allocating the key list.
+/// Number of metadata keys in the archive. Derived from the same
+/// cached key list `zimru_archive_metadata_key` indexes into, so the
+/// documented `for (i = 0; i < count; i++)` enumeration can never see
+/// an index the key lookup answers with NULL (a raw namespace-range
+/// count could exceed the list when a corrupt dirent fails to parse).
 #[no_mangle]
 pub unsafe extern "C" fn zimru_archive_metadata_keys_count(arc: *const zimru_archive_t) -> usize {
     if arc.is_null() {
         return 0;
     }
-    (*arc)
-        .inner
-        .entry_count_in_namespace(crate::NS_METADATA)
-        .map(|n| n as usize)
-        .unwrap_or(0)
+    cached_metadata_keys(&*arc).len()
 }
 
 /// Borrowed pointer to the i'th metadata key as a NUL-terminated string.
@@ -836,16 +835,21 @@ pub unsafe extern "C" fn zimru_archive_metadata_key(
     if arc.is_null() {
         return std::ptr::null();
     }
-    let keys = (*arc).metadata_keys.get_or_init(|| {
-        (*arc)
-            .inner
+    match cached_metadata_keys(&*arc).get(idx) {
+        Some(cs) => cs.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// The archive's metadata key names, computed once per handle. Shared
+/// by `zimru_archive_metadata_keys_count` and
+/// `zimru_archive_metadata_key` so count and list always agree.
+fn cached_metadata_keys(arc: &zimru_archive_t) -> &Vec<CString> {
+    arc.metadata_keys.get_or_init(|| {
+        arc.inner
             .get_metadata_keys()
             .into_iter()
             .filter_map(|k| CString::new(k).ok())
             .collect()
-    });
-    match keys.get(idx) {
-        Some(cs) => cs.as_ptr(),
-        None => std::ptr::null(),
-    }
+    })
 }

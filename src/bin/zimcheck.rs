@@ -551,15 +551,13 @@ fn check_integrity(arc: &Archive) -> Result<(), Error> {
 }
 
 fn touch_cluster(arc: &Archive, c: u32) -> Result<(), Error> {
-    // Decode the cluster (bypassing the shared cache, so memory stays
-    // bounded) and walk its blob-offset table, so a corrupt or
-    // undecompressible cluster payload actually fails `-I` instead of
-    // false-Passing on checksum-less archives.
-    let cluster = arc.cluster_uncached(c)?;
-    for b in 0..cluster.blob_count() {
-        cluster.blob_range(b)?;
-    }
-    Ok(())
+    // Decode-and-walk each cluster's blob table so a corrupt or
+    // undecompressible payload actually fails `-I` instead of
+    // false-Passing on checksum-less archives. `validate_cluster`
+    // checks uncompressed clusters against the offset table in place —
+    // no multi-GB copy of conventionally-uncompressed Xapian/media
+    // clusters — and decodes compressed ones without caching.
+    arc.validate_cluster(c)
 }
 
 const REQUIRED_METADATA: &[&str] = &[

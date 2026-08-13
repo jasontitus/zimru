@@ -554,8 +554,11 @@ struct zimru_entry_t *zimru_archive_random_entry(const struct zimru_archive_t *a
                                                  struct zimru_error_t **err);
 
 /**
- * Number of metadata keys in the archive. O(log n) — counts the
- * `M`-namespace range without scanning or allocating the key list.
+ * Number of metadata keys in the archive. Derived from the same
+ * cached key list `zimru_archive_metadata_key` indexes into, so the
+ * documented `for (i = 0; i < count; i++)` enumeration can never see
+ * an index the key lookup answers with NULL (a raw namespace-range
+ * count could exceed the list when a corrupt dirent fails to parse).
  */
  uintptr_t zimru_archive_metadata_keys_count(const struct zimru_archive_t *arc);
 
