@@ -21,7 +21,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use zimru::{Archive, Dirent, Entry, Error};
+use zimru::{Archive, Dirent, Entry, Error, NS_ARTICLES_LEGACY};
 
 const VERSION: &str = "zimdump (zimru) 0.1.0\n+ libzim equivalent: zimru 0.1.0";
 
@@ -300,21 +300,60 @@ fn print_list_entry(e: &Entry, details: bool, local_idx: u32) {
 
 // ---------------- subcommand: show ----------------
 
+/// Namespace to look `--url` up in. Upstream documents the default as `A`
+/// (the legacy article namespace) and relies on libzim's compatibility layer
+/// to redirect that to `C` on archives written with the new namespace scheme
+/// — so `zimdump show --url=Foo` works on both generations. Resolving `A`
+/// literally, as we used to, made every `--url` lookup fail on any modern
+/// archive.
+fn effective_url_ns(arc: &Archive, requested: Option<u8>) -> u8 {
+    let ns = requested.unwrap_or(NS_ARTICLES_LEGACY);
+    if ns == NS_ARTICLES_LEGACY && arc.header().uses_new_namespaces() {
+        b'C'
+    } else {
+        ns
+    }
+}
+
+/// Resolve a `--url` value to an entry. The plain path wins; a
+/// `<namespace>/<path>` form (`M/Title`, `C/Foo`) is accepted as a fallback
+/// so callers can address metadata and index entries the same way upstream's
+/// users do. Trying the plain path first keeps a content path that genuinely
+/// begins with a one-character directory (`C/foo.png`) resolving to itself.
+fn lookup_by_url(arc: &Archive, requested_ns: Option<u8>, url: &str) -> Result<Entry, Error> {
+    let ns = effective_url_ns(arc, requested_ns);
+    match arc.entry_by_ns_path(ns, url) {
+        Ok(e) => Ok(e),
+        Err(e) => {
+            if requested_ns.is_none() {
+                let b = url.as_bytes();
+                if b.len() > 2 && b[1] == b'/' && b[0].is_ascii_alphanumeric() {
+                    if let Ok(hit) = arc.entry_by_ns_path(b[0], &url[2..]) {
+                        return Ok(hit);
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 fn cmd_show(args: &[String]) -> Result<ExitCode, Error> {
     let opts = parse_opts(args)?;
     let arc = open_archive(&opts)?;
     let entry = if let Some(idx) = opts.idx {
         entry_by_filtered_index(&arc, opts.ns.unwrap_or(b'C'), idx)?
     } else if let Some(url) = &opts.url {
-        arc.entry_by_ns_path(opts.ns.unwrap_or(b'A'), url)?
+        lookup_by_url(&arc, opts.ns, url)?
     } else {
         eprintln!("zimdump: --idx or --url required for `show`");
         return Ok(ExitCode::from(1));
     };
     if entry.is_redirect() {
-        // Upstream message: "Entry <path> is a redirect."
-        println!("Entry {} is a redirect.", entry.path());
-        return Ok(ExitCode::SUCCESS);
+        // Upstream message: "Entry <path> is a redirect." — on *stderr*,
+        // with a failing exit status, since `show` produced no content.
+        eprintln!("Entry {} is a redirect.", entry.path());
+        return Ok(ExitCode::from(255));
     }
     let item = entry.get_item(false)?;
     io::stdout().write_all(item.get_data()?.data())?;

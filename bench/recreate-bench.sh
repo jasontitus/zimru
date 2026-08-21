@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Creation benchmark: time zimru's `zimrecreate` against the upstream
-# `zimrecreate` from kiwix zim-tools 3.6.0. Both tools take a source ZIM
+# `zimrecreate` from kiwix zim-tools 3.8.0. Both tools take a source ZIM
 # and produce a new ZIM with re-encoded clusters; this is the cleanest
 # apples-to-apples writer benchmark we can run without upstream's full
 # zimwriterfs+filesystem pipeline.
@@ -14,7 +14,7 @@
 # Usage: ./bench/recreate-bench.sh [glob]
 set -uo pipefail
 
-UPSTREAM_DIR="${UPSTREAM_DIR:-/opt/zim-tools-upstream/zim-tools_linux-x86_64-3.6.0}"
+UPSTREAM_DIR="${UPSTREAM_DIR:-/opt/zim-tools-upstream/zim-tools_linux-x86_64-3.8.0}"
 UP_RECREATE="$UPSTREAM_DIR/zimrecreate"
 UP_CHECK="$UPSTREAM_DIR/zimcheck"
 ZIMRU_RECREATE=./target/release/zimrecreate

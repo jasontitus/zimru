@@ -228,14 +228,28 @@ struct LogLine {
 /// Structured payload attached to each log entry, so the JSON output can
 /// reproduce the per-check field shapes upstream emits.
 enum JsonExtra {
+    /// `-M` findings carry the message twice: once as `message`, once as
+    /// `error` (upstream 3.8.0 emits both keys).
+    Metadata,
+    Empty {
+        path: String,
+    },
     Redundant {
         path1: String,
         path2: String,
     },
+    /// One dangling-link group: every raw link in the article that
+    /// normalizes to the same (missing) `normalized_link`.
     UrlInternal {
         article: String,
-        link: String,
+        links: Vec<String>,
         normalized_link: String,
+    },
+    /// A link written as an absolute path (`/foo`), which is invalid
+    /// inside a ZIM regardless of whether the target exists.
+    UrlInternalAbsolute {
+        article: String,
+        link: String,
     },
     UrlExternal {
         article: String,
@@ -259,12 +273,14 @@ struct Report {
     /// Warnings emitted BEFORE the per-check phase (e.g. "integrity skipped"
     /// from libzim's preamble). Printed right after the preamble [INFO]s.
     preamble_warns: Vec<String>,
-    /// Per-check [INFO] lines in execution order (headers + body lines).
-    infos: Vec<LogLine>,
-    /// Per-check [WARNING] lines.
-    warns: Vec<LogLine>,
-    /// Per-check [ERROR] lines.
-    errs: Vec<LogLine>,
+    /// Every log line in emission order. zim-tools 3.8.0 interleaves
+    /// findings with the phase headers that produced them (a dangling-link
+    /// error prints inside the "Verifying Articles' content..." phase, not
+    /// in a trailing block), so a single ordered stream is what reproduces
+    /// the report — bucketing by severity the way 3.6.0 did would reorder it.
+    lines: Vec<LogLine>,
+    /// Number of `[ERROR]` header lines emitted; drives Pass/Fail.
+    error_count: usize,
     /// Structured entries used by the JSON renderer (in detection order).
     entries: Vec<JsonLog>,
     elapsed_secs: u64,
@@ -275,49 +291,51 @@ impl Report {
         self.preamble_warns.push(s.into());
     }
     fn add_info<S: Into<String>>(&mut self, s: S) {
-        self.infos.push(LogLine {
+        self.lines.push(LogLine {
             bucket: Bucket::Info,
             is_header: true,
             text: s.into(),
         });
     }
     fn add_info_body<S: Into<String>>(&mut self, s: S) {
-        self.infos.push(LogLine {
+        self.lines.push(LogLine {
             bucket: Bucket::Info,
             is_header: false,
             text: s.into(),
         });
     }
     fn add_warn<S: Into<String>>(&mut self, s: S) {
-        self.warns.push(LogLine {
+        self.lines.push(LogLine {
             bucket: Bucket::Warning,
             is_header: true,
             text: s.into(),
         });
     }
-    fn add_warn_body<S: Into<String>>(&mut self, s: S) {
-        self.warns.push(LogLine {
-            bucket: Bucket::Warning,
-            is_header: false,
-            text: s.into(),
-        });
-    }
     fn add_error<S: Into<String>>(&mut self, _c: Check, s: S) {
-        self.errs.push(LogLine {
+        self.error_count += 1;
+        self.lines.push(LogLine {
             bucket: Bucket::Error,
             is_header: true,
             text: s.into(),
         });
     }
     fn add_error_body<S: Into<String>>(&mut self, _c: Check, s: S) {
-        self.errs.push(LogLine {
+        self.lines.push(LogLine {
             bucket: Bucket::Error,
             is_header: false,
             text: s.into(),
         });
     }
-    fn errors(&self) -> impl Iterator<Item = &LogLine> {
-        self.errs.iter().filter(|l| l.is_header)
+    /// A bare newline. Upstream terminates each dangling-link block with one.
+    fn add_blank(&mut self) {
+        self.lines.push(LogLine {
+            bucket: Bucket::Info,
+            is_header: false,
+            text: String::new(),
+        });
+    }
+    fn has_errors(&self) -> bool {
+        self.error_count > 0
     }
 
     fn print_text(&self) {
@@ -326,16 +344,14 @@ impl Report {
         for w in &self.preamble_warns {
             println!("[WARNING] {w}");
         }
-        for sec in [&self.infos, &self.warns, &self.errs] {
-            for l in sec {
-                match (l.bucket, l.is_header) {
-                    (Bucket::Info, true) => println!("[INFO] {}", l.text),
-                    (Bucket::Info, false) => println!("{}", l.text),
-                    (Bucket::Warning, true) => println!("[WARNING] {}", l.text),
-                    (Bucket::Warning, false) => println!("{}", l.text),
-                    (Bucket::Error, true) => println!("[ERROR] {}", l.text),
-                    (Bucket::Error, false) => println!("{}", l.text),
-                }
+        for l in &self.lines {
+            match (l.bucket, l.is_header) {
+                (Bucket::Info, true) => println!("[INFO] {}", l.text),
+                (Bucket::Info, false) => println!("{}", l.text),
+                (Bucket::Warning, true) => println!("[WARNING] {}", l.text),
+                (Bucket::Warning, false) => println!("{}", l.text),
+                (Bucket::Error, true) => println!("[ERROR] {}", l.text),
+                (Bucket::Error, false) => println!("{}", l.text),
             }
         }
         println!(
@@ -383,13 +399,9 @@ impl Report {
         println!("\n  ],");
         println!("  \"file_name\" : \"{}\",", esc(&self.file_name));
         println!("  \"file_uuid\" : \"{}\",", esc(&self.file_uuid));
-        println!(
-            "  \"status\" : {},",
-            if self.pass { "true" } else { "false" }
-        );
         if self.entries.is_empty() {
             println!("  \"logs\" : [");
-            println!("  ]");
+            println!("  ],");
         } else {
             println!("  \"logs\" : [");
             for (i, e) in self.entries.iter().enumerate() {
@@ -400,6 +412,14 @@ impl Report {
                 println!("      \"check\" : \"{}\",", e.check.name());
                 println!("      \"level\" : \"{}\",", e.level);
                 match &e.extra {
+                    JsonExtra::Metadata => {
+                        println!("      \"message\" : \"{}\",", esc(&e.message));
+                        println!("      \"error\" : \"{}\"", esc(&e.message));
+                    }
+                    JsonExtra::Empty { path } => {
+                        println!("      \"message\" : \"{}\",", esc(&e.message));
+                        println!("      \"path\" : \"{}\"", esc(path));
+                    }
                     JsonExtra::Redundant { path1, path2 } => {
                         println!("      \"message\" : \"{}\",", esc(&e.message));
                         println!("      \"path1\" : \"{}\",", esc(path1));
@@ -407,14 +427,22 @@ impl Report {
                     }
                     JsonExtra::UrlInternal {
                         article,
-                        link,
+                        links,
                         normalized_link,
                     } => {
                         println!("      \"message\" : \"{}\",", esc(&e.message));
                         println!("      \"links\" : [");
-                        println!("        \"{}\"", esc(link));
+                        for (j, l) in links.iter().enumerate() {
+                            let comma = if j + 1 == links.len() { "" } else { "," };
+                            println!("        \"{}\"{comma}", esc(l));
+                        }
                         println!("      ],");
                         println!("      \"normalized_link\" : \"{}\",", esc(normalized_link));
+                        println!("      \"path\" : \"{}\"", esc(article));
+                    }
+                    JsonExtra::UrlInternalAbsolute { article, link } => {
+                        println!("      \"message\" : \"{}\",", esc(&e.message));
+                        println!("      \"link\" : \"{}\",", esc(link));
                         println!("      \"path\" : \"{}\"", esc(article));
                     }
                     JsonExtra::UrlExternal { article, url } => {
@@ -425,8 +453,12 @@ impl Report {
                 }
                 print!("    }}");
             }
-            println!("\n  ]");
+            println!("\n  ],");
         }
+        println!(
+            "  \"status\" : {}",
+            if self.pass { "true" } else { "false" }
+        );
         println!("}}");
     }
 }
@@ -499,32 +531,33 @@ fn run_checks(file: &str, arc: &Archive, o: &Opts) -> Report {
     let need_url_ext = o.checks.contains(&Check::UrlExternal);
     let need_any_content = need_empty || need_redundant || need_url_int || need_url_ext;
 
-    if need_empty {
-        report.add_info("Verifying Articles' content...".to_string());
-    }
-    if need_redundant {
-        report.add_info("Searching for redundant articles...".to_string());
-        report.add_info_body("  Verifying Similar Articles for redundancies...".to_string());
-    }
-    if o.checks.contains(&Check::Redirect) {
-        report.add_info("Checking for redirect loops...".to_string());
-        check_redirect_loops(arc, &mut report);
-    }
+    // Upstream prints the content-phase header whenever ANY of the four
+    // per-blob checks is selected (including `-R` alone), then emits that
+    // phase's findings inline before moving to the next header.
     if need_any_content {
-        scan_content(
+        report.add_info("Verifying Articles' content...".to_string());
+        let findings = scan_content(
             arc,
-            &mut report,
             need_empty,
             need_redundant,
             need_url_int,
             need_url_ext,
         );
+        emit_per_entry_findings(&findings, &mut report, need_empty, need_url_int, need_url_ext);
+        if need_redundant {
+            report.add_info("Searching for redundant articles...".to_string());
+            report.add_info_body("  Verifying Similar Articles for redundancies...".to_string());
+            emit_redundant(&findings, &mut report);
+        }
+    }
+    if o.checks.contains(&Check::Redirect) {
+        report.add_info("Checking for redirect loops...".to_string());
+        check_redirect_loops(arc, &mut report);
     }
 
     let elapsed = started.elapsed();
     report.elapsed_secs = elapsed.as_secs();
-    let any_err = report.errors().next().is_some();
-    report.pass = !any_err;
+    report.pass = !report.has_errors();
     report
 }
 
@@ -570,11 +603,75 @@ const REQUIRED_METADATA: &[&str] = &[
     "Name",
 ];
 
+/// The shape zim-tools 3.8.0 requires of `M/Counter`. Reported verbatim in
+/// the error message, so it is kept as the literal regex source rather than
+/// being described in prose.
+const COUNTER_REGEX_SRC: &str =
+    r"^([a-zA-Z]+/[a-zA-Z0-9.\-+]+=\d+)(;[a-zA-Z0-9]+/[a-zA-Z0-9.\-+]+=\d+)*;?$";
+
+/// `true` when `s` matches [`COUNTER_REGEX_SRC`]. Hand-rolled rather than
+/// pulling in a regex crate for one fixed pattern: the grammar is
+/// `mime=count` pairs joined by `;`, with an optional trailing `;`.
+///
+/// Real archives fail this routinely — a Counter listing
+/// `image/svg+xml; charset=utf-8; profile="…"=676` carries mimetype
+/// parameters whose spaces, `=` and `;` the grammar has no room for — which
+/// is exactly why upstream started flagging it.
+fn counter_matches(s: &str) -> bool {
+    let mut rest = s;
+    if let Some(stripped) = rest.strip_suffix(';') {
+        rest = stripped;
+    }
+    if rest.is_empty() {
+        return false;
+    }
+    for (i, pair) in rest.split(';').enumerate() {
+        let Some((mime, count)) = pair.split_once('=') else {
+            return false;
+        };
+        let Some((typ, sub)) = mime.split_once('/') else {
+            return false;
+        };
+        // The first pair's type is [a-zA-Z]+, later ones [a-zA-Z0-9]+.
+        let type_ok = if i == 0 {
+            !typ.is_empty() && typ.bytes().all(|b| b.is_ascii_alphabetic())
+        } else {
+            !typ.is_empty() && typ.bytes().all(|b| b.is_ascii_alphanumeric())
+        };
+        if !type_ok {
+            return false;
+        }
+        if sub.is_empty()
+            || !sub
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+        {
+            return false;
+        }
+        if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    true
+}
+
 fn check_metadata(arc: &Archive, report: &mut Report) {
     let keys: HashSet<String> = arc.get_metadata_keys().into_iter().collect();
     for k in REQUIRED_METADATA {
         if !keys.contains(*k) {
             report.add_error(Check::Metadata, format!("Missing mandatory metadata: {k}"));
+        }
+    }
+    if let Ok(counter) = arc.metadata_str("Counter") {
+        if !counter_matches(&counter) {
+            let msg = format!("Counter doesn't match regex: {COUNTER_REGEX_SRC}");
+            report.add_error(Check::Metadata, format!("Metadata: {msg}"));
+            report.entries.push(JsonLog {
+                check: Check::Metadata,
+                level: "ERROR",
+                message: msg,
+                extra: JsonExtra::Metadata,
+            });
         }
     }
 }
@@ -608,21 +705,50 @@ fn check_main_page(arc: &Archive, report: &mut Report) {
     }
 }
 
+/// A single article's findings from the combined content scan.
+struct PerEntryFinding {
+    url_index: u32,
+    path: String,
+    is_empty: bool,
+    md5: Option<[u8; 16]>,
+    /// `(raw link exactly as written in the HTML, normalized target)` for
+    /// every in-archive link whose target is missing.
+    dangling: Vec<(String, String)>,
+    /// Links written as absolute paths (`/foo`) — invalid inside a ZIM
+    /// whether or not the target resolves.
+    absolute: Vec<String>,
+    /// Absolute `http(s)` `src=` URLs (external dependencies).
+    external: Vec<String>,
+}
+
+impl Default for PerEntryFinding {
+    fn default() -> Self {
+        Self {
+            url_index: 0,
+            path: String::new(),
+            is_empty: false,
+            md5: None,
+            dangling: Vec::new(),
+            absolute: Vec::new(),
+            external: Vec::new(),
+        }
+    }
+}
+
 /// One pass over every C-namespace article that runs all of empty / redundant
 /// / internal-URL / external-URL checks together, parallelizing by cluster.
 ///
 /// Each worker decompresses one cluster (without going through the archive's
 /// shared cache), then iterates its blobs. Per-cluster results are returned
-/// to the main thread, which aggregates them deterministically (URL-pointer
-/// order) so the output stays stable.
+/// to the caller, which sorts them into URL-pointer order so the emitted
+/// report is deterministic and matches upstream's article ordering.
 fn scan_content(
     arc: &Archive,
-    report: &mut Report,
     do_empty: bool,
     do_redundant: bool,
     do_internal: bool,
     do_external: bool,
-) {
+) -> Vec<PerEntryFinding> {
     // (cluster_index, blob_index, dirent metadata, url-pointer index)
     struct BlobRef {
         url_index: u32,
@@ -665,16 +791,6 @@ fn scan_content(
         k.sort();
         k
     };
-
-    #[derive(Default)]
-    struct PerEntryFinding {
-        url_index: u32,
-        path: String,
-        is_empty: bool,
-        md5: Option<[u8; 16]>,
-        dangling: Vec<(String, String)>, // (raw target, resolved target)
-        external: Vec<String>,           // absolute http(s) src= URLs
-    }
 
     // Parallel work across clusters. Each cluster's findings come back as a
     // Vec<PerEntryFinding> in url-pointer order.
@@ -719,21 +835,7 @@ fn scan_content(
                                 f.external.push(target.to_string());
                             }
                             if do_internal {
-                                let stripped = target.strip_prefix("./").unwrap_or(target);
-                                if !(stripped.contains("://")
-                                    || has_scheme(stripped)
-                                    || stripped.starts_with("//")
-                                    || stripped.starts_with('#')
-                                    || stripped.is_empty())
-                                {
-                                    let no_frag =
-                                        stripped.split(['#', '?']).next().unwrap_or(stripped);
-                                    let decoded = percent_decode(no_frag);
-                                    let resolved = resolve_relative(&b.path, &decoded);
-                                    if arc.entry_by_ns_path(b'C', &resolved).is_err() {
-                                        f.dangling.push((no_frag.to_string(), resolved));
-                                    }
-                                }
+                                classify_internal_link(arc, &b.path, target, &mut f);
                             }
                         }
                     }
@@ -750,111 +852,184 @@ fn scan_content(
     // Aggregate in url-pointer order so the report is deterministic.
     let mut findings = findings;
     findings.sort_by_key(|f| f.url_index);
+    findings
+}
 
-    // ---- Empty ----
-    if do_empty {
-        for f in &findings {
-            if f.is_empty {
-                report.add_error(Check::Empty, format!("Empty article: {}", f.path));
-            }
-        }
+/// Classify one `href`/`src` value from article `base` as an absolute-path
+/// link, a dangling in-archive link, or fine.
+fn classify_internal_link(arc: &Archive, base: &str, target: &str, f: &mut PerEntryFinding) {
+    // Protocol-relative (`//host/x`) and scheme'd (`mailto:`, `data:`, …)
+    // links leave the archive; a bare `#frag` stays on the current page.
+    if target.starts_with("//") || target.starts_with('#') || target.is_empty() {
+        return;
     }
+    if target.contains("://") || has_scheme(target) {
+        return;
+    }
+    if target.starts_with('/') {
+        // Reported regardless of whether the target resolves.
+        f.absolute.push(target.to_string());
+        return;
+    }
+    let normalized = normalize_link_target(target);
+    let stripped = normalized.strip_prefix("./").unwrap_or(&normalized);
+    if stripped.is_empty() {
+        return;
+    }
+    let decoded = percent_decode(stripped);
+    let resolved = resolve_relative(base, &decoded);
+    if arc.entry_by_ns_path(b'C', &resolved).is_err() {
+        f.dangling.push((target.to_string(), resolved));
+    }
+}
 
-    // ---- Redundant ----
-    if do_redundant {
-        let mut groups: Vec<(Vec<String>, [u8; 16])> = Vec::new();
-        let mut by_hash: HashMap<[u8; 16], usize> = HashMap::new();
-        for f in &findings {
-            let Some(d) = f.md5 else { continue };
-            if let Some(&idx) = by_hash.get(&d) {
-                groups[idx].0.push(f.path.clone());
-            } else {
-                by_hash.insert(d, groups.len());
-                groups.push((vec![f.path.clone()], d));
+/// Strip the trailing fragment-or-query component from a link, matching
+/// zim-tools 3.8.0: it cuts at the **last** `#` or `?` in the string, not at
+/// the first. The distinction is observable — `a.html?x=1#f` normalizes to
+/// `a.html?x=1` (only `#f` is removed), while `a.html#sec?q` normalizes to
+/// `a.html#sec`. Both then fail to resolve, which is why upstream reports
+/// links carrying both markers as dangling even when the underlying article
+/// exists. Reproducing the rule (rather than stripping both markers, which
+/// is what a naive reading suggests) is what keeps `-U`/`-A` finding counts
+/// equal to upstream's.
+fn normalize_link_target(target: &str) -> &str {
+    match target.rfind(['#', '?']) {
+        Some(i) => &target[..i],
+        None => target,
+    }
+}
+
+/// Emit the per-article findings of the content phase (empty / internal URL /
+/// external URL) in URL-pointer order, interleaved the way 3.8.0 prints them.
+fn emit_per_entry_findings(
+    findings: &[PerEntryFinding],
+    report: &mut Report,
+    do_empty: bool,
+    do_internal: bool,
+    do_external: bool,
+) {
+    for f in findings {
+        if do_empty && f.is_empty {
+            let msg = format!("Entry {} is empty", f.path);
+            report.add_error(Check::Empty, format!("Empty Article: {msg}"));
+            report.entries.push(JsonLog {
+                check: Check::Empty,
+                level: "ERROR",
+                message: msg,
+                extra: JsonExtra::Empty {
+                    path: f.path.clone(),
+                },
+            });
+        }
+        if do_internal {
+            for link in &f.absolute {
+                let msg = format!("{link} is an absolute path link. Article: {}", f.path);
+                report.add_error(Check::UrlInternal, format!("Internal URL: {msg}"));
+                report.entries.push(JsonLog {
+                    check: Check::UrlInternal,
+                    level: "ERROR",
+                    message: msg,
+                    extra: JsonExtra::UrlInternalAbsolute {
+                        article: f.path.clone(),
+                        link: link.clone(),
+                    },
+                });
+            }
+            // Group by normalized target — upstream prints one block per
+            // distinct resolved path, listing every raw link that produced
+            // it in document order, with the blocks in ascending target
+            // order.
+            let mut order: Vec<&str> = Vec::new();
+            let mut groups: HashMap<&str, Vec<&str>> = HashMap::new();
+            for (raw, resolved) in &f.dangling {
+                let e = groups.entry(resolved.as_str()).or_default();
+                if e.is_empty() {
+                    order.push(resolved.as_str());
+                }
+                e.push(raw.as_str());
+            }
+            order.sort_unstable();
+            for resolved in order {
+                let raws = &groups[resolved];
+                let mut body = String::new();
+                for raw in raws {
+                    body.push_str(&format!("  - '{raw}' (resolves to '{resolved}')\n"));
+                }
+                let msg = format!("Dangling link(s) in article '{}':\n{body}", f.path);
+                report.add_error(
+                    Check::UrlInternal,
+                    format!("Internal URL: Dangling link(s) in article '{}':", f.path),
+                );
+                for raw in raws {
+                    report.add_error_body(
+                        Check::UrlInternal,
+                        format!("  - '{raw}' (resolves to '{resolved}')"),
+                    );
+                }
+                report.add_blank();
+                report.entries.push(JsonLog {
+                    check: Check::UrlInternal,
+                    level: "ERROR",
+                    message: msg,
+                    extra: JsonExtra::UrlInternal {
+                        article: f.path.clone(),
+                        links: raws.iter().map(|s| s.to_string()).collect(),
+                        normalized_link: resolved.to_string(),
+                    },
+                });
             }
         }
-        let mut emitted_header = false;
-        for (paths, _) in &groups {
-            if paths.len() < 2 {
-                continue;
-            }
-            if !emitted_header {
-                report.add_warn("Redundant data found:".to_string());
-                emitted_header = true;
-            }
-            for w in paths.windows(2) {
-                report.add_warn_body(format!("  {} and {}", w[0], w[1]));
+        if do_external {
+            for url in &f.external {
+                let msg = format!("{url} is an external dependence in article {}", f.path);
+                report.add_error(Check::UrlExternal, format!("External URL: {msg}"));
                 report.entries.push(JsonLog {
-                    check: Check::Redundant,
-                    level: "WARNING",
-                    message: format!("{} and {}", w[0], w[1]),
-                    extra: JsonExtra::Redundant {
-                        path1: w[0].clone(),
-                        path2: w[1].clone(),
+                    check: Check::UrlExternal,
+                    level: "ERROR",
+                    message: msg,
+                    extra: JsonExtra::UrlExternal {
+                        article: f.path.clone(),
+                        url: url.clone(),
                     },
                 });
             }
         }
     }
+}
 
-    // ---- Internal URLs ----
-    if do_internal {
-        let any = findings.iter().any(|f| !f.dangling.is_empty());
-        if any {
-            report.add_error(
-                Check::UrlInternal,
-                "Invalid internal links found:".to_string(),
-            );
-            for f in &findings {
-                for (raw, resolved) in &f.dangling {
-                    report.add_error_body(Check::UrlInternal, "  The following links:".to_string());
-                    report.add_error_body(Check::UrlInternal, format!("- ./{raw}"));
-                    report.add_error_body(
-                        Check::UrlInternal,
-                        format!("({resolved}) were not found in article {}", f.path),
-                    );
-                    let msg = format!("The following links:\n- ./{raw}\n({resolved}) were not found in article {}", f.path);
-                    report.entries.push(JsonLog {
-                        check: Check::UrlInternal,
-                        level: "ERROR",
-                        message: msg,
-                        extra: JsonExtra::UrlInternal {
-                            article: f.path.clone(),
-                            link: format!("./{raw}"),
-                            normalized_link: resolved.clone(),
-                        },
-                    });
-                }
-            }
+/// Emit `[WARNING] Redundant Data: a and b` for every pair of articles that
+/// share a payload MD5.
+fn emit_redundant(findings: &[PerEntryFinding], report: &mut Report) {
+    let mut groups: Vec<(Vec<String>, [u8; 16])> = Vec::new();
+    let mut by_hash: HashMap<[u8; 16], usize> = HashMap::new();
+    for f in findings {
+        let Some(d) = f.md5 else { continue };
+        if let Some(&idx) = by_hash.get(&d) {
+            groups[idx].0.push(f.path.clone());
+        } else {
+            by_hash.insert(d, groups.len());
+            groups.push((vec![f.path.clone()], d));
         }
     }
-
-    // ---- External URLs ----
-    if do_external {
-        let any = findings.iter().any(|f| !f.external.is_empty());
-        if any {
-            report.add_error(
-                Check::UrlExternal,
-                "Invalid external links found:".to_string(),
-            );
-            for f in &findings {
-                for url in &f.external {
-                    let msg = format!("{url} is an external dependence in article {}", f.path);
-                    report.add_error_body(Check::UrlExternal, format!("  {msg}"));
-                    report.entries.push(JsonLog {
-                        check: Check::UrlExternal,
-                        level: "ERROR",
-                        message: msg,
-                        extra: JsonExtra::UrlExternal {
-                            article: f.path.clone(),
-                            url: url.clone(),
-                        },
-                    });
-                }
-            }
+    for (paths, _) in &groups {
+        if paths.len() < 2 {
+            continue;
+        }
+        for w in paths.windows(2) {
+            report.add_warn(format!("Redundant Data: {} and {}", w[0], w[1]));
+            report.entries.push(JsonLog {
+                check: Check::Redundant,
+                level: "WARNING",
+                message: format!("{} and {}", w[0], w[1]),
+                extra: JsonExtra::Redundant {
+                    path1: w[0].clone(),
+                    path2: w[1].clone(),
+                },
+            });
         }
     }
 }
+
 
 fn check_redirect_loops(arc: &Archive, report: &mut Report) {
     for entry in arc.iter_by_path() {
@@ -880,23 +1055,19 @@ fn follow_loop(e: &Entry) -> Result<Entry, Error> {
     Ok(cur)
 }
 
-/// True if the candidate string looks like a sane URL/path. Filters out the
-/// garbage extracted from broken HTML attribute syntax (curly-quoted values,
-/// strings containing `<`/`>`/`&`, etc.).
+/// True if the candidate string looks like a sane URL/path.
+///
+/// Now that extraction is tag-aware this only has to reject values that
+/// cannot be a link at all — markup characters and control whitespace that a
+/// well-formed attribute value never contains, plus absurd lengths.
+///
+/// It deliberately does *not* restrict the first character. A whitelist of
+/// leading bytes threw away every percent-encoded link — `href="%D0%90…"` is
+/// how MediaWiki writes non-Latin article titles, so on any non-Latin-script
+/// archive that silently skipped most of the article graph, and `-U` under-
+/// reported dangling links compared to upstream.
 fn looks_like_url(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    if s.len() > 2048 {
-        return false;
-    }
-    let first = s.as_bytes()[0];
-    if !(first.is_ascii_alphanumeric()
-        || first == b'/'
-        || first == b'.'
-        || first == b'_'
-        || first == b'#')
-    {
+    if s.is_empty() || s.len() > 2048 {
         return false;
     }
     !s.bytes()
@@ -923,51 +1094,96 @@ fn has_scheme(s: &str) -> bool {
     false
 }
 
-/// Pull `href`/`src` attribute values out of an HTML blob. The match must
-/// look like a real HTML attribute (preceded by whitespace, `<`, `/`, or
-/// `>`) so we don't mistake the literal text `src=` inside a URL query
-/// parameter for an HTML attribute.
+/// Pull `href`/`src` attribute values out of an HTML blob, in document
+/// order.
+///
+/// The scan is tag-aware: it walks the document once, tracks whether the
+/// cursor is inside a `<…>` tag (honouring quoted attribute values, which may
+/// legally contain `>`), skips `<!-- … -->` comments, and only looks for
+/// attributes while inside a tag.
+///
+/// That structure is what keeps escaped markup out of the results. Wikipedia
+/// articles routinely *display* markup as text — `&lt;a href="./Foo"` inside a
+/// table cell — and a scanner that just searches for `href=` anywhere in the
+/// blob reports every such example as a link, inventing dangling-link and
+/// external-dependency findings that upstream (which parses the HTML) does
+/// not report.
 fn extract_link_targets(html: &str) -> Vec<(&'static str, &str)> {
     let mut out = Vec::new();
     let bytes = html.as_bytes();
-    for (kind, attr) in [("href", "href="), ("src", "src=")] {
-        let mut search_from = 0usize;
-        while let Some(rel) = html[search_from..].find(attr) {
-            let pos = search_from + rel;
-            search_from = pos + attr.len();
-            // Require the byte before `attr` to be whitespace or `<`.
-            if pos == 0 {
-                continue;
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        // ---- text: skip to the next tag open ----
+        let Some(rel) = html[i..].find('<') else { break };
+        i += rel + 1;
+        if html[i..].starts_with("!--") {
+            match html[i..].find("-->") {
+                Some(e) => i += e + 3,
+                None => break,
             }
-            let prev = bytes[pos - 1];
-            if !(prev.is_ascii_whitespace()
-                || prev == b'<'
-                || prev == b'/'
-                || prev == b'"'
-                || prev == b'\'')
-            {
-                continue;
+            continue;
+        }
+        // ---- inside a tag: scan attributes until the unquoted `>` ----
+        let mut prev_is_sep = true; // just after `<`
+        while i < n {
+            let b = bytes[i];
+            if b == b'>' {
+                i += 1;
+                break;
             }
-            let rest = &html[pos + attr.len()..];
-            let quote = rest.chars().next();
-            let val = match quote {
-                Some('"') | Some('\'') => {
-                    let q = quote.unwrap();
-                    let after_q = &rest[1..];
-                    if let Some(end) = after_q.find(q) {
-                        &after_q[..end]
-                    } else {
-                        continue;
+            if b == b'"' || b == b'\'' {
+                // Attribute value we are not interested in: skip it whole so
+                // a `>` or an `href=` inside it can't confuse the scan.
+                let q = b;
+                i += 1;
+                match html[i..].find(q as char) {
+                    Some(e) => i += e + 1,
+                    None => {
+                        i = n;
+                        break;
                     }
                 }
-                _ => {
-                    let end = rest
-                        .find(|c: char| c.is_whitespace() || c == '>')
-                        .unwrap_or(rest.len());
-                    &rest[..end]
+                prev_is_sep = true;
+                continue;
+            }
+            let mut matched = false;
+            if prev_is_sep {
+                for (kind, attr) in [("href", "href="), ("src", "src=")] {
+                    if html[i..].starts_with(attr) {
+                        let rest = &html[i + attr.len()..];
+                        let (val, consumed) = match rest.as_bytes().first() {
+                            Some(&q @ (b'"' | b'\'')) => match rest[1..].find(q as char) {
+                                Some(e) => (&rest[1..1 + e], 1 + e + 1),
+                                None => break,
+                            },
+                            _ => {
+                                let e = rest
+                                    .find(|c: char| c.is_whitespace() || c == '>')
+                                    .unwrap_or(rest.len());
+                                (&rest[..e], e)
+                            }
+                        };
+                        out.push((kind, val));
+                        i += attr.len() + consumed;
+                        matched = true;
+                        break;
+                    }
                 }
-            };
-            out.push((kind, val));
+            }
+            if matched {
+                // Re-dispatch on the byte after the value instead of
+                // consuming it: it may be the tag's closing `>` (as in
+                // `<a href="x">`), and swallowing that would leave the scan
+                // "inside a tag" across the element's text content — the
+                // exact state in which escaped markup gets mistaken for
+                // real attributes.
+                prev_is_sep = false;
+                continue;
+            }
+            let b = bytes[i];
+            prev_is_sep = b.is_ascii_whitespace() || b == b'/';
+            i += 1;
         }
     }
     out

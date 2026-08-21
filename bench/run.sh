@@ -35,7 +35,7 @@ cargo build --release --quiet
 ZIMRU=./target/release/zimru
 ZIMRU_CHECK=./target/release/zimcheck
 ZIMRU_DUMP=./target/release/zimdump
-UPSTREAM_DIR="${UPSTREAM_DIR:-/opt/zim-tools-upstream/zim-tools_linux-x86_64-3.6.0}"
+UPSTREAM_DIR="${UPSTREAM_DIR:-/opt/zim-tools-upstream/zim-tools_linux-x86_64-3.8.0}"
 UP_CHECK="$UPSTREAM_DIR/zimcheck"
 UP_DUMP="$UPSTREAM_DIR/zimdump"
 
