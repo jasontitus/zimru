@@ -158,7 +158,7 @@ fn builds_zim_without_indexes_when_helper_missing() {
 }
 
 #[test]
-fn skips_indexing_with_without_ft_index_flag() {
+fn without_ft_index_flag_keeps_the_title_index() {
     let Some(xb) = xapianbuilder_on_path() else {
         eprintln!("skip: xapianbuilder not on PATH");
         return;
@@ -180,6 +180,47 @@ fn skips_indexing_with_without_ft_index_flag() {
             "--creator=test",
             "--publisher=test",
             "-j", // --withoutFTIndex
+        ])
+        .arg("--xapianbuilder-path")
+        .arg(&xb)
+        .arg(&html_dir)
+        .arg(&zim_path)
+        .output()
+        .expect("zimwriterfs spawn");
+    assert!(out.status.success());
+
+    // `-j` is upstream's `--withoutFTIndex`: it drops the *fulltext* index
+    // and keeps the title index, which is what kiwix's suggestion box reads.
+    // Dropping both would produce an archive missing an entry that upstream's
+    // `-j` output contains.
+    let entries = list_x_namespace(&zim_path);
+    assert!(!entries.contains(&"fulltext/xapian".to_string()));
+    assert!(entries.contains(&"title/xapian".to_string()));
+}
+
+#[test]
+fn without_indexes_flag_skips_both_indexes() {
+    let Some(xb) = xapianbuilder_on_path() else {
+        eprintln!("xapianbuilder not available; skipping");
+        return;
+    };
+    let dir = workdir("without_indexes");
+    let html_dir = dir.join("html");
+    std::fs::create_dir_all(&html_dir).unwrap();
+    write_minimal_corpus(&html_dir);
+    let zim_path = dir.join("out.zim");
+
+    let out = Command::new(zimwriterfs_bin())
+        .args([
+            "--welcome=index.html",
+            "--illustration=icon48.png",
+            "--language=eng",
+            "--name=demo",
+            "--title=Demo",
+            "--description=demo",
+            "--creator=test",
+            "--publisher=test",
+            "--without-indexes",
         ])
         .arg("--xapianbuilder-path")
         .arg(&xb)

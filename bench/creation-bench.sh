@@ -9,7 +9,8 @@
 # subtraction:
 #
 #   index     both tools build X/fulltext/xapian + X/title/xapian
-#   noindex   both tools pass -j / --withoutFTIndex
+#   noft      both tools pass -j, which drops the fulltext index and keeps
+#             the title index — upstream's semantics, and now zimru's too
 #
 # Fairness notes:
 #   * Upstream's zimrecreate exposes no compression knobs — it uses libzim's
@@ -189,7 +190,7 @@ for src in "$@"; do
     classes_of "$OUT/.srcreport.$$" > "$SRC_CLASSES"
     rm -f "$OUT/.srcreport.$$"
 
-    for mode in index noindex; do
+    for mode in index noft; do
         zr_out="$OUT/$name.zr.$mode.zim"
         up_out="$OUT/$name.up.$mode.zim"
         if [[ $mode == index ]]; then
@@ -197,6 +198,10 @@ for src in "$@"; do
         else
             zr_extra=(-j); up_extra=(-j)
         fi
+        # Both -j runs still produce X/title/xapian, so the size column
+        # compares two archives with the same entry set. Running zimru with
+        # --without-indexes here instead would drop an entry upstream keeps
+        # and report the missing index as a compression win.
 
         ZR_CMD=("$ZIMRU_RECREATE" "$src" "$zr_out" --compression zstd
                 --compression-level "$LEVEL" -J "$THREADS" "${zr_extra[@]}")

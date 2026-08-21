@@ -115,7 +115,12 @@ pub struct IndexHelper {
 // irrelevant — not worth the indirection of boxing the jobs.
 #[allow(clippy::large_enum_variant)]
 enum State {
-    Active { fulltext: Job, title: Job },
+    /// `fulltext` is `None` under upstream's `-j/--withoutFTIndex`, which
+    /// suppresses only the fulltext index — the title index is still built.
+    Active {
+        fulltext: Option<Job>,
+        title: Option<Job>,
+    },
     Disabled,
 }
 
@@ -196,12 +201,23 @@ impl IndexHelper {
         }
     }
 
+    /// `want_fulltext` / `want_title` select which indexes to build.
+    /// Upstream's `-j` clears only the first: `zimrecreate -j` and
+    /// `zimwriterfs -j` still emit `X/title/xapian`, which is what the
+    /// suggestion box in kiwix-serve reads. Treating `-j` as "no indexes at
+    /// all" produces an archive that is missing an entry upstream's would
+    /// have, and quietly flatters any benchmark run in that mode.
     pub fn spawn(
         language: &str,
         tmp_dir: &std::path::Path,
         explicit_path: Option<&std::path::Path>,
         verbose: bool,
+        want_fulltext: bool,
+        want_title: bool,
     ) -> Self {
+        if !want_fulltext && !want_title {
+            return Self::disabled();
+        }
         let bin = match resolve_binary(explicit_path) {
             Some(p) => p,
             None => {
@@ -219,28 +235,39 @@ impl IndexHelper {
         let fulltext_out = tmp_dir.join("fulltext.xapian");
         let title_out = tmp_dir.join("title.xapian");
 
-        let fulltext = match spawn_one(&bin, "fulltext", &fulltext_out, language) {
-            Ok(j) => j,
-            Err(e) => {
-                eprintln!(
-                    "[zimwriterfs] xapianbuilder fulltext spawn failed: {e}; skipping indexes"
-                );
-                return Self::disabled();
-            }
-        };
-        let title = match spawn_one(&bin, "title", &title_out, language) {
-            Ok(j) => j,
-            Err(e) => {
-                eprintln!("[zimwriterfs] xapianbuilder title spawn failed: {e}; skipping indexes");
-                let mut fulltext = fulltext;
-                fulltext.stdin.take();
-                let stderr_thread = fulltext.stderr_thread.take();
-                let _ = fulltext.child.wait_with_killing();
-                if let Some(t) = stderr_thread {
-                    let _ = t.join();
+        let fulltext = if want_fulltext {
+            match spawn_one(&bin, "fulltext", &fulltext_out, language) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    eprintln!(
+                        "[zimwriterfs] xapianbuilder fulltext spawn failed: {e}; skipping indexes"
+                    );
+                    return Self::disabled();
                 }
-                return Self::disabled();
             }
+        } else {
+            None
+        };
+        let title = if want_title {
+            match spawn_one(&bin, "title", &title_out, language) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    eprintln!(
+                        "[zimwriterfs] xapianbuilder title spawn failed: {e}; skipping indexes"
+                    );
+                    if let Some(mut fulltext) = fulltext {
+                        fulltext.stdin.take();
+                        let stderr_thread = fulltext.stderr_thread.take();
+                        let _ = fulltext.child.wait_with_killing();
+                        if let Some(t) = stderr_thread {
+                            let _ = t.join();
+                        }
+                    }
+                    return Self::disabled();
+                }
+            }
+        } else {
+            None
         };
 
         IndexHelper {
@@ -252,7 +279,10 @@ impl IndexHelper {
     /// entries (title DB indexes everything in namespace C, regardless
     /// of mimetype).
     pub fn feed_title(&mut self, path: &str, title: &str, target_path: &str) {
-        let State::Active { title: t, .. } = &mut self.state else {
+        let State::Active {
+            title: Some(t), ..
+        } = &mut self.state
+        else {
             return;
         };
         let buf = encode_title_doc(path, title, target_path);
@@ -279,7 +309,11 @@ impl IndexHelper {
         if !mimetype.starts_with("text/html") {
             return;
         }
-        let State::Active { fulltext, .. } = &mut self.state else {
+        let State::Active {
+            fulltext: Some(fulltext),
+            ..
+        } = &mut self.state
+        else {
             return;
         };
         let buf = encode_fulltext_doc(path, title, mimetype, body, language);
@@ -293,20 +327,20 @@ impl IndexHelper {
     pub fn finish(mut self, verbose: bool) -> Vec<IndexBlob> {
         // Take the state out so the `Drop` impl (which kills children
         // on early-error paths) sees `Disabled` and no-ops.
-        let State::Active {
-            mut fulltext,
-            mut title,
-        } = std::mem::replace(&mut self.state, State::Disabled)
+        let State::Active { fulltext, title } =
+            std::mem::replace(&mut self.state, State::Disabled)
         else {
             return Vec::new();
         };
 
         // Close stdin pipes so the children see EOF and finalise.
-        fulltext.stdin.take();
-        title.stdin.take();
+        let mut jobs: Vec<Job> = [fulltext, title].into_iter().flatten().collect();
+        for j in &mut jobs {
+            j.stdin.take();
+        }
 
-        let mut blobs = Vec::with_capacity(2);
-        for mut job in [fulltext, title] {
+        let mut blobs = Vec::with_capacity(jobs.len());
+        for mut job in jobs {
             let url = job.url;
             let out_path = job.out_path.clone();
             let status = job.child.wait();
@@ -359,7 +393,7 @@ impl Drop for IndexHelper {
     /// `finish`, which replaces the state with `Disabled` first.
     fn drop(&mut self) {
         if let State::Active { fulltext, title } = &mut self.state {
-            for job in [fulltext, title] {
+            for job in [fulltext, title].into_iter().flatten() {
                 job.stdin.take();
                 let _ = job.child.kill();
                 let _ = job.child.wait();

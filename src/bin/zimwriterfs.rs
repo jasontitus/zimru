@@ -44,6 +44,10 @@ struct Opts {
     inflate_html: bool,
     redirects_file: Option<PathBuf>,
     without_ft_index: bool,
+    /// zimru extension: drop the title index too. Upstream has no equivalent
+    /// flag — its `-j` keeps the title index — so this is spelled out rather
+    /// than folded into `-j`.
+    without_indexes: bool,
     /// Optional explicit path to the xapianbuilder helper binary. If
     /// unset we look at $XAPIANBUILDER, then $PATH. Absence is
     /// non-fatal: the ZIM is built without search indexes.
@@ -87,6 +91,7 @@ fn main() -> ExitCode {
             ("-v", _) | ("--verbose", _) => o.verbose = true,
             ("-x", _) | ("--inflateHtml", _) => o.inflate_html = true,
             ("-j", _) | ("--withoutFTIndex", _) => o.without_ft_index = true,
+            ("--without-indexes", _) => o.without_indexes = true,
             ("--skip-libmagic-check", _) => o.skip_libmagic = true,
             ("-w", v) | ("--welcome", v) => o.welcome = Some(value_or_next(v, &args, &mut i)),
             ("-I", v) | ("--illustration", v) => {
@@ -197,7 +202,7 @@ fn value_or_next(v: Option<&str>, args: &[String], i: &mut usize) -> String {
 
 fn print_help() {
     println!(
-        "Usage: zimwriterfs [mandatory arguments] [optional arguments] HTML_DIR ZIM_FILE\n\nMandatory:\n  -w/--welcome PATH      main HTML page (relative to HTML_DIR)\n  -I/--illustration PATH 48×48 PNG illustration (relative)\n  -l/--language LANG     ISO639-3 language code (e.g. eng)\n  -n/--name NAME         version-independent identifier\n  -t/--title TITLE       ZIM title\n  -d/--description TEXT  short description\n  -c/--creator AUTHOR    content creator\n  -p/--publisher PUB     ZIM creator/publisher\n\nOptional:\n  -L/--longDescription TEXT\n  -m/--clusterSize KB    cluster size in KiB (default 2048)\n  --compression-level N  compression level (zstd: 1..=22, xz: 0..=9)\n  -J/--threads N         rayon thread-pool size (default num_cpus)\n  -x/--inflateHtml       gunzip *.html files before packing\n  -j/--withoutFTIndex    don't build fulltext / title indexes\n  --xapianbuilder-path P override $PATH lookup of xapianbuilder helper\n  -r/--redirects PATH    TSV file: url\\ttitle\\ttarget_url\n  -a/--tags TAGS         semicolon-separated tags\n  -e/--source URL        source URL\n  -o/--flavour NAME      content flavour\n  -s/--scraper NAME      scraper tool name+version\n  --skip-libmagic-check  ignore libmagic; use file-extension mime detection (default in zimru)\n  -v/--verbose           print processing details\n  -V/--version           print version\n"
+        "Usage: zimwriterfs [mandatory arguments] [optional arguments] HTML_DIR ZIM_FILE\n\nMandatory:\n  -w/--welcome PATH      main HTML page (relative to HTML_DIR)\n  -I/--illustration PATH 48×48 PNG illustration (relative)\n  -l/--language LANG     ISO639-3 language code (e.g. eng)\n  -n/--name NAME         version-independent identifier\n  -t/--title TITLE       ZIM title\n  -d/--description TEXT  short description\n  -c/--creator AUTHOR    content creator\n  -p/--publisher PUB     ZIM creator/publisher\n\nOptional:\n  -L/--longDescription TEXT\n  -m/--clusterSize KB    cluster size in KiB (default 2048)\n  --compression-level N  compression level (zstd: 1..=22, xz: 0..=9)\n  -J/--threads N         rayon thread-pool size (default num_cpus)\n  -x/--inflateHtml       gunzip *.html files before packing\n  -j/--withoutFTIndex    don't build the fulltext index (title index still built)\n  --without-indexes      don't build the fulltext or title index\n  --xapianbuilder-path P override $PATH lookup of xapianbuilder helper\n  -r/--redirects PATH    TSV file: url\\ttitle\\ttarget_url\n  -a/--tags TAGS         semicolon-separated tags\n  -e/--source URL        source URL\n  -o/--flavour NAME      content flavour\n  -s/--scraper NAME      scraper tool name+version\n  --skip-libmagic-check  ignore libmagic; use file-extension mime detection (default in zimru)\n  -v/--verbose           print processing details\n  -V/--version           print version\n"
     );
 }
 
@@ -259,7 +264,10 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     // Removes the temp dir on every exit path, including early `?`
     // returns while walking the input tree.
     let _index_tmp_cleanup = index_helper::TmpDirCleanup(index_tmp.clone());
-    let mut indexer = if o.without_ft_index {
+    // `-j` matches upstream: it drops the fulltext index only. The title
+    // index still gets built, because that is what upstream's `-j` output
+    // contains and what kiwix's suggestion box reads.
+    let mut indexer = if o.without_indexes {
         IndexHelper::disabled()
     } else {
         IndexHelper::spawn(
@@ -267,6 +275,8 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
             &index_tmp,
             o.xapianbuilder_path.as_deref(),
             o.verbose,
+            !o.without_ft_index,
+            true,
         )
     };
 
