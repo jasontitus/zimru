@@ -37,32 +37,72 @@ UP_SEARCH="$UPSTREAM_DIR/zimsearch"
 ZIMRU_RECREATE="${ZIMRU_RECREATE:-./target/release/zimrecreate}"
 ZIMRU_DUMP="${ZIMRU_DUMP:-./target/release/zimdump}"
 export XAPIANBUILDER="${XAPIANBUILDER:-/home/user/xapianbuilder/target/release/xapianbuilder}"
-RUNS="${RUNS:-1}"
+# One "pair" is a full ABBA cycle: two runs of each tool. Raising it trades
+# wall-clock for a tighter best-of.
+PAIRS="${PAIRS:-1}"
 THREADS="${THREADS:-$(nproc)}"
 LEVEL="${LEVEL:-19}"
 OUT="${OUT:-/tmp/zbench}"
 mkdir -p "$OUT"
+DETAIL="${DETAIL:-$OUT/run-times.log}"
+: > "$DETAIL"
 
 [[ -x "$UP_RECREATE" ]] || { echo "upstream zimrecreate not found at $UP_RECREATE" >&2; exit 1; }
 [[ -x "$XAPIANBUILDER" ]] || echo "warning: xapianbuilder not executable at $XAPIANBUILDER — zimru will build no index" >&2
 
 human() { numfmt --to=iec --suffix=B "$1"; }
 
-# Best-of-RUNS wall clock. Echoes "<seconds> <output-bytes>", or "FAIL -" on
-# a non-zero exit.
-timeit() {
-    local outfile="$1"; shift
-    local best="" t start end rc
-    for _ in $(seq 1 "$RUNS"); do
-        rm -f "$outfile"
-        start=$(date +%s.%N)
-        "$@" >/dev/null 2>&1; rc=$?
-        end=$(date +%s.%N)
-        if [[ $rc -ne 0 ]]; then echo "FAIL -"; return 1; fi
-        t=$(awk "BEGIN{printf \"%.2f\", $end - $start}")
-        if [[ -z "$best" ]] || awk "BEGIN{exit !($t < $best)}"; then best=$t; fi
+# One timed run. Echoes "<seconds>", or "FAIL" on a non-zero exit.
+#
+# Each run starts from the same state: the previous output is removed, the
+# source is re-read into page cache, and the previous run's dirty pages are
+# already flushed (see the sync below). Without the re-warm the second tool
+# reads a source the first tool's output writes have partly evicted, which
+# on this box means whoever runs second pays for disk reads the other did
+# not — an order effect that can be worth more than the difference being
+# measured.
+run_once() {
+    local outfile="$1" src="$2"; shift 2
+    local start end rc
+    rm -f "$outfile"
+    cat "$src" > /dev/null 2>&1
+    start=$(date +%s.%N)
+    "$@" >/dev/null 2>&1; rc=$?
+    end=$(date +%s.%N)
+    # Outside the timed region: flush this run's writes so the next run does
+    # not inherit them as background writeback.
+    sync
+    if [[ $rc -ne 0 ]]; then echo FAIL; return 1; fi
+    awk "BEGIN{printf \"%.2f\", $end - $start}"
+}
+
+# Run the two tools in ABBA order, $PAIRS times, and keep each tool's best.
+#
+# ABBA (zimru, upstream, upstream, zimru) rather than AB: it gives both tools
+# the same number of first-position and last-position runs, so any residual
+# ordering advantage cancels instead of accruing to whichever tool the script
+# happens to invoke first. Every individual run time is written to the
+# detail log so the spread — and any surviving order effect — stays auditable
+# rather than being hidden behind a single "best of".
+ab_compare() {
+    local zr_out="$1" up_out="$2" src="$3" label="$4"; shift 4
+    local zr_best="" up_best="" t i
+    for ((i = 1; i <= PAIRS; i++)); do
+        for slot in zr up up zr; do
+            if [[ $slot == zr ]]; then
+                t=$(run_once "$zr_out" "$src" "${ZR_CMD[@]}")
+                [[ "$t" == FAIL ]] && { echo "FAIL FAIL"; return 1; }
+                echo "$label run$i zimru    $t" >> "$DETAIL"
+                if [[ -z "$zr_best" ]] || awk "BEGIN{exit !($t < $zr_best)}"; then zr_best=$t; fi
+            else
+                t=$(run_once "$up_out" "$src" "${UP_CMD[@]}")
+                [[ "$t" == FAIL ]] && { echo "$zr_best FAIL"; return 1; }
+                echo "$label run$i upstream $t" >> "$DETAIL"
+                if [[ -z "$up_best" ]] || awk "BEGIN{exit !($t < $up_best)}"; then up_best=$t; fi
+            fi
+        done
     done
-    echo "$best $(stat -c%s "$outfile" 2>/dev/null || echo 0)"
+    echo "$zr_best $up_best"
 }
 
 # Verdict on upstream's full sweep of our output.
@@ -135,9 +175,9 @@ pick_query() {
                END { for (i = 1; i <= 12 && n; i++) print a[int(n * i / 13) + 1] }')
 }
 
-printf "%-40s %9s %6s %10s %10s %8s %12s %12s %8s %10s %14s\n" \
-    FILE SIZE MODE ZIMRU UPSTREAM SPEEDUP ZIMRU-OUT UP-OUT CHECK SEARCH IDX-ZR/UP
-printf -- "%s\n" "$(printf '%.0s-' {1..152})"
+printf "%-40s %9s %6s %10s %10s %8s %10s %10s %8s %7s %9s %13s\n" \
+    FILE SIZE MODE ZIMRU UPSTREAM SPEEDUP ZR-OUT UP-OUT SIZE-D CHECK SEARCH IDX-ZR/UP
+printf -- "%s\n" "$(printf '%.0s-' {1..160})"
 
 for src in "$@"; do
     [[ -f "$src" ]] || { echo "skip (missing): $src" >&2; continue; }
@@ -148,7 +188,6 @@ for src in "$@"; do
     check_report "$src" > "$OUT/.srcreport.$$"
     classes_of "$OUT/.srcreport.$$" > "$SRC_CLASSES"
     rm -f "$OUT/.srcreport.$$"
-    cat "$src" > /dev/null 2>&1   # warm the page cache for both sides alike
 
     for mode in index noindex; do
         zr_out="$OUT/$name.zr.$mode.zim"
@@ -159,16 +198,25 @@ for src in "$@"; do
             zr_extra=(-j); up_extra=(-j)
         fi
 
-        read -r zr_t zr_sz < <(timeit "$zr_out" \
-            "$ZIMRU_RECREATE" "$src" "$zr_out" --compression zstd \
-            --compression-level "$LEVEL" -J "$THREADS" "${zr_extra[@]}")
-        read -r up_t up_sz < <(timeit "$up_out" \
-            "$UP_RECREATE" "$src" "$up_out" -J "$THREADS" "${up_extra[@]}")
+        ZR_CMD=("$ZIMRU_RECREATE" "$src" "$zr_out" --compression zstd
+                --compression-level "$LEVEL" -J "$THREADS" "${zr_extra[@]}")
+        UP_CMD=("$UP_RECREATE" "$src" "$up_out" -J "$THREADS" "${up_extra[@]}")
+        read -r zr_t up_t < <(ab_compare "$zr_out" "$up_out" "$src" "$name/$mode")
+        zr_sz=$(stat -c%s "$zr_out" 2>/dev/null || echo 0)
+        up_sz=$(stat -c%s "$up_out" 2>/dev/null || echo 0)
 
         if [[ "$zr_t" == FAIL || "$up_t" == FAIL ]]; then
             speedup="-"
         else
             speedup=$(awk "BEGIN{printf \"%.2fx\", $up_t / $zr_t}")
+        fi
+        # Output size relative to upstream's: negative means zimru's archive
+        # is smaller. Reported as a percentage because the absolute figures
+        # span three orders of magnitude across the corpus.
+        if [[ "$zr_sz" -gt 0 && "$up_sz" -gt 0 ]]; then
+            sizedelta=$(awk "BEGIN{printf \"%+.1f%%\", 100.0 * ($zr_sz - $up_sz) / $up_sz}")
+        else
+            sizedelta="-"
         fi
         if [[ "$zr_t" == FAIL ]]; then
             chk="-"; idx="-"; idxsz="-"
@@ -185,11 +233,10 @@ for src in "$@"; do
                 idx="n/a"; idxsz="n/a"
             fi
         fi
-        printf "%-40s %9s %6s %10s %10s %8s %12s %12s %8s %10s %14s\n" \
+        printf "%-40s %9s %6s %10s %10s %8s %10s %10s %8s %7s %9s %13s\n" \
             "$name" "$(human "$size")" "$mode" \
             "${zr_t}s" "${up_t}s" "$speedup" \
-            "$([[ "$zr_sz" == - ]] && echo - || human "$zr_sz")" \
-            "$([[ "$up_sz" == - ]] && echo - || human "$up_sz")" \
+            "$(human "$zr_sz")" "$(human "$up_sz")" "$sizedelta" \
             "$chk" "$idx" "$idxsz"
         # Multi-GB sources produce multi-GB outputs on both sides; keeping
         # four of them per file fills the disk before the suite finishes.
