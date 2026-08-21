@@ -704,6 +704,12 @@ fn exception_dest(exceptions_dir: &PathBuf, rel: &str) -> std::io::Result<PathBu
             _ => esc.push(c),
         }
     }
+    // Escaping `/` stops multi-segment traversal, but a path that is
+    // exactly "." or ".." survives it and would name the exceptions dir
+    // or its parent. Neither is a file we may write.
+    if esc.is_empty() || esc == "." || esc == ".." {
+        esc.insert(0, '_');
+    }
     Ok(exceptions_dir.join(esc))
 }
 

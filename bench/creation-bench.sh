@@ -65,17 +65,36 @@ timeit() {
     echo "$best $(stat -c%s "$outfile" 2>/dev/null || echo 0)"
 }
 
-# "PASS" / "=src" / "REGRESS": does the output survive upstream's full sweep,
-# and if not, did the source already fail it?
+# Verdict on upstream's full sweep of our output.
+#
+#   PASS     clean
+#   =src     fails only in ways the source already failed
+#   REGRESS  introduces an error class the source does not have
+#
+# A plain Pass/Fail is not usable any more: zim-tools 3.8.0 added the
+# M/Counter regex check, and virtually every published archive fails it (its
+# mimetype histogram contains parameterised types like
+# `image/svg+xml; charset=utf-8; …`). Comparing error *classes* against the
+# source is what actually answers "did the writer break anything".
+# `upstream zimcheck -A` is the single most expensive step in this script on
+# a multi-GB archive — slower than either recreate it is verifying. Run it
+# exactly once per archive and derive both the pass/fail and the error-class
+# set from the same captured report; the source's classes are computed once
+# per file and reused across modes.
+check_report() { $UP_CHECK -A "$1" 2>/dev/null; }
+classes_of()   { sed -n 's/^\[ERROR\] \([A-Za-z ]*\):.*/\1/p' "$1" | sort -u; }
+
+SRC_CLASSES=""   # per-file temp file, set in the loop below
 zimcheck_verdict() {
-    local out="$1" src="$2"
-    if $UP_CHECK -A "$out" 2>/dev/null | grep -q "Overall Test Status: Pass"; then
-        echo PASS
-    elif $UP_CHECK -A "$src" 2>/dev/null | grep -q "Overall Test Status: Pass"; then
-        echo REGRESS
-    else
-        echo "=src"
+    local out="$1" rep="$OUT/.check.$$"
+    check_report "$out" > "$rep"
+    if grep -q "Overall Test Status: Pass" "$rep"; then
+        rm -f "$rep"; echo PASS; return
     fi
+    local extra
+    extra=$(classes_of "$rep" | comm -13 "$SRC_CLASSES" -)
+    rm -f "$rep"
+    if [[ -z "$extra" ]]; then echo "=src"; else echo "REGRESS"; fi
 }
 
 # "OK" when both index entries exist and zimsearch's top hit matches the
@@ -94,21 +113,41 @@ index_verdict() {
     else echo "MISMATCH"; fi
 }
 
-# A query term guaranteed to be in the archive: the title of the first
-# content article long enough to be indexed.
-pick_query() {
-    $ZIMRU_DUMP list "$1" 2>/dev/null | awk 'length($0) >= 4 { print; exit }'
+# Total bytes of the two X/*/xapian blobs, so the two indexers' output sizes
+# can be compared directly rather than inferred from whole-file sizes.
+index_bytes() {
+    $ZIMRU_DUMP analyze --by-item "$1" 2>/dev/null \
+        | awk '/X\/(fulltext|title)\/xapian$/ { s += $5 } END { print s + 0 }'
 }
 
-printf "%-40s %9s %6s %10s %10s %8s %12s %12s %8s %8s\n" \
-    FILE SIZE MODE ZIMRU UPSTREAM SPEEDUP ZIMRU-OUT UP-OUT CHECK INDEX
-printf -- "%s\n" "$(printf '%.0s-' {1..135})"
+# A query term drawn from the middle of the archive: a content path with no
+# directory or extension punctuation, i.e. an article title rather than an
+# asset. Taken from the middle so it isn't an alphabetical-prefix outlier.
+pick_query() {
+    local src="$1" c
+    while read -r c; do
+        [[ -n "$c" ]] || continue
+        if [[ -n "$($UP_SEARCH "$src" "$c" 2>/dev/null | grep -m1 '^score')" ]]; then
+            echo "$c"; return
+        fi
+    done < <($ZIMRU_DUMP list "$src" 2>/dev/null \
+        | awk '$0 !~ /[.\/]/ && length($0) >= 3 {a[++n]=$0}
+               END { for (i = 1; i <= 12 && n; i++) print a[int(n * i / 13) + 1] }')
+}
+
+printf "%-40s %9s %6s %10s %10s %8s %12s %12s %8s %10s %14s\n" \
+    FILE SIZE MODE ZIMRU UPSTREAM SPEEDUP ZIMRU-OUT UP-OUT CHECK SEARCH IDX-ZR/UP
+printf -- "%s\n" "$(printf '%.0s-' {1..152})"
 
 for src in "$@"; do
     [[ -f "$src" ]] || { echo "skip (missing): $src" >&2; continue; }
     name=$(basename "$src" .zim)
     size=$(stat -c%s "$src")
     query=$(pick_query "$src")
+    SRC_CLASSES="$OUT/.srcclasses.$$"
+    check_report "$src" > "$OUT/.srcreport.$$"
+    classes_of "$OUT/.srcreport.$$" > "$SRC_CLASSES"
+    rm -f "$OUT/.srcreport.$$"
     cat "$src" > /dev/null 2>&1   # warm the page cache for both sides alike
 
     for mode in index noindex; do
@@ -132,16 +171,29 @@ for src in "$@"; do
             speedup=$(awk "BEGIN{printf \"%.2fx\", $up_t / $zr_t}")
         fi
         if [[ "$zr_t" == FAIL ]]; then
-            chk="-"; idx="-"
+            chk="-"; idx="-"; idxsz="-"
         else
-            chk=$(zimcheck_verdict "$zr_out" "$src")
-            if [[ $mode == index ]]; then idx=$(index_verdict "$zr_out" "$src" "$query"); else idx="n/a"; fi
+            chk=$(zimcheck_verdict "$zr_out")
+            if [[ $mode == index ]]; then
+                idx=$(index_verdict "$zr_out" "$src" "$query")
+                if [[ "$up_t" == FAIL ]]; then
+                    idxsz="$(human "$(index_bytes "$zr_out")")/-"
+                else
+                    idxsz="$(human "$(index_bytes "$zr_out")")/$(human "$(index_bytes "$up_out")")"
+                fi
+            else
+                idx="n/a"; idxsz="n/a"
+            fi
         fi
-        printf "%-40s %9s %6s %10s %10s %8s %12s %12s %8s %8s\n" \
+        printf "%-40s %9s %6s %10s %10s %8s %12s %12s %8s %10s %14s\n" \
             "$name" "$(human "$size")" "$mode" \
             "${zr_t}s" "${up_t}s" "$speedup" \
             "$([[ "$zr_sz" == - ]] && echo - || human "$zr_sz")" \
             "$([[ "$up_sz" == - ]] && echo - || human "$up_sz")" \
-            "$chk" "$idx"
+            "$chk" "$idx" "$idxsz"
+        # Multi-GB sources produce multi-GB outputs on both sides; keeping
+        # four of them per file fills the disk before the suite finishes.
+        [[ -n "${KEEP:-}" ]] || rm -f "$zr_out" "$up_out"
     done
+    rm -f "$SRC_CLASSES"
 done

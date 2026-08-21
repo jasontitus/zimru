@@ -38,6 +38,7 @@ ZIMRU_DUMP=./target/release/zimdump
 UPSTREAM_DIR="${UPSTREAM_DIR:-/opt/zim-tools-upstream/zim-tools_linux-x86_64-3.8.0}"
 UP_CHECK="$UPSTREAM_DIR/zimcheck"
 UP_DUMP="$UPSTREAM_DIR/zimdump"
+OUR_BENCH=./target/release/zimbench
 
 echo "Versions:"
 echo "  zimru   : 0.1.0 (this repo)"
@@ -87,6 +88,27 @@ echo "## 5. zimdump info"
 hyperfine --shell=none --warmup 2 --runs 10 --export-markdown bench/results-info.md \
     -n "zimru zimdump info" "$ZIMRU_DUMP info $ZIM" \
     -n "upstream zimdump info" "$UP_DUMP info $ZIM"
+echo
+
+# -------------------------------------------------------------------
+# 6. Export every entry to the filesystem
+# -------------------------------------------------------------------
+echo "## 6. zimdump dump (export every entry)"
+DUMPDIR="${TMPDIR:-/tmp}/zimru-bench-dump"
+hyperfine -i --warmup 0 --runs 2 --export-markdown bench/results-dump.md \
+    --prepare "rm -rf $DUMPDIR" \
+    -n "zimru zimdump dump" "$ZIMRU_DUMP dump --dir=$DUMPDIR --redirect $ZIM" \
+    -n "upstream zimdump dump" "$UP_DUMP dump --dir=$DUMPDIR --redirect $ZIM"
+rm -rf "$DUMPDIR"
+echo
+
+# -------------------------------------------------------------------
+# 7. Random-access benchmark
+# -------------------------------------------------------------------
+echo "## 7. zimbench -n 1000 (random + sequential entry access)"
+hyperfine -i --warmup 1 --runs 3 --export-markdown bench/results-bench.md \
+    -n "zimru zimbench" "$OUR_BENCH -n 1000 $ZIM" \
+    -n "upstream zimbench" "$UPSTREAM_DIR/zimbench -n 1000 $ZIM"
 echo
 
 echo "All benchmarks complete. Markdown summaries in bench/results-*.md"
