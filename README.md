@@ -19,13 +19,14 @@ format spec] and validated against real-world ZIM files.
 - **CLI parity with zim-tools 3.8.0 / libzim 9.8.2** — 12/12 cases on each
   of 8 archives spanning Arabic (RTL), Bashkir (1.1 GB Cyrillic), English,
   Chinese ×2, Tamil, Korean and Japanese.
-- **Faster than upstream on almost every comparable workload**, measured
-  ABBA against the current release (see [the benchmark](#head-to-head-benchmark-vs-upstream)):
-  `zimcheck -R` 8.4×, `zimcheck -A` 6.0×, `zimdump dump` 4.0×,
-  `zimdump info` 3.4×, `zimdump list` 1.8×, `zimcheck -C` 1.18×;
+- **Faster than upstream on every comparable workload**, measured ABBA
+  against the current release (see [the benchmark](#head-to-head-benchmark-vs-upstream)):
+  `zimcheck -R` 8.7×, `zimcheck -A` 7.0×, `zimdump info` 3.6×,
+  `zimdump list` 2.0×, `zimcheck -C` 1.18×, `zimcheck -I` 1.16×;
   `zimrecreate` 1.15×–1.84× at matched compression with both sides building
-  search indexes. The exception is `zimcheck -I`, where upstream is faster
-  (0.74×) — open work, not a design choice.
+  search indexes. `zimdump dump` and `zimbench` are excluded — the first is
+  swamped by filesystem noise on the test machine, the second is not
+  comparable because upstream exits 0 without running its read phases.
 - **Content equivalence verified through real libzim**, not through zimru's
   own reader: every one of 252 234 entries identical after a recreate.
 - **Writer validated end-to-end on real ZIMs** across 13 MB → 1.1 GB and
@@ -541,50 +542,64 @@ CJK archives to check the pattern holds across scripts:
 
 | workload                                     | zimru   | upstream | speedup   |
 |----------------------------------------------|---------|----------|-----------|
-| `zimcheck -C` (MD5 trailer only)             | 2.011 s | 2.367 s  | **1.18×** |
-| `zimcheck -I` (structure + every cluster)    | 3.831 s | 2.842 s  | 0.74×     |
-| `zimcheck -R` (decompress + MD5 every blob)  | 2.199 s | 18.494 s | **8.41×** |
-| `zimcheck -A` (full sweep)                   | 9.882 s | 59.097 s | **5.98×** |
-| `zimdump info`                               | 0.005 s | 0.017 s  | **3.40×** |
-| `zimdump list`                               | 0.081 s | 0.149 s  | **1.84×** |
-| `zimdump dump --redirect` (export 175 k files) | 6.469 s | 25.767 s | **3.98×** |
+| `zimcheck -C` (MD5 trailer only)             | 2.050 s | 2.421 s  | **1.18×** |
+| `zimcheck -I` (structure + every cluster)    | 2.504 s | 2.895 s  | **1.16×** |
+| `zimcheck -R` (decompress + MD5 every blob)  | 2.182 s | 18.899 s | **8.66×** |
+| `zimcheck -A` (full sweep)                   | 8.486 s | 59.165 s | **6.97×** |
+| `zimdump info`                               | 0.005 s | 0.018 s  | **3.60×** |
+| `zimdump list`                               | 0.075 s | 0.149 s  | **1.99×** |
 
 | workload      | `ko_top_mini` 154 MB | `zh_chemistry_maxi` 128 MB |
 |---------------|----------------------|----------------------------|
-| `zimcheck -C` | 1.26×                | 1.18×                      |
-| `zimcheck -I` | 1.20×                | 0.82×                      |
-| `zimcheck -R` | **9.80×**            | **8.94×**                  |
-| `zimcheck -A` | **5.48×**            | **4.03×**                  |
-| `zimdump info`| **3.40×**            | **3.60×**                  |
-| `zimdump list`| **1.93×**            | **2.64×**                  |
-| `zimdump dump`| upstream fails       | 1.11×                      |
+| `zimcheck -C` | **1.23×**            | **1.20×**                  |
+| `zimcheck -I` | **2.16×**            | **1.17×**                  |
+| `zimcheck -R` | **9.91×**            | **8.74×**                  |
+| `zimcheck -A` | **5.98×**            | **4.58×**                  |
+| `zimdump info`| **3.80×**            | **3.20×**                  |
+| `zimdump list`| **2.01×**            | **2.69×**                  |
 
-Three results deserve more than a number:
+`zimdump dump` and `zimbench` are excluded from both tables; see below.
 
-- **`zimcheck -I` is the one workload where upstream is faster** (0.74× on
-  Bashkir, 0.82× on the Chinese archive; we are ahead on the Korean one).
-  Both tools do detect real corruption — an archive with 32 bytes flipped
-  inside a zstd cluster payload and a re-stamped MD5 trailer, so that only
-  cluster decoding can catch it, is caught by both. The difference is what
-  happens next: zimru reports `[ERROR] ZIM file's low level structure is
-  invalid: cluster decompression failed` followed by
-  `Overall Test Status: Fail` and exits 1, while upstream prints a bare
-  `Data corruption detected` and aborts before emitting a report, exit 2.
-  Closing this gap is open work, not a design decision.
+### What is not in the tables, and why
 
-- **`zimdump dump` fails outright on the Korean archive** — upstream exits
-  255 after 0.098 s with `Error creating symlink from …/%/%`, because that
-  archive contains entries named `%` and `$`. zimru completes the export in
-  29 s. This is why the harness prints both tools' exit codes: a crash is
-  otherwise indistinguishable from a very fast run.
+Two workloads are excluded rather than scored, and one archive breaks a
+third tool outright.
 
-- **`zimbench` is not comparable and is deliberately not scored.** Upstream
-  collects its URL lists and then exits **0** without running either read
-  phase, reporting no throughput; zimru runs all three phases (linear
-  access 1 000 reads / 84 MB / 42.7 MB/s, random access 1 000 reads / 84 MB
-  / 45.2 MB/s). Taken at face value the numbers say upstream is 190×
-  faster, and the exit status does not contradict it. It is doing none of
-  the work.
+- **`zimdump dump` is not reliably measurable here.** Extracting 175 k files
+  is dominated by the container's filesystem and writeback behaviour, not by
+  either tool: within a *single* ABBA pair the two runs of one tool came in
+  at 7.698 s and 19.832 s, and upstream's at 30.022 s and 13.964 s. A 2.58×
+  spread swamps any difference between the implementations. Every other
+  workload in these tables holds within 1.15× run-to-run, which is what
+  makes those numbers worth quoting and this one not. An earlier revision
+  of this README claimed 3.98× here; that was one sample of a distribution
+  this wide.
+
+- **`zimbench` is not comparable.** Upstream collects its URL lists and then
+  exits **0** without running either read phase, reporting no throughput;
+  zimru runs all three (linear access 1 000 reads / 84 MB / 42.7 MB/s,
+  random access 1 000 reads / 84 MB / 45.2 MB/s). Taken at face value the
+  numbers say upstream is ~190× faster, and the exit status does not
+  contradict it. It is doing none of the work. `bench/toolset-bench.sh`
+  keeps the row and prints both exit codes rather than dropping it, so the
+  asymmetry stays visible.
+
+- **`zimdump dump` fails outright on the Korean archive**: upstream exits
+  255 after 0.1 s with `Error creating symlink from …/%/%`, because that
+  archive contains entries named `%` and `$`. zimru completes the export.
+  This is why the harness prints exit codes at all — a crash is otherwise
+  indistinguishable from a very fast run, and the same trap is what makes
+  `zimdump dump`-based content verification useless on that file (it gives
+  up after 24 of 252 234 entries, still exiting 0).
+
+`zimcheck -I` used to be the one workload where upstream was faster (0.74×).
+The cause was structural rather than algorithmic — `-A`'s content scan had
+been rayon-parallel by cluster for some time, but `-I` still decoded every
+cluster in a sequential loop, 1.8 s of a 3.8 s run. Parallelizing it took
+`-I` to 1.16× and carried `-A` from 5.98× to 6.97×, since `-A` runs the
+integrity check too. Corruption detection is unchanged: an archive with
+damaged zstd cluster payloads and a re-stamped MD5 trailer — so that only
+decoding can catch it — still fails, with the same message every run.
 
 ### Write side
 
@@ -741,8 +756,9 @@ stays **deterministic** and still matches upstream byte-for-byte on all
 | build                            | `-A` on 1.1 GB   | speedup vs upstream |
 |----------------------------------|------------------|---------------------|
 | single-pass, single-thread       | ~12 s (estimate) | ~4.8×               |
-| **single-pass, rayon (4 cores)** | **9.88 s**       | **5.98×**           |
-| upstream                         | 57.27 s          | 1.00×               |
+| single-pass, rayon content scan  | 9.88 s           | 5.98×               |
+| **+ rayon integrity check**      | **8.49 s**       | **6.97×**           |
+| upstream (3.8.0)                 | 59.17 s          | 1.00×               |
 
 The rayon pass saturates user CPU time (20 s of user time across
 wall-clock 6.9 s on this container). Memory stays bounded because
