@@ -570,8 +570,23 @@ fn check_integrity(arc: &Archive) -> Result<(), Error> {
         let _ = arc.entry_by_url_index(i)?;
     }
     // Validate every cluster parses and yields valid blob ranges.
-    for c in 0..h.cluster_count {
-        touch_cluster(arc, c)?;
+    //
+    // Parallel by cluster, like the -A content scan: each cluster is
+    // self-contained, and decoding them is what dominates -I on a
+    // gigabyte-scale archive (1.8 s of a 3.8 s run on the 1.1 GB Bashkir
+    // Wikipedia, against 2.0 s for the MD5 pass that follows). Running it
+    // one cluster at a time left -I as the only workload where upstream was
+    // faster.
+    //
+    // `min_by_key` rather than "first error wins": with work stealing the
+    // order failures surface in depends on scheduling, and the reported
+    // cluster has to be the same one on every run.
+    let first_err = (0..h.cluster_count)
+        .into_par_iter()
+        .filter_map(|c| touch_cluster(arc, c).err().map(|e| (c, e)))
+        .min_by_key(|(c, _)| *c);
+    if let Some((_, e)) = first_err {
+        return Err(e);
     }
     // MD5 trailer
     if h.has_checksum() && !arc.check()? {
