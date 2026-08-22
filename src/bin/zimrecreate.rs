@@ -40,6 +40,9 @@ fn main() -> ExitCode {
     let mut cluster_target: Option<usize> = None;
     let mut cluster_strategy: ClusterStrategy = ClusterStrategy::Single;
     let mut without_ft_index = false;
+    // zimru extension: upstream has no flag for "no indexes at all", since
+    // its -j keeps the title index.
+    let mut without_indexes = false;
     let mut xapianbuilder_path: Option<PathBuf> = None;
 
     let mut i = 1;
@@ -55,6 +58,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "-j" | "--withoutFTIndex" => without_ft_index = true,
+            "--without-indexes" => without_indexes = true,
             "--xapianbuilder-path" => {
                 i += 1;
                 xapianbuilder_path = args.get(i).map(PathBuf::from);
@@ -142,6 +146,7 @@ fn main() -> ExitCode {
         cluster_target,
         cluster_strategy,
         without_ft_index,
+        without_indexes,
         xapianbuilder_path.as_deref(),
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -154,7 +159,7 @@ fn main() -> ExitCode {
 
 fn print_help() {
     println!(
-        "\nzimrecreate recreates a ZIM file from an existing ZIM.\n\nUsage: zimrecreate ORIGIN_FILE OUTPUT_FILE [Options]\nOptions:\n\t-v, --version              print software version\n\t-j, --withoutFTIndex       don't create a fulltext index (always)\n\t-J, --threads <number>     encode worker pool size (default: one per CPU)\n\t--compression C            one of: none | zstd | xz  (default zstd)\n\t--compression-level N      compression level (zstd: 1..=22, xz: 0..=9)\n\t--cluster-size BYTES       cluster size target (default 2097152)\n"
+        "\nzimrecreate recreates a ZIM file from an existing ZIM.\n\nUsage: zimrecreate ORIGIN_FILE OUTPUT_FILE [Options]\nOptions:\n\t-v, --version              print software version\n\t-j, --withoutFTIndex       skip the fulltext index (title index still built)\n\t--without-indexes          skip both the fulltext and title indexes\n\t-J, --threads <number>     encode worker pool size (default: one per CPU)\n\t--compression C            one of: none | zstd | xz  (default zstd)\n\t--compression-level N      compression level (zstd: 1..=22, xz: 0..=9)\n\t--cluster-size BYTES       cluster size target (default 2097152)\n"
     );
 }
 
@@ -167,6 +172,7 @@ fn run(
     cluster_target: Option<usize>,
     cluster_strategy: ClusterStrategy,
     without_ft_index: bool,
+    without_indexes: bool,
     xapianbuilder_path: Option<&std::path::Path>,
 ) -> Result<(), zimru::Error> {
     let source = Archive::open(src)?;
@@ -204,10 +210,20 @@ fn run(
     // Removes the temp dir on every exit path, including early `?`
     // returns (a corrupt source entry mid-iteration, say).
     let _index_tmp_cleanup = index_helper::TmpDirCleanup(index_tmp.clone());
-    let mut indexer = if without_ft_index {
+    // `-j` matches upstream: it drops the fulltext index only. The title
+    // index still gets built, because that is what upstream's `-j` output
+    // contains and what kiwix's suggestion box reads.
+    let mut indexer = if without_indexes {
         IndexHelper::disabled()
     } else {
-        IndexHelper::spawn(&language, &index_tmp, xapianbuilder_path, false)
+        IndexHelper::spawn(
+            &language,
+            &index_tmp,
+            xapianbuilder_path,
+            false,
+            !without_ft_index,
+            true,
+        )
     };
 
     // Iterate every entry, partition by kind. We skip:

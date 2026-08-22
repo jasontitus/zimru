@@ -424,7 +424,7 @@ pub unsafe extern "C" fn zimru_archive_illustrations(
     if triples.is_empty() {
         return std::ptr::null_mut();
     }
-    let mut boxed: Vec<zimru_illustration_t> = triples
+    let boxed: Box<[zimru_illustration_t]> = triples
         .into_iter()
         .map(|(width, height, scale)| zimru_illustration_t {
             width,
@@ -432,12 +432,13 @@ pub unsafe extern "C" fn zimru_archive_illustrations(
             scale,
         })
         .collect();
-    boxed.shrink_to_fit();
-    let ptr = boxed.as_mut_ptr();
-    // Capacity == length (post-shrink_to_fit), so the matching free
-    // can reconstruct the Vec from `(ptr, count, count)`.
-    std::mem::forget(boxed);
-    ptr
+    // `into_boxed_slice` (which `collect::<Box<[_]>>` goes through) is
+    // *guaranteed* to hand back an allocation whose size is exactly the
+    // element count, reallocating if it has to. `shrink_to_fit`, which this
+    // used to call, is explicitly best-effort: it may leave capacity > len,
+    // and the matching free below then reconstructs the allocation with the
+    // wrong size, which is undefined behaviour.
+    Box::into_raw(boxed) as *mut zimru_illustration_t
 }
 
 /// Free an illustration array previously returned by
@@ -446,7 +447,8 @@ pub unsafe extern "C" fn zimru_archive_illustrations(
 #[no_mangle]
 pub unsafe extern "C" fn zimru_illustrations_free(ptr: *mut zimru_illustration_t, count: usize) {
     if !ptr.is_null() && count > 0 {
-        drop(Vec::from_raw_parts(ptr, count, count));
+        // Mirror of the `Box<[_]>` the allocation was created as.
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, count)));
     }
 }
 

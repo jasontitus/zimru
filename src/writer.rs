@@ -596,19 +596,31 @@ impl Creator {
     }
 
     pub fn add_item(&mut self, item: Item) -> &mut Self {
-        if let Some(s) = self.stream.as_mut() {
-            // Streaming mode — bin-pack body into the current cluster,
-            // encode-write-free if it overflows. Errors here panic
-            // because the &mut Self return shape doesn't propagate; if
-            // a caller wants error propagation it should use the
-            // explicit `add_item_streaming` helper (TODO if needed).
-            if let Err(e) = s.push_item(item) {
-                panic!("streaming add_item: {e}");
-            }
-        } else {
-            self.items.push(item);
+        // Errors panic because the `&mut Self` builder return shape has
+        // nowhere to put them. Callers that need to handle failure —
+        // notably the C ABI, where a panic unwinding out of an
+        // `extern "C"` function is undefined behaviour — use
+        // [`try_add_item`] instead.
+        if let Err(e) = self.try_add_item(item) {
+            panic!("streaming add_item: {e}");
         }
         self
+    }
+
+    /// Fallible sibling of [`Creator::add_item`], for callers that cannot
+    /// tolerate a panic.
+    ///
+    /// In streaming mode adding an item does real work — it bin-packs the
+    /// body into the current cluster and may encode and write that cluster
+    /// out — so it can fail on a full disk or an I/O error partway through
+    /// a build.
+    pub fn try_add_item(&mut self, item: Item) -> Result<()> {
+        if let Some(s) = self.stream.as_mut() {
+            s.push_item(item)
+        } else {
+            self.items.push(item);
+            Ok(())
+        }
     }
 
     /// True iff `start_writing` has been called and the creator is

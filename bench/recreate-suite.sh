@@ -15,7 +15,7 @@
 # Usage: ./bench/recreate-suite.sh [glob]
 set -uo pipefail
 
-UPSTREAM_DIR="${UPSTREAM_DIR:-/opt/zim-tools-upstream/zim-tools_linux-x86_64-3.6.0}"
+UPSTREAM_DIR="${UPSTREAM_DIR:-/opt/zim-tools-upstream/zim-tools_linux-x86_64-3.8.0}"
 ZIMCHECK="$UPSTREAM_DIR/zimcheck"
 ZIMRU=./target/release/zimru
 ZIMDUMP=./target/release/zimdump

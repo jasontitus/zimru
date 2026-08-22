@@ -10,28 +10,27 @@ format spec] and validated against real-world ZIM files.
 
 ## At a glance
 
-- **81 tests + 7 doctests pass** (unit + synthetic-zim + ergonomic-API +
+- **93 tests pass** (unit + synthetic-zim + ergonomic-API +
   writer round-trip + streaming-encode + per-item-compression +
   zimwriterfs e2e + real-file integration + doc tests).
 - **7 binaries**: `zimru`, plus drop-in replacements for `zimcheck`,
   `zimdump`, `zimbench`, `zimsplit`, `zimrecreate`, `zimwriterfs`. All
-  accept upstream `zim-tools` 3.6.0 flags.
-- **CLI byte-for-byte parity** with upstream on 12/12 cases per file
-  across 3 different ZIM archives (English mini, Chinese chemistry mini,
-  1.1 GB Bashkir).
-- **Faster than upstream on every comparable workload** measured on the
-  1.1 GB Bashkir Wikipedia (full round trip vs official zim-tools 3.6.0
-  binaries — see [the benchmark](docs/bashkir-roundtrip-bench.md)):
-  `zimdump dump` 3.5×, `zimrecreate` 35× at default settings and
-  **1.49× with ~2% smaller output at matched zstd level 19**;
-  `zimcheck -A` 8.27×, `zimcheck -R` 8.44×, `zimdump info` 2.73×.
-  Upstream zimwriterfs could not complete the same 153 k-file build at
-  any thread count (fd exhaustion); zimru's finishes in 9 s (zstd 3) /
-  209 s (zstd 19).
-- **Writer validated end-to-end on 8 diverse real ZIMs** (1.8 MB → 1.1 GB,
-  6 languages, 6 source projects). 8/8 round-trip with byte-perfect blob
-  content; on the 6 that are clean to begin with, both source and our
-  recreated output pass `upstream zimcheck -A`.
+  accept upstream `zim-tools` 3.8.0 flags.
+- **CLI parity with zim-tools 3.8.0 / libzim 9.8.2** — 12/12 cases on each
+  of 8 archives spanning Arabic (RTL), Bashkir (1.1 GB Cyrillic), English,
+  Chinese ×2, Tamil, Korean and Japanese.
+- **Faster than upstream on almost every comparable workload**, measured
+  ABBA against the current release (see [the benchmark](#head-to-head-benchmark-vs-upstream)):
+  `zimcheck -R` 8.4×, `zimcheck -A` 6.0×, `zimdump dump` 4.0×,
+  `zimdump info` 3.4×, `zimdump list` 1.8×, `zimcheck -C` 1.18×;
+  `zimrecreate` 1.15×–1.84× at matched compression with both sides building
+  search indexes. The exception is `zimcheck -I`, where upstream is faster
+  (0.74×) — open work, not a design choice.
+- **Content equivalence verified through real libzim**, not through zimru's
+  own reader: every one of 252 234 entries identical after a recreate.
+- **Writer validated end-to-end on real ZIMs** across 13 MB → 1.1 GB and
+  10 languages, with the rebuilt Xapian index answering upstream
+  `zimsearch` with the same top hit as libzim's original.
 
 ## Goals
 
@@ -279,11 +278,11 @@ drop-in replacements for the upstream `zim-tools` family:
 | binary        | upstream counterpart      | status                                                                |
 |---------------|---------------------------|-----------------------------------------------------------------------|
 | `zimru`       | (native, no upstream)     | Inspection / extraction / read-every-blob benchmark                   |
-| `zimcheck`    | `zim-tools/zimcheck`      | Full CLI parity (all flags) + JSON output. **8.27× faster than upstream on `-A`.** |
+| `zimcheck`    | `zim-tools/zimcheck`      | Full CLI parity (all flags) + JSON output. **6.0× faster than upstream on `-A`, 8.4× on `-R`.** |
 | `zimdump`     | `zim-tools/zimdump`       | `info` / `list` / `list --details` / `show` / `dump`. **2.73× faster on `info`.** |
 | `zimbench`    | `zim-tools/zimbench`      | `-n` / `-r` / `-d` flags. Upstream's random-URL phase crashes; ours runs to completion. |
 | `zimsplit`    | `zim-tools/zimsplit`      | byte-aligned split (concat reproduces original)                       |
-| `zimrecreate` | `zim-tools/zimrecreate`   | reads source cluster-grouped, writes new archive preserving per-cluster compression. Output passes upstream `zimcheck -A`. **35× faster than upstream at defaults, 1.49× at matched zstd 19 (with smaller output).** |
+| `zimrecreate` | `zim-tools/zimrecreate`   | reads source cluster-grouped, writes new archive preserving per-cluster compression. **1.15×–1.84× faster at matched compression**, both sides building search indexes. |
 | `zimwriterfs` | `zim-tools/zimwriterfs`   | packs an HTML directory tree into a ZIM: symlinks → redirects, content-sniffed mimetypes for extensionless files, mime-driven cluster compression. Completes 153 k-file builds upstream dies on (fd exhaustion). |
 
 ```sh
@@ -310,35 +309,43 @@ cargo build --release
     --creator=me --publisher=zimru ./html_dir out.zim
 ```
 
-## CLI parity vs upstream `zim-tools` 3.6.0 / `libzim` 9.3.0
+## CLI parity vs upstream `zim-tools` 3.8.0 / `libzim` 9.8.2
 
 `bench/parity.sh` runs the upstream tool and our binary on the same archive,
-normalizes version strings + elapsed-time, and diffs outputs. On three
-real-world ZIM files the harness reports **36/36 cases pass** (12 cases ×
-3 archives — small English mini, Chinese chemistry mini, and 1.1 GB Bashkir
-all-maxi):
+normalizes version strings + elapsed-time, and diffs outputs. This is a
+correctness harness, not a benchmark — no timing is involved. Across 8
+real-world ZIMs it reports **96/96 cases pass** (12 cases × 8 archives:
+Arabic, Bashkir 1.1 GB, English, Japanese, Korean, Tamil, and two Chinese):
 
 | case                    | matching mode    | result   |
 |-------------------------|------------------|----------|
-| `zimdump info`          | byte-for-byte    | ✓ 3/3    |
-| `zimdump list`          | byte-for-byte    | ✓ 3/3    |
-| `zimdump list --details`| byte-for-byte    | ✓ 3/3    |
-| `zimdump show --idx=N`  | byte-for-byte    | ✓ 3/3    |
-| `zimcheck -C`           | byte-for-byte    | ✓ 3/3    |
-| `zimcheck -I`           | byte-for-byte    | ✓ 3/3    |
-| `zimcheck -M`           | byte-for-byte    | ✓ 3/3    |
-| `zimcheck -F`           | byte-for-byte    | ✓ 3/3    |
-| `zimcheck -P`           | byte-for-byte    | ✓ 3/3    |
-| `zimcheck -L`           | byte-for-byte    | ✓ 3/3    |
-| `zimcheck -A`           | structural*      | ✓ 3/3    |
-| `zimcheck -A -J` (JSON) | structural*      | ✓ 3/3    |
+| `zimdump info`          | byte-for-byte    | ✓ 8/8    |
+| `zimdump list`          | byte-for-byte    | ✓ 8/8    |
+| `zimdump list --details`| byte-for-byte    | ✓ 8/8    |
+| `zimdump show --idx=N`  | byte-for-byte    | ✓ 8/8    |
+| `zimcheck -C`           | byte-for-byte    | ✓ 8/8    |
+| `zimcheck -I`           | byte-for-byte    | ✓ 8/8    |
+| `zimcheck -M`           | byte-for-byte    | ✓ 8/8    |
+| `zimcheck -F`           | byte-for-byte    | ✓ 8/8    |
+| `zimcheck -P`           | byte-for-byte    | ✓ 8/8    |
+| `zimcheck -L`           | byte-for-byte    | ✓ 8/8    |
+| `zimcheck -A`           | structural*      | ✓ 8/8    |
+| `zimcheck -A -J` (JSON) | structural*      | ✓ 8/8    |
 
-\* "Structural" means everything in the report matches except the order of
-items inside `[WARNING] Redundant data found:`, `[ERROR] Invalid internal
-links found:` and `[ERROR] Invalid external links found:` blocks. The set
-*counts* (e.g. `dangling=27/29 redundant=2/2 external=1/1` on Bashkir) are
-also checked. Order varies because libzim iterates clusters in a sequence
-we don't replicate.
+\* "Structural" means everything in the report matches except two blocks
+whose contents depend on libzim's internal iteration:
+
+- `[WARNING] Redundant Data:` lines — compared as a *set*, with the two
+  paths in each pair normalized, since which member prints first depends on
+  hash order.
+- `[ERROR] Internal URL: Dangling link(s) …` blocks — elided, with the
+  counts reported separately (e.g. `dangling=10/9` on Bashkir). Upstream's
+  HTML parser reports a scattered subset of the links actually present:
+  every extra zimru reports has been checked against the raw markup and is
+  a real `href`/`src` in a real tag pointing at a missing entry.
+
+Everything else, including the phase interleaving 3.8.0 introduced, is
+compared exactly.
 
 Tools we don't yet reach byte-for-byte parity on:
 
@@ -460,32 +467,18 @@ Illustration_48x48@1).
 
 ### Creation benchmark vs upstream
 
-`bench/recreate-bench.sh` times `zimru zimrecreate` against
-`upstream zimrecreate --withoutFTIndex --threads 1` (closest fair comparison
-since neither builds a fulltext index, both are single-threaded), and
-verifies both outputs pass `upstream zimcheck -A`:
+Measured by `bench/creation-bench.sh` — see
+[Head-to-head benchmark vs upstream](#write-side) for the current table
+against zim-tools 3.8.0. Summary: **1.15×–1.84×** faster at matched
+compression with both sides building search indexes, output sizes within
+±5%.
 
-| file                                | size | zimru     | upstream    | zimru ZIM | upstream ZIM | zimcheck (zimru / upstream) |
-|-------------------------------------|------|-----------|-------------|-----------|--------------|------------------------------|
-| `wikipedia_zh_chemistry_mini.zim`   | 14 MB| 0.24 s    | 12.57 s     | 7.0 MB    | 8.6 MB       | PASS / PASS                  |
-| `wikipedia_en_100_nopic.zim`        | 13 MB| 0.31 s    | 18.32 s     | 12 MB     | 11 MB        | PASS / PASS                  |
-| `freecodecamp_js.zim`               | 6.7 MB| 0.26 s   | 9.68 s      | 7.9 MB    | 6.7 MB       | PASS / PASS                  |
-| `vikidia_ca.zim`                    | 5.0 MB| 0.06 s   | 1.16 s      | 4.6 MB    | 4.7 MB       | PASS / PASS                  |
-| `wikipedia_en_100_mini.zim`         | 4.4 MB| 0.04 s   | 0.97 s      | 3.3 MB    | 4.1 MB       | PASS / PASS                  |
-| `wikiquote_af.zim`                  | 1.8 MB| 0.02 s   | 0.58 s      | 1.6 MB    | 1.6 MB       | PASS / PASS                  |
-
-Speedups range from **19× to 59×** vs upstream (`upstream / zimru` time).
-Both produce green `zimcheck -A` on every input. Output sizes are
-comparable (within ±25%, depending on which compression preset
-outperforms the source).
-
-At scale and at matched compression the gap is smaller but still real:
-on the 1.1 GB Bashkir Wikipedia, `zimru zimrecreate --compression-level
-19` finishes in **214.8 s vs upstream's 320.5 s (1.49×)** with ~2%
-smaller output, both running 4 threads — see
-[docs/bashkir-roundtrip-bench.md](docs/bashkir-roundtrip-bench.md) for
-the full methodology, including the dump → zimwriterfs round trip that
-upstream zimwriterfs cannot complete.
+Earlier revisions of this README reported 19×–59× here. That figure
+compared zimru at its own default (zstd 3, no index) against upstream at
+libzim's default (zstd 19, with a fulltext index) — it measured preset
+choice and workload, not implementation. Matching the compression level,
+the thread count and the set of indexes built is what the current harness
+does, and it is the only way the number means anything.
 
 ### `zimrecreate` validated across diverse real-world archives
 
@@ -521,28 +514,172 @@ recreated file passes upstream zimcheck's full sweep.
 
 ## Head-to-head benchmark vs upstream
 
-Reproduced via `bench/run.sh wikipedia_ba_all_maxi.zim` (1.1 GB Bashkir
-Wikipedia, 175 404 entries, 1 502 clusters, 3.2 GB of decompressed
-content). Hardware: shared linux container; results are warm-cache means of
-3–5 runs measured by `hyperfine`.
+Against **zim-tools 3.8.0 / libzim 9.8.2** (the current release), reproduced
+via `bench/toolset-bench.sh`. Hardware: shared 4-core linux container.
 
-| workload                                  | upstream (3.6.0)  | zimru          | speedup      |
-|-------------------------------------------|-------------------|----------------|--------------|
-| `zimcheck -C` (MD5 trailer only)          | 2.29 s            | 2.05 s         | **1.12×**    |
-| `zimcheck -R` (decompress + MD5 every blob) | 18.28 s         | 2.19 s         | **8.44×**    |
-| `zimcheck -A` (full sweep)                | 57.27 s           | 6.93 s         | **8.27×**    |
-| `zimdump info` (cold-style header parse)  | 4.3 ms            | 1.6 ms         | **2.73×**    |
-| `zimdump dump --redirect` (export 175 k files) | 19.1 s       | 4.2–5.5 s      | **~3.5–4.5×**|
-| `zimrecreate` (defaults)                  | 320.5 s (zstd 19) | 9.0 s (zstd 3) | **35×**      |
-| `zimrecreate --compression-level 19`      | 320.5 s           | 214.8 s        | **1.49×**    |
-| `zimru readall` (decompress only)         | n/a               | 4.20 s         | —            |
-| `zimbench` (n=1000)                       | ~~n/a~~ (crashes) | 1.95 s (full)  | —            |
+### Methodology
+
+The harness does **not** use hyperfine, which runs every repetition of A and
+then every repetition of B. Several of these workloads write (`zimdump dump`
+extracts 175 k files) or stream a gigabyte through page cache, so running one
+tool's repetitions back-to-back hands the second command a machine the first
+one warmed or dirtied — and the effect is worth more than some of the
+differences being measured.
+
+Instead each pair runs **ABBA** — zimru, upstream, upstream, zimru — with
+each tool keeping its best, so both get the same number of first- and
+last-position runs. Before every run the previous output is removed and the
+archive is re-read into page cache; afterwards the run's writes are synced
+outside the timed region. Every individual run time is recorded, and the
+spread is small: on the 1.1 GB archive `zimcheck -A` came in at 9.894 /
+9.882 s for zimru against 59.327 / 59.097 s for upstream.
+
+### Read side
+
+1.1 GB Bashkir Wikipedia (175 404 entries, 3.2 GB decompressed), plus two
+CJK archives to check the pattern holds across scripts:
+
+| workload                                     | zimru   | upstream | speedup   |
+|----------------------------------------------|---------|----------|-----------|
+| `zimcheck -C` (MD5 trailer only)             | 2.011 s | 2.367 s  | **1.18×** |
+| `zimcheck -I` (structure + every cluster)    | 3.831 s | 2.842 s  | 0.74×     |
+| `zimcheck -R` (decompress + MD5 every blob)  | 2.199 s | 18.494 s | **8.41×** |
+| `zimcheck -A` (full sweep)                   | 9.882 s | 59.097 s | **5.98×** |
+| `zimdump info`                               | 0.005 s | 0.017 s  | **3.40×** |
+| `zimdump list`                               | 0.081 s | 0.149 s  | **1.84×** |
+| `zimdump dump --redirect` (export 175 k files) | 6.469 s | 25.767 s | **3.98×** |
+
+| workload      | `ko_top_mini` 154 MB | `zh_chemistry_maxi` 128 MB |
+|---------------|----------------------|----------------------------|
+| `zimcheck -C` | 1.26×                | 1.18×                      |
+| `zimcheck -I` | 1.20×                | 0.82×                      |
+| `zimcheck -R` | **9.80×**            | **8.94×**                  |
+| `zimcheck -A` | **5.48×**            | **4.03×**                  |
+| `zimdump info`| **3.40×**            | **3.60×**                  |
+| `zimdump list`| **1.93×**            | **2.64×**                  |
+| `zimdump dump`| upstream fails       | 1.11×                      |
+
+Three results deserve more than a number:
+
+- **`zimcheck -I` is the one workload where upstream is faster** (0.74× on
+  Bashkir, 0.82× on the Chinese archive; we are ahead on the Korean one).
+  Both tools do detect real corruption — an archive with 32 bytes flipped
+  inside a zstd cluster payload and a re-stamped MD5 trailer, so that only
+  cluster decoding can catch it, is caught by both. The difference is what
+  happens next: zimru reports `[ERROR] ZIM file's low level structure is
+  invalid: cluster decompression failed` followed by
+  `Overall Test Status: Fail` and exits 1, while upstream prints a bare
+  `Data corruption detected` and aborts before emitting a report, exit 2.
+  Closing this gap is open work, not a design decision.
+
+- **`zimdump dump` fails outright on the Korean archive** — upstream exits
+  255 after 0.098 s with `Error creating symlink from …/%/%`, because that
+  archive contains entries named `%` and `$`. zimru completes the export in
+  29 s. This is why the harness prints both tools' exit codes: a crash is
+  otherwise indistinguishable from a very fast run.
+
+- **`zimbench` is not comparable and is deliberately not scored.** Upstream
+  collects its URL lists and then exits **0** without running either read
+  phase, reporting no throughput; zimru runs all three phases (linear
+  access 1 000 reads / 84 MB / 42.7 MB/s, random access 1 000 reads / 84 MB
+  / 45.2 MB/s). Taken at face value the numbers say upstream is 190×
+  faster, and the exit status does not contradict it. It is doing none of
+  the work.
+
+### Write side
+
+`bench/creation-bench.sh`, same ABBA scheme, matched compression (upstream's
+`zimrecreate` exposes no knobs and uses libzim's zstd 19, so zimru is driven
+at `--compression zstd --compression-level 19`), same thread count, both
+tools spawning their indexers — zimru the `xapianbuilder` helper, upstream
+its in-process Xapian.
+
+Two modes, both producing the **same entry set**: `index` builds fulltext +
+title on both sides; `noft` passes `-j` to both, which drops the fulltext
+index and keeps the title index.
+
+| archive                     | size   | mode  | zimru   | upstream | speedup   | size vs upstream |
+|-----------------------------|--------|-------|---------|----------|-----------|------------------|
+| `wikipedia_ar_chemistry_mini` | 13 MB  | index | 3.82 s  | 5.14 s   | **1.35×** | −3.7%            |
+|                             |        | noft  | 3.13 s  | 3.74 s   | **1.19×** | +0.2%            |
+| `wikipedia_zh_chemistry_mini` | 14 MB  | index | 3.82 s  | 7.04 s   | **1.84×** | −1.9%            |
+|                             |        | noft  | 2.93 s  | 3.74 s   | **1.28×** | −3.8%            |
+| `wikipedia_zh_chemistry_maxi` | 128 MB | index | 20.47 s | 28.52 s  | **1.39×** | −0.0%            |
+|                             |        | noft  | 14.55 s | 16.92 s  | **1.16×** | −0.2%            |
+| `wikipedia_ta_top_mini`     | 134 MB | index | 90.89 s | 108.17 s | **1.19×** | −2.1%            |
+|                             |        | noft  | 78.87 s | 96.95 s  | **1.23×** | +0.1%            |
+| `wikipedia_ko_top_mini`     | 154 MB | index | 76.53 s | 112.10 s | **1.46×** | −3.4%            |
+|                             |        | noft  | 50.31 s | 79.16 s  | **1.57×** | −4.7%            |
+| `wikipedia_ja_top_mini`     | 179 MB | index | 90.11 s | 132.54 s | **1.47×** | −3.3%            |
+|                             |        | noft  | 61.37 s | 89.23 s  | **1.45×** | −4.9%            |
+| `wikipedia_en_100`          | 318 MB | index | 9.13 s  | 10.91 s  | **1.19×** | +0.0%            |
+|                             |        | noft  | 8.03 s  | 9.23 s   | **1.15×** | +0.0%            |
+| `wikipedia_hi_all_mini`     | 378 MB | index | 329.6 s | 393.1 s  | **1.19×** | —                |
+
+zimru is faster on every row, by 1.15×–1.84×. The margin tracks how much
+indexing the archive needs: widest on CJK, narrowest on `en_100`, which is
+mostly media with a 3.2 MB index.
+
+**Output sizes land within ±5%, and where zimru is smaller it is the index
+that is smaller, not the content compression.** Content clusters agree
+within 0.2% — which is what should happen when both tools run zstd 19 over
+identical bytes. Earlier revisions of this table claimed 25–42% size wins;
+those were a measurement error, described below.
+
+Indic archives are disproportionately expensive on **both** sides (Tamil
+takes 91 s for 134 MB against English's 9 s for 318 MB). That is a property
+of the shared Xapian accent/stemming pipeline, not of either writer.
+
+### Content equivalence
+
+Being smaller is only interesting if the archive is still the same archive.
+`bench/content-verify.sh` diffs per-entry content manifests between the
+source, zimru's recreate and upstream's, reading every entry through **real
+libzim** (zimru-misc's `zim-manifest`) rather than through zimru's own
+reader — checking our writer with our reader would only prove the two agree
+with each other.
+
+| archive                       | entries | identical | changed | missing | extra |
+|-------------------------------|---------|-----------|---------|---------|-------|
+| `wikipedia_zh_chemistry_mini` | 12 692  | 12 692    | 0       | 0       | 0     |
+| `wikipedia_ko_top_mini`       | 252 234 | 252 234   | 0       | 0       | 0     |
+
+Both writers, both archives: same path set, same redirect graph, same MD5
+per item.
+
+The Korean archive is exactly the case where the obvious verification
+approach fails silently. Extracting with `zimdump dump` and hashing the tree
+routes every entry through a filesystem path, and upstream zimdump aborts on
+the `%` entries after **24 of 252 234** — while still exiting 0.
+
+### Two measurement errors found and fixed
+
+Both inflated zimru's results, and both are recorded here rather than
+quietly corrected, because the wrong numbers circulated first.
+
+1. **Ordering bias.** The harness ran zimru then upstream, warming the
+   source once before the pair. zimru's output writes — up to a gigabyte —
+   evicted the warmed source, so upstream re-read from disk what zimru got
+   from cache. Worth a few percent, in zimru's favour, on exactly the
+   comparison the benchmark existed to make. Fixed by the ABBA scheme above.
+
+2. **`-j` meant different things to the two tools.** Upstream's
+   `--withoutFTIndex` drops only the fulltext index and still builds
+   `X/title/xapian`; zimru's dropped both. The old "noindex" mode therefore
+   compared an archive that had a title index against one that did not, and
+   scored the missing index as a compression win — **−42.4% on Korean,
+   where the honest figure is −4.7%**. That was also a real CLI-parity bug:
+   `zimru zimrecreate -j` produced an archive missing an entry upstream's
+   `-j` output contains. `-j` now matches upstream; `--without-indexes`
+   drops both.
 
 ## Why zimru is faster
 
-Four independent optimizations, each measurable on its own. The numbers
-below are from the 1.1 GB Bashkir Wikipedia test file, warm-cache, reported
-by `hyperfine` (mean of 3–5 runs).
+Four independent optimizations, each measurable on its own. Figures are
+from the 1.1 GB Bashkir Wikipedia test file. Where a row compares against
+upstream it is the ABBA best-of described above; rows comparing zimru
+against an earlier zimru are historical, from when that change landed, and
+are labelled as such.
 
 ### 1. `md-5` with the `asm` feature (beats OpenSSL + `md5sum`)
 
@@ -604,7 +741,7 @@ stays **deterministic** and still matches upstream byte-for-byte on all
 | build                            | `-A` on 1.1 GB   | speedup vs upstream |
 |----------------------------------|------------------|---------------------|
 | single-pass, single-thread       | ~12 s (estimate) | ~4.8×               |
-| **single-pass, rayon (8 cores)** | **6.93 s**       | **8.27×**           |
+| **single-pass, rayon (4 cores)** | **9.88 s**       | **5.98×**           |
 | upstream                         | 57.27 s          | 1.00×               |
 
 The rayon pass saturates user CPU time (20 s of user time across
@@ -670,20 +807,32 @@ MD5-hashes every blob in 11.3 s. The pure decompression alone is 4.2 s —
 ```sh
 # Install upstream tools
 curl -fLo /tmp/zt.tar.gz \
-    https://download.openzim.org/release/zim-tools/zim-tools_linux-x86_64-3.6.0.tar.gz
+    https://download.openzim.org/release/zim-tools/zim-tools_linux-x86_64-3.8.0.tar.gz
 sudo tar xf /tmp/zt.tar.gz -C /opt
-sudo apt-get install -y hyperfine
 
 # Get a 1 GB+ ZIM
 mkdir -p zim-cache && cd zim-cache
-curl -fLO https://download.kiwix.org/zim/wikipedia/wikipedia_ba_all_maxi_2026-04.zim
-mv wikipedia_ba_all_maxi_2026-04.zim wikipedia_ba_all_maxi.zim
+curl -fLO https://download.kiwix.org/zim/wikipedia/wikipedia_ba_all_maxi_2026-07.zim
 cd ..
 
 cargo build --release
-./bench/run.sh   zim-cache/wikipedia_ba_all_maxi.zim   # benchmark
-./bench/parity.sh zim-cache/wikipedia_ba_all_maxi.zim  # CLI parity diff
+
+# ABBA read-side + tool-by-tool comparison
+./bench/toolset-bench.sh  zim-cache/wikipedia_ba_all_maxi_2026-07.zim
+
+# ABBA creation comparison (needs the xapianbuilder helper on $PATH or
+# $XAPIANBUILDER for the index-building modes)
+./bench/creation-bench.sh zim-cache/wikipedia_ba_all_maxi_2026-07.zim
+
+# Is the output still the same archive? (needs zimru-misc's zim-manifest)
+./bench/content-verify.sh zim-cache/wikipedia_ba_all_maxi_2026-07.zim
+
+# CLI parity diff — correctness, not timing
+./bench/parity.sh        zim-cache/wikipedia_ba_all_maxi_2026-07.zim
 ```
+
+Every harness writes each individual run time to a detail log
+(`$OUT/run-times.log`), so the spread behind a "best of" stays checkable.
 
 ## Tests
 
@@ -693,7 +842,7 @@ Run the full suite:
 cargo test --release
 ```
 
-Test breakdown (**81 tests + 7 doctests pass**, plus C-ABI smoke
+Test breakdown (**93 tests pass**, plus C-ABI smoke
 binaries under the `cffi` feature):
 
 - **Unit tests** (`src/*.rs`, 20 tests) — synthetic byte-level round-trips
