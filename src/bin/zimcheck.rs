@@ -536,14 +536,14 @@ fn run_checks(file: &str, arc: &Archive, o: &Opts) -> Report {
     // phase's findings inline before moving to the next header.
     if need_any_content {
         report.add_info("Verifying Articles' content...".to_string());
-        let findings = scan_content(
-            arc,
+        let findings = scan_content(arc, need_empty, need_redundant, need_url_int, need_url_ext);
+        emit_per_entry_findings(
+            &findings,
+            &mut report,
             need_empty,
-            need_redundant,
             need_url_int,
             need_url_ext,
         );
-        emit_per_entry_findings(&findings, &mut report, need_empty, need_url_int, need_url_ext);
         if need_redundant {
             report.add_info("Searching for redundant articles...".to_string());
             report.add_info_body("  Verifying Similar Articles for redundancies...".to_string());
@@ -721,6 +721,7 @@ fn check_main_page(arc: &Archive, report: &mut Report) {
 }
 
 /// A single article's findings from the combined content scan.
+#[derive(Default)]
 struct PerEntryFinding {
     url_index: u32,
     path: String,
@@ -734,20 +735,6 @@ struct PerEntryFinding {
     absolute: Vec<String>,
     /// Absolute `http(s)` `src=` URLs (external dependencies).
     external: Vec<String>,
-}
-
-impl Default for PerEntryFinding {
-    fn default() -> Self {
-        Self {
-            url_index: 0,
-            path: String::new(),
-            is_empty: false,
-            md5: None,
-            dangling: Vec::new(),
-            absolute: Vec::new(),
-            external: Vec::new(),
-        }
-    }
 }
 
 /// One pass over every C-namespace article that runs all of empty / redundant
@@ -887,7 +874,7 @@ fn classify_internal_link(arc: &Archive, base: &str, target: &str, f: &mut PerEn
         return;
     }
     let normalized = normalize_link_target(target);
-    let stripped = normalized.strip_prefix("./").unwrap_or(&normalized);
+    let stripped = normalized.strip_prefix("./").unwrap_or(normalized);
     if stripped.is_empty() {
         return;
     }
@@ -1045,7 +1032,6 @@ fn emit_redundant(findings: &[PerEntryFinding], report: &mut Report) {
     }
 }
 
-
 fn check_redirect_loops(arc: &Archive, report: &mut Report) {
     for entry in arc.iter_by_path() {
         let Ok(e) = entry else { continue };
@@ -1130,7 +1116,9 @@ fn extract_link_targets(html: &str) -> Vec<(&'static str, &str)> {
     let mut i = 0usize;
     while i < n {
         // ---- text: skip to the next tag open ----
-        let Some(rel) = html[i..].find('<') else { break };
+        let Some(rel) = html[i..].find('<') else {
+            break;
+        };
         i += rel + 1;
         if html[i..].starts_with("!--") {
             match html[i..].find("-->") {

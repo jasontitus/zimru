@@ -448,7 +448,9 @@ pub unsafe extern "C" fn zimru_archive_illustrations(
 pub unsafe extern "C" fn zimru_illustrations_free(ptr: *mut zimru_illustration_t, count: usize) {
     if !ptr.is_null() && count > 0 {
         // Mirror of the `Box<[_]>` the allocation was created as.
-        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, count)));
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+            ptr, count,
+        )));
     }
 }
 

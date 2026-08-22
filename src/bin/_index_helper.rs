@@ -279,10 +279,7 @@ impl IndexHelper {
     /// entries (title DB indexes everything in namespace C, regardless
     /// of mimetype).
     pub fn feed_title(&mut self, path: &str, title: &str, target_path: &str) {
-        let State::Active {
-            title: Some(t), ..
-        } = &mut self.state
-        else {
+        let State::Active { title: Some(t), .. } = &mut self.state else {
             return;
         };
         let buf = encode_title_doc(path, title, target_path);
@@ -327,8 +324,7 @@ impl IndexHelper {
     pub fn finish(mut self, verbose: bool) -> Vec<IndexBlob> {
         // Take the state out so the `Drop` impl (which kills children
         // on early-error paths) sees `Disabled` and no-ops.
-        let State::Active { fulltext, title } =
-            std::mem::replace(&mut self.state, State::Disabled)
+        let State::Active { fulltext, title } = std::mem::replace(&mut self.state, State::Disabled)
         else {
             return Vec::new();
         };

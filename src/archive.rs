@@ -280,7 +280,10 @@ impl Archive {
         // crafted archive. An unchecked `pos + 16` wraps for pos near
         // usize::MAX, the bounds test then passes, and the slice below
         // panics. Checked arithmetic turns that into a clean Truncated.
-        if pos.checked_add(16).is_none_or(|end| end > self.core.mmap.len()) {
+        if pos
+            .checked_add(16)
+            .is_none_or(|end| end > self.core.mmap.len())
+        {
             return Err(Error::Truncated(pos as u64 + 16));
         }
         let mut out = [0u8; 16];
@@ -292,7 +295,11 @@ impl Archive {
     pub fn check(&self) -> Result<bool> {
         use md5::{Digest, Md5};
         let pos = self.core.header.checksum_pos as usize;
-        if pos == 0 || pos.checked_add(16).is_none_or(|end| end > self.core.mmap.len()) {
+        if pos == 0
+            || pos
+                .checked_add(16)
+                .is_none_or(|end| end > self.core.mmap.len())
+        {
             return Err(Error::NoChecksum);
         }
         let mut h = Md5::new();
@@ -373,11 +380,13 @@ impl Archive {
             if !bytes.len().is_multiple_of(4) {
                 return Err(Error::Truncated(bytes.len() as u64));
             }
-            let mut out = Vec::with_capacity(bytes.len() / 4);
-            for chunk in bytes.chunks_exact(4) {
-                out.push(u32::from_le_bytes(chunk.try_into().unwrap()));
-            }
-            out.into()
+            // `as_chunks::<4>` rather than `chunks_exact(4)`: the array
+            // length is in the type, so `from_le_bytes` takes the chunk
+            // directly and the infallible-but-unprovable `try_into().unwrap()`
+            // goes away. The length was just checked to be a multiple of 4,
+            // so the remainder is empty.
+            let (quads, _rest) = bytes.as_chunks::<4>();
+            quads.iter().copied().map(u32::from_le_bytes).collect()
         };
         let _ = self.core.title_listing.set(v.clone());
         Ok(v)
