@@ -131,8 +131,8 @@ fn run(file: &str, prefix: &str, size: u64, force: bool) -> Result<(), Error> {
     let mut input = File::open(file)?;
     let mut buf = vec![0u8; READ_BUF];
     let mut written = 0u64;
-    let mut suffix = *b"aa";
-    let mut part_path = format!("{prefix}{}{}", suffix[0] as char, suffix[1] as char);
+    let mut suffix: Vec<u8> = b"aa".to_vec();
+    let mut part_path = format!("{prefix}{}", String::from_utf8_lossy(&suffix));
     eprintln!("opening new file {part_path}");
     let mut part = OpenOptions::new()
         .write(true)
@@ -147,7 +147,7 @@ fn run(file: &str, prefix: &str, size: u64, force: bool) -> Result<(), Error> {
             // rotate
             part.flush()?;
             advance_suffix(&mut suffix);
-            part_path = format!("{prefix}{}{}", suffix[0] as char, suffix[1] as char);
+            part_path = format!("{prefix}{}", String::from_utf8_lossy(&suffix));
             eprintln!("opening new file {part_path}");
             part = OpenOptions::new()
                 .write(true)
@@ -171,11 +171,58 @@ fn run(file: &str, prefix: &str, size: u64, force: bool) -> Result<(), Error> {
     Ok(())
 }
 
-fn advance_suffix(s: &mut [u8; 2]) {
-    if s[1] < b'z' {
-        s[1] += 1;
-    } else {
-        s[1] = b'a';
-        s[0] += 1;
+/// Advance an alphabetic part suffix: `aa` → `ab` → … → `az` → `ba` → …
+/// `zz` → `aaa` → …
+///
+/// The suffix grows rather than wrapping. The previous fixed `[u8; 2]`
+/// incremented the leading byte unconditionally, so the 27th part was named
+/// `{a` (`z` + 1) and every part past `zz` walked further out of the
+/// alphabet — filenames no concatenating tool recognises, produced silently.
+/// A 2 GB `--size` on a 60 GB archive needs 30 parts, which is well inside
+/// what this is asked to do.
+fn advance_suffix(s: &mut Vec<u8>) {
+    for i in (0..s.len()).rev() {
+        if s[i] < b'z' {
+            s[i] += 1;
+            return;
+        }
+        s[i] = b'a';
+    }
+    // Every position rolled over: widen (`zz` → `aaa`).
+    s.insert(0, b'a');
+}
+
+#[cfg(test)]
+mod suffix_tests {
+    use super::advance_suffix;
+
+    fn seq(n: usize) -> Vec<String> {
+        let mut s: Vec<u8> = b"aa".to_vec();
+        let mut out = vec![String::from_utf8(s.clone()).unwrap()];
+        for _ in 1..n {
+            advance_suffix(&mut s);
+            out.push(String::from_utf8(s.clone()).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn suffix_walks_the_alphabet_and_widens() {
+        let v = seq(28);
+        assert_eq!(&v[..3], ["aa", "ab", "ac"]);
+        // The old fixed-width version produced "{a" here.
+        assert_eq!(v[25], "az");
+        assert_eq!(v[26], "ba");
+        assert_eq!(v[27], "bb");
+        // Every part name stays alphabetic, however many there are.
+        assert!(v.iter().all(|p| p.bytes().all(|b| b.is_ascii_lowercase())));
+    }
+
+    #[test]
+    fn suffix_widens_past_zz() {
+        let v = seq(26 * 26 + 2);
+        assert_eq!(v[26 * 26 - 1], "zz");
+        assert_eq!(v[26 * 26], "aaa");
+        assert_eq!(v[26 * 26 + 1], "aab");
     }
 }

@@ -276,7 +276,11 @@ impl Archive {
             return Err(Error::NoChecksum);
         }
         let pos = self.core.header.checksum_pos as usize;
-        if pos + 16 > self.core.mmap.len() {
+        // `pos` is the header's checksum_pos, i.e. attacker-controlled in a
+        // crafted archive. An unchecked `pos + 16` wraps for pos near
+        // usize::MAX, the bounds test then passes, and the slice below
+        // panics. Checked arithmetic turns that into a clean Truncated.
+        if pos.checked_add(16).is_none_or(|end| end > self.core.mmap.len()) {
             return Err(Error::Truncated(pos as u64 + 16));
         }
         let mut out = [0u8; 16];
@@ -288,7 +292,7 @@ impl Archive {
     pub fn check(&self) -> Result<bool> {
         use md5::{Digest, Md5};
         let pos = self.core.header.checksum_pos as usize;
-        if pos == 0 || pos + 16 > self.core.mmap.len() {
+        if pos == 0 || pos.checked_add(16).is_none_or(|end| end > self.core.mmap.len()) {
             return Err(Error::NoChecksum);
         }
         let mut h = Md5::new();
@@ -344,9 +348,17 @@ impl Archive {
         let v: Arc<[u32]> = if self.core.header.title_ptr_pos != u64::MAX {
             let n = self.core.header.entry_count as usize;
             let base = self.core.header.title_ptr_pos as usize;
+            // `base` (title_ptr_pos) and `n` (entry_count) both come from
+            // the header. `base + i * 4` unchecked wraps on a crafted pair,
+            // and the read then lands at an arbitrary in-bounds offset —
+            // silently returning the wrong table rather than erroring.
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
-                out.push(raw::u32_at(&self.core.mmap, base + i * 4)?);
+                let off = i
+                    .checked_mul(4)
+                    .and_then(|delta| base.checked_add(delta))
+                    .ok_or(Error::Truncated(base as u64))?;
+                out.push(raw::u32_at(&self.core.mmap, off)?);
             }
             out.into()
         } else {

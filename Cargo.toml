@@ -32,9 +32,9 @@ path = "src/lib.rs"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 # Each [[bin]] sets `test = false` so `cargo test` doesn't compile a
-# zero-test harness for it (we keep all integration tests under `tests/`,
-# which shell out to the built binaries; no `#[test]` lives inside any
-# `src/bin/*.rs`).
+# zero-test harness for it — integration tests live under `tests/` and shell
+# out to the built binaries. The exception is `zimsplit`, which does carry
+# `#[test]` fns for its part-suffix sequence.
 
 [[bin]]
 name = "zimru"
@@ -59,7 +59,9 @@ test = false
 [[bin]]
 name = "zimsplit"
 path = "src/bin/zimsplit.rs"
-test = false
+# Unlike the other bins this one carries unit tests (the part-suffix
+# sequence), so it needs a harness.
+test = true
 
 [[bin]]
 name = "zimrecreate"

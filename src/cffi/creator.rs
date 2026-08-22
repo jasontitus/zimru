@@ -268,7 +268,14 @@ pub unsafe extern "C" fn zimru_creator_add_item(
     } else {
         Item::new(path_str, title_str, mime_str, bytes)
     };
-    (*inner).add_item(item);
+    // try_add_item, not add_item: in streaming mode this does real work and
+    // can fail, and add_item reports failure by panicking — which across an
+    // `extern "C"` boundary is undefined behaviour rather than an error the
+    // caller can see. Map it onto the documented `false` + `*err` contract.
+    if let Err(e) = (*inner).try_add_item(item) {
+        set_err(err, e);
+        return false;
+    }
     true
 }
 
@@ -319,9 +326,12 @@ pub unsafe extern "C" fn zimru_creator_add_item_in_namespace(
     if inner.is_null() {
         return false;
     }
-    (*inner).add_item(Item::in_namespace(
+    if let Err(e) = (*inner).try_add_item(Item::in_namespace(
         namespace, url_str, title_str, mime_str, bytes,
-    ));
+    )) {
+        set_err(err, e);
+        return false;
+    }
     true
 }
 
