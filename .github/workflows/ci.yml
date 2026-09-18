@@ -124,7 +124,7 @@ jobs:
           sha256sum --check <<'EOF'
           9aa68a83cf9a7d9449724b6c722f797e2a307e290a34b083df717028cd42330d  zim-cache/wikipedia_en_ray-charles_mini.zim
           59eb2b233b1fcdd7dfd44679a519501dbd7b77fbee80ac46ad90a57899459e62  zim-cache/wikipedia_en_ray-charles_nopic.zim
-          212bf3f09e3fa4c02886d8a2147f4a58682a7111d28645e6e1d084cc1a3fe620  zim-cache/wikipedia_zh_chemistry_mini.zim
+          47849c47e10929b55c954a15691191fa1d5ce07570d787e93d9a1d4cfba3933b  zim-cache/wikipedia_zh_chemistry_mini.zim
           EOF
       - name: cargo test (real archives, fixtures required)
         run: cargo test --release --test real_files -- --nocapture

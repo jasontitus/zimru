@@ -210,5 +210,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it remain `O_NOFOLLOW`.
 - Bench harnesses: commands are argv vectors / `printf %q`-escaped, and
   scratch directories default to `mktemp -d`.
+- `zimdump dump`: without `--ns`, modern archives dump only the `C`
+  namespace (as `list`/`info` already did and as upstream 3.8.0 does), so
+  `M/Title` no longer flattens onto `C/Title`; legacy archives still dump
+  every namespace. `dump_errors.log` is written only when an entry failed.
+  Verified on Linux against official zim-tools 3.8.0: dump trees identical
+  on all three fixtures.
 
 [Unreleased]: https://github.com/jasontitus/zimru/compare/main...HEAD

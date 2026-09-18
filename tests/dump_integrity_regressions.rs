@@ -185,7 +185,9 @@ fn extraction_never_follows_existing_parent_final_or_log_links() {
         fs::read(root.join("_exceptions/parent%2fpage")).unwrap(),
         b"payload:parent/page"
     );
-    assert!(!fs::symlink_metadata(root.join("dump_errors.log"))
+    // A clean dump writes no log, and never writes through the planted
+    // link: it is still a symlink and the sentinel above is unchanged.
+    assert!(fs::symlink_metadata(root.join("dump_errors.log"))
         .unwrap()
         .file_type()
         .is_symlink());

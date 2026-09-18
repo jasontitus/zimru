@@ -487,7 +487,14 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
         .clone()
         .ok_or_else(|| io_err("dump requires --dir=DIR"))?;
     let root = DumpRoot::open(&dir)?;
-    let target_ns = opts.ns;
+    // Like `list`/`info`, dump only the content namespace by default on
+    // modern archives (matches upstream zimdump 3.8.0, verified black-box);
+    // otherwise `M/Title` and `C/Title` would flatten onto one path.
+    // Legacy archives spread content over `A`/`I`/`-`, so there the
+    // default stays "every namespace" and `--ns` narrows it.
+    let target_ns = opts
+        .ns
+        .or_else(|| arc.header().uses_new_namespaces().then_some(b'C'));
 
     // Filesystem path collisions are expected in real archives: an
     // entry `Foo` (a file) can coexist with `Foo/bar` (which needs
@@ -669,9 +676,13 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
         log.push_str(line);
         log.push('\n');
     }
-    // The log is untrusted filesystem output too: never open it by an
-    // absolute path, follow an existing link, or suppress a write failure.
-    root.write(std::path::Path::new("dump_errors.log"), log.as_bytes())?;
+    // Only written when something failed (a clean dump leaves no log, like
+    // upstream). The log is untrusted filesystem output too: never open it
+    // by an absolute path, follow an existing link, or suppress a write
+    // failure.
+    if !log.is_empty() {
+        root.write(std::path::Path::new("dump_errors.log"), log.as_bytes())?;
+    }
     if errors.into_inner() > 0 {
         Ok(ExitCode::from(2))
     } else {
