@@ -69,7 +69,7 @@ pub unsafe extern "C" fn zimru_item_namespace(it: *const zimru_item_t) -> u8 {
 }
 
 /// Cluster index this item's bytes live in. Combine with
-/// [`zimru_archive_cluster_offset`] to find where the cluster starts
+/// [`crate::cffi::archive::zimru_archive_cluster_offset`] to find where the cluster starts
 /// in the file, or with [`zimru_item_blob_index`] +
 /// [`zimru_item_direct_access`] to address the blob within the
 /// cluster. Returns `0` on a NULL item — callers that care must not

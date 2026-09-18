@@ -1,5 +1,10 @@
 # Shim-side wiring for the writer C ABI (zimru round 4)
 
+> **Historical note.** This document describes an earlier revision and its
+> measurements or plans at the time of writing. It is not a statement of
+> current behavior, support or open bugs; for those see the README
+> compatibility matrix, the generated API docs and CHANGELOG.md.
+
 zimru round 4 (`claude/libzim-shim-work-d3Rh4`, commit `6388b8a`) ships
 the writer C ABI surface that `docs/SHIM_WORK.md` "Writer-side gap"
 asked for. With this, the shim's `src/writer/creator.cpp` no longer

@@ -150,9 +150,8 @@ struct ArchiveCore {
     file_len: u64,
     cluster_cache: Mutex<ClusterByteCache>,
     /// Cached title-order listing: dirent indices sorted by (namespace, title).
-    /// In legacy archives this comes from `header.title_ptr_pos`; in modern
-    /// archives (v6.2+) it's stored at `X/listing/titleOrdered/v1` and only
-    /// covers C-namespace entries.
+    /// Prefer the modern front-article subset at `X/listing/titleOrdered/v1`;
+    /// otherwise use the full header/v0 table.
     title_listing: OnceLock<Arc<[u32]>>,
     /// Cached `(article_count, media_count)` for the content namespace,
     /// computed on first request via [`Archive::article_and_media_counts`].
@@ -275,19 +274,16 @@ impl Archive {
         if !self.has_checksum() {
             return Err(Error::NoChecksum);
         }
-        let pos = self.core.header.checksum_pos as usize;
-        // `pos` is the header's checksum_pos, i.e. attacker-controlled in a
-        // crafted archive. An unchecked `pos + 16` wraps for pos near
-        // usize::MAX, the bounds test then passes, and the slice below
-        // panics. Checked arithmetic turns that into a clean Truncated.
-        if pos
-            .checked_add(16)
-            .is_none_or(|end| end > self.core.mmap.len())
-        {
-            return Err(Error::Truncated(pos as u64 + 16));
-        }
+        let offset = self.core.header.checksum_pos;
+        let pos = usize::try_from(offset).map_err(|_| Error::Truncated(offset))?;
+        let end = pos.checked_add(16).ok_or(Error::Truncated(offset))?;
+        let bytes = self
+            .core
+            .mmap
+            .get(pos..end)
+            .ok_or(Error::Truncated(offset))?;
         let mut out = [0u8; 16];
-        out.copy_from_slice(&self.core.mmap[pos..pos + 16]);
+        out.copy_from_slice(bytes);
         Ok(out)
     }
 
@@ -336,65 +332,76 @@ impl Archive {
         self.entry_by_url_index(url_index)
     }
 
-    /// Number of entries in the title-order listing. In modern archives this
-    /// is typically *less* than [`Archive::entry_count`] because only the
-    /// content (C) namespace is indexed by title.
+    /// Number of entries in the title-order listing. A modern v1 listing
+    /// contains only the selected front articles, not all content or media.
     pub fn title_count(&self) -> Result<u32> {
         Ok(self.title_listing()?.len() as u32)
     }
 
     /// Returns the title-order listing as dirent indices.
     ///
-    /// - Legacy archives: read from the in-header u32 array at `title_ptr_pos`.
-    /// - Modern archives (v6.2+ where `title_ptr_pos == u64::MAX`): read from
-    ///   the `X/listing/titleOrdered/v1` entry as a packed u32 LE array.
+    /// Modern archives prefer `X/listing/titleOrdered/v1`, the selected
+    /// front-article subset, even when a full header title table also exists.
+    /// Otherwise the full header table or older v0 listing is used.
     pub fn title_listing(&self) -> Result<Arc<[u32]>> {
         if let Some(cached) = self.core.title_listing.get() {
             return Ok(cached.clone());
         }
-        let v: Arc<[u32]> = if self.core.header.title_ptr_pos != u64::MAX {
-            let n = self.core.header.entry_count as usize;
-            let base = self.core.header.title_ptr_pos as usize;
-            // `base` (title_ptr_pos) and `n` (entry_count) both come from
-            // the header. `base + i * 4` unchecked wraps on a crafted pair,
-            // and the read then lands at an arbitrary in-bounds offset —
-            // silently returning the wrong table rather than erroring.
-            let mut out = Vec::with_capacity(n);
-            for i in 0..n {
-                let off = i
-                    .checked_mul(4)
-                    .and_then(|delta| base.checked_add(delta))
-                    .ok_or(Error::Truncated(base as u64))?;
-                out.push(raw::u32_at(&self.core.mmap, off)?);
-            }
-            out.into()
+        let v = if self.core.header.uses_new_namespaces() {
+            self.named_title_listing("listing/titleOrdered/v1")?
         } else {
-            // Try v1 first (current), then v0 (older modern files).
-            let entry = self
-                .entry_by_ns_path(NS_INDEX, "listing/titleOrdered/v1")
-                .or_else(|_| self.entry_by_ns_path(NS_INDEX, "listing/titleOrdered/v0"))
-                .or_else(|_| self.entry_by_ns_path(NS_INDEX, "listing/titleOrdered"))?;
-            let item = entry.get_item(true)?;
-            let blob = item.get_data()?;
-            let bytes = blob.data();
-            if !bytes.len().is_multiple_of(4) {
-                return Err(Error::Truncated(bytes.len() as u64));
-            }
-            // `as_chunks::<4>` rather than `chunks_exact(4)`: the array
-            // length is in the type, so `from_le_bytes` takes the chunk
-            // directly and the infallible-but-unprovable `try_into().unwrap()`
-            // goes away. The length was just checked to be a multiple of 4,
-            // so the remainder is empty.
-            let (quads, _rest) = bytes.as_chunks::<4>();
-            quads.iter().copied().map(u32::from_le_bytes).collect()
+            None
+        };
+        let v = match v {
+            Some(v) => v,
+            None if self.core.header.title_ptr_pos != u64::MAX => self.header_title_listing()?,
+            None => match self.named_title_listing("listing/titleOrdered/v0")? {
+                Some(v) => v,
+                None => self
+                    .named_title_listing("listing/titleOrdered")?
+                    .ok_or(Error::EntryNotFound)?,
+            },
         };
         let _ = self.core.title_listing.set(v.clone());
         Ok(v)
     }
 
+    fn header_title_listing(&self) -> Result<Arc<[u32]>> {
+        let bytes = self.pointer_table(self.core.header.title_ptr_pos, self.entry_count(), 4)?;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
+            .collect())
+    }
+
+    fn named_title_listing(&self, path: &str) -> Result<Option<Arc<[u32]>>> {
+        let entry = match self.entry_by_ns_path(NS_INDEX, path) {
+            Ok(entry) => entry,
+            Err(Error::EntryNotFound) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let blob = entry.get_item(true)?.get_data()?;
+        let bytes = blob.data();
+        if !bytes.len().is_multiple_of(4) || bytes.len() / 4 > self.entry_count() as usize {
+            return Err(Error::Truncated(bytes.len() as u64));
+        }
+        Ok(Some(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(u32::from_le_bytes)
+                .collect(),
+        ))
+    }
+
     /// Modeled after libzim's `Archive::getEntryByPath(path)` — for "new
-    /// namespace" archives this looks up `C/<path>`. For legacy archives the
-    /// caller must include the namespace prefix as `A/...`.
+    /// namespace" archives this looks up `C/<path>`. Legacy paths may carry
+    /// a namespace prefix such as `A/` or `-/`; unqualified paths use `A/`.
     pub fn get_entry_by_path(&self, path: &str) -> Result<Entry> {
         if self.core.header.uses_new_namespaces() {
             self.entry_by_ns_path(NS_CONTENT_NEW, path)
@@ -615,19 +622,12 @@ impl Archive {
         Err(Error::EntryNotFound)
     }
 
-    /// Look up `(namespace, title)` directly via binary search of the title
-    /// listing. In modern archives the listing only covers the content
-    /// namespace, so lookups in M/W/X namespaces fall back to a linear scan.
+    /// Look up `(namespace, title)`. Search the title listing first, then
+    /// fall back to a path-order scan for entries excluded from a modern
+    /// front-article subset (including media and non-content namespaces).
     pub fn entry_by_ns_title(&self, ns: u8, title: &str) -> Result<Entry> {
         let listing = self.title_listing()?;
-        let listing_covers_ns = !listing.is_empty() && {
-            let probe = self.entry_by_url_index(listing[0])?.dirent.namespace();
-            // Modern listings are entirely C; legacy listings span all ns. We
-            // can take the binary-search path only when the listing namespace
-            // matches the requested one.
-            probe == ns || self.core.header.title_ptr_pos != u64::MAX // legacy: full
-        };
-        if listing_covers_ns {
+        if !listing.is_empty() {
             let mut lo = 0usize;
             let mut hi = listing.len();
             while lo < hi {
@@ -653,8 +653,13 @@ impl Archive {
                 }
             }
         }
-        // Linear fallback for non-content namespaces in modern archives.
+        // A full-table listing (header or v0 covering every entry) makes the
+        // miss authoritative. Only a v1 front-article subset can hide the
+        // requested entry, and only then is the linear scan justified.
         let n = self.core.header.entry_count;
+        if listing.len() as u32 == n {
+            return Err(Error::EntryNotFound);
+        }
         for i in 0..n {
             let off = self.url_pointer(i)?;
             let d = Dirent::parse(&self.core.mmap, off as usize)?;
@@ -680,9 +685,8 @@ impl Archive {
     /// [`Dirent::title_key_at`] (no allocation per probe) — `O(log N)`
     /// regardless of prefix length or match count.
     ///
-    /// On modern (new-namespace) archives the title listing only covers
-    /// the `C/` namespace, so passing any other namespace yields an
-    /// empty range. Legacy archives' listings span every namespace.
+    /// With a modern v1 listing, only selected C-namespace front articles
+    /// are covered. Full header/v0 listings span every namespace.
     pub fn title_prefix_range(&self, ns: u8, prefix: &str) -> Result<std::ops::Range<u32>> {
         let listing = self.title_listing()?;
         let lo = self.lower_bound_in_title_listing(&listing, ns, prefix.as_bytes())?;
@@ -729,8 +733,8 @@ impl Archive {
         }
     }
 
-    /// Iterate every entry in title order. In modern archives this only
-    /// yields C-namespace entries (matching libzim's `iterByTitle()`).
+    /// Iterate the title listing. A modern v1 listing yields only selected
+    /// front articles; full header/v0 listings include every entry.
     pub fn iter_by_title(&self) -> EntryIter {
         let n = self.title_listing().map(|v| v.len() as u32).unwrap_or(0);
         EntryIter {
@@ -1030,13 +1034,22 @@ impl Archive {
 
     // ---- internal helpers ----
 
+    fn pointer_table(&self, pos: u64, count: u32, width: usize) -> Result<&[u8]> {
+        let start = usize::try_from(pos).map_err(|_| Error::Truncated(pos))?;
+        let length = (count as usize)
+            .checked_mul(width)
+            .ok_or(Error::Truncated(pos))?;
+        let end = start.checked_add(length).ok_or(Error::Truncated(pos))?;
+        self.core.mmap.get(start..end).ok_or(Error::Truncated(pos))
+    }
+
     fn url_pointer(&self, idx: u32) -> Result<u64> {
         let n = self.core.header.entry_count;
         if idx >= n {
             return Err(Error::BadUrlIndex(idx, n));
         }
-        let off = self.core.header.url_ptr_pos as usize + idx as usize * 8;
-        raw::u64_at(&self.core.mmap, off)
+        let table = self.pointer_table(self.core.header.url_ptr_pos, n, 8)?;
+        raw::u64_at(table, idx as usize * 8)
     }
 
     fn cluster_pointer(&self, idx: u32) -> Result<u64> {
@@ -1044,8 +1057,8 @@ impl Archive {
         if idx >= n {
             return Err(Error::BadClusterIndex(idx, n));
         }
-        let off = self.core.header.cluster_ptr_pos as usize + idx as usize * 8;
-        raw::u64_at(&self.core.mmap, off)
+        let table = self.pointer_table(self.core.header.cluster_ptr_pos, n, 8)?;
+        raw::u64_at(table, idx as usize * 8)
     }
 
     /// Public access to a decoded cluster by its index. The cluster is cached
@@ -1060,13 +1073,23 @@ impl Archive {
     /// of the possibly multi-GB payload out of the mmap); compressed
     /// clusters are decoded once and every blob range walked.
     pub fn validate_cluster(&self, idx: u32) -> Result<()> {
+        self.validate_cluster_references(idx, &[])
+    }
+
+    /// Validate a cluster's offset table and every supplied blob reference.
+    /// Uncompressed payloads are checked in place; compressed payloads are
+    /// decoded once, without populating the archive cache.
+    pub fn validate_cluster_references(&self, idx: u32, blobs: &[u32]) -> Result<()> {
         let raw = self.cluster_raw(idx)?;
         if crate::cluster::validate_raw_offsets(raw)? {
+            for &blob in blobs {
+                crate::cluster::raw_blob_range(raw, blob)?;
+            }
             return Ok(());
         }
         let c = Cluster::parse(raw)?;
-        for b in 0..c.blob_count() {
-            c.blob_range(b)?;
+        for &blob in blobs {
+            c.blob_range(blob)?;
         }
         Ok(())
     }
@@ -1126,20 +1149,26 @@ impl Archive {
     /// `idx` by `cluster_pointer(idx + 1)` would corrupt reads of any
     /// out-of-order cluster. The sorted offset list is built once per
     /// archive and shared.
-    fn cluster_slice_end(&self, start: u64) -> u64 {
+    fn cluster_slice_end(&self, start: u64) -> Result<u64> {
+        let table =
+            self.pointer_table(self.core.header.cluster_ptr_pos, self.cluster_count(), 8)?;
         let offs = self.core.sorted_cluster_offsets.get_or_init(|| {
-            let n = self.core.header.cluster_count;
-            let mut v: Vec<u64> = (0..n)
-                .filter_map(|i| self.cluster_pointer(i).ok())
+            let mut v: Vec<u64> = table
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .copied()
+                .map(u64::from_le_bytes)
                 .collect();
             v.sort_unstable();
             v
         });
         let i = offs.partition_point(|&o| o <= start);
-        if i < offs.len() {
-            return offs[i];
-        }
-        self.cluster_region_boundary_after(start)
+        let boundary = self.cluster_region_boundary_after(start);
+        Ok(offs
+            .get(i)
+            .copied()
+            .map_or(boundary, |next| next.min(boundary)))
     }
 
     /// Nearest header-table / checksum / EOF position after `start` —
@@ -1147,7 +1176,7 @@ impl Archive {
     fn cluster_region_boundary_after(&self, start: u64) -> u64 {
         let h = &self.core.header;
         let eof = if h.has_checksum() {
-            h.checksum_pos
+            h.checksum_pos.min(self.core.file_len)
         } else {
             self.core.file_len
         };
@@ -1163,8 +1192,8 @@ impl Archive {
     /// takes up in the file.
     pub fn cluster_byte_range(&self, idx: u32) -> Result<std::ops::Range<u64>> {
         let start = self.cluster_pointer(idx)?;
-        let end = self.cluster_slice_end(start);
-        if end < start {
+        let end = self.cluster_slice_end(start)?;
+        if end <= start || end > self.core.file_len {
             return Err(Error::Truncated(end));
         }
         Ok(start..end)
@@ -1173,12 +1202,8 @@ impl Archive {
     /// Raw on-disk bytes of cluster `idx` (info byte included), bounded
     /// by the next cluster in file order.
     fn cluster_raw(&self, idx: u32) -> Result<&[u8]> {
-        let start = self.cluster_pointer(idx)? as usize;
-        let end = self.cluster_slice_end(start as u64) as usize;
-        if end < start || end > self.core.mmap.len() {
-            return Err(Error::Truncated(end as u64));
-        }
-        Ok(&self.core.mmap[start..end])
+        let range = self.cluster_byte_range(idx)?;
+        Ok(&self.core.mmap[range.start as usize..range.end as usize])
     }
 
     /// Decompress a cluster *without* touching the cache. Useful for parallel
@@ -1283,24 +1308,53 @@ impl Archive {
         Ok(true)
     }
 
-    /// Verify the title-pointer list (legacy) or the modern
-    /// `X/listing/titleOrdered/v1` stream (v6+) yields dirents in
-    /// `(namespace, title)` order. `entry_by_ns_title` is a binary
-    /// search over this ordering.
+    /// Validate every available title table independently: the header and
+    /// v0 tables must be full permutations of the URL indices, while v1 is
+    /// a unique C-namespace subset. All tables must be title-sorted.
     pub fn check_title_index(&self) -> Result<bool> {
-        let listing = self.title_listing()?;
-        // Same borrow-from-mmap trick as `check_dirent_order`.
-        let mut prev: Option<(u8, &str)> = None;
-        for &url_idx in listing.iter() {
-            let off = self.url_pointer(url_idx)?;
-            let (ns, title) = Dirent::title_key_at(&self.core.mmap, off as usize)?;
-            if let Some((prev_ns, prev_title)) = prev {
-                let cmp = prev_ns.cmp(&ns).then_with(|| prev_title.cmp(title));
-                if cmp.is_gt() {
+        let mut found = false;
+        if self.core.header.title_ptr_pos != u64::MAX {
+            found = true;
+            if !self.valid_title_listing(&self.header_title_listing()?, false)? {
+                return Ok(false);
+            }
+        }
+        for (path, subset) in [
+            ("listing/titleOrdered/v0", false),
+            ("listing/titleOrdered", false),
+            ("listing/titleOrdered/v1", true),
+        ] {
+            if let Some(listing) = self.named_title_listing(path)? {
+                found = true;
+                if !self.valid_title_listing(&listing, subset)? {
                     return Ok(false);
                 }
             }
-            prev = Some((ns, title));
+        }
+        Ok(found)
+    }
+
+    fn valid_title_listing(&self, listing: &[u32], subset: bool) -> Result<bool> {
+        if !subset && listing.len() != self.entry_count() as usize {
+            return Ok(false);
+        }
+        // Bound allocation by the real URL table, not an unchecked header count.
+        self.pointer_table(self.core.header.url_ptr_pos, self.entry_count(), 8)?;
+        let mut seen = vec![false; self.entry_count() as usize];
+        let mut prev: Option<(u8, &str)> = None;
+        for &url_idx in listing {
+            let Some(seen) = seen.get_mut(url_idx as usize) else {
+                return Ok(false);
+            };
+            if std::mem::replace(seen, true) {
+                return Ok(false);
+            }
+            let off = self.url_pointer(url_idx)?;
+            let key = Dirent::title_key_at(&self.core.mmap, off as usize)?;
+            if (subset && key.0 != NS_CONTENT_NEW) || prev.is_some_and(|prev| prev > key) {
+                return Ok(false);
+            }
+            prev = Some(key);
         }
         Ok(true)
     }
@@ -1313,13 +1367,7 @@ impl Archive {
         let file_len = self.core.file_len;
         for i in 0..n {
             let off = self.cluster_pointer(i)?;
-            // A cluster's info-byte must fit in the file; the cluster
-            // itself extends to the next cluster's offset (or the
-            // checksum / EOF for the trailing one). Just bounding the
-            // start byte is enough to catch the corruption modes
-            // `check_cluster_ptrs` exists to surface — full parseability
-            // is what `check_cluster_payloads` (future work) would
-            // cover, and it's expensive enough to keep separate.
+            // Full payload validation remains separate in `validate_cluster`.
             if off >= file_len {
                 return Ok(false);
             }
@@ -1385,7 +1433,8 @@ fn parse_illustration_key(name: &str) -> Option<(u32, u32, u32)> {
 
 fn split_legacy_path(path: &str) -> Option<(u8, &str)> {
     let bytes = path.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b'/' && bytes[0].is_ascii_alphabetic() {
+    if bytes.len() >= 2 && bytes[1] == b'/' && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'-')
+    {
         Some((bytes[0], &path[2..]))
     } else {
         None

@@ -82,9 +82,9 @@ impl Header {
 
     /// True for ZIM files that use the "new" namespace scheme (`C` for content,
     /// `M` for metadata, `W` for well-known, `X` for indexes).
-    /// New namespaces were introduced when minor_version became >= 1.
+    /// New namespaces were introduced in version 6.1; version 6.0 is legacy.
     pub fn uses_new_namespaces(&self) -> bool {
-        self.major_version > 5 || (self.major_version == 5 && self.minor_version >= 1)
+        self.major_version > 6 || (self.major_version == 6 && self.minor_version >= 1)
     }
 
     pub fn has_main_page(&self) -> bool {

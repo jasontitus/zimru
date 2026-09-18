@@ -2,8 +2,10 @@
 //! downloaded from kiwix. The files are NOT redistributed in this repo; the
 //! test harness expects them under `zim-cache/` (the gitignored cache).
 //!
-//! Skipped automatically when the files aren't present so CI without them
-//! still passes.
+//! Missing files are skipped with a notice unless `ZIMRU_REQUIRE_FIXTURES=1`
+//! is set, in which case a missing fixture fails the test. CI's fixture job
+//! downloads the pinned archives (see `.github/workflows/ci.yml`) and runs
+//! with that variable, so a green CI run is a real-archive result.
 //!
 //! Coverage per file:
 //!   * Header sanity
@@ -28,6 +30,11 @@ fn cache_dir() -> PathBuf {
 fn try_open(name: &str) -> Option<(PathBuf, Archive)> {
     let p = cache_dir().join(name);
     if !p.exists() {
+        assert!(
+            std::env::var_os("ZIMRU_REQUIRE_FIXTURES").is_none(),
+            "fixture {} missing but ZIMRU_REQUIRE_FIXTURES is set",
+            p.display()
+        );
         eprintln!("skip: {} not present", p.display());
         return None;
     }
@@ -167,16 +174,16 @@ fn exercise_archive(label: &str, archive: &Archive) {
 }
 
 #[test]
-fn english_top_100_mini() {
-    if let Some((_p, a)) = try_open("wikipedia_en_100_mini.zim") {
-        exercise_archive("en/mini", &a);
+fn english_ray_charles_mini() {
+    if let Some((_p, a)) = try_open("wikipedia_en_ray-charles_mini.zim") {
+        exercise_archive("en/ray-charles-mini", &a);
     }
 }
 
 #[test]
-fn english_top_100_nopic() {
-    if let Some((_p, a)) = try_open("wikipedia_en_100_nopic.zim") {
-        exercise_archive("en/nopic", &a);
+fn english_ray_charles_nopic() {
+    if let Some((_p, a)) = try_open("wikipedia_en_ray-charles_nopic.zim") {
+        exercise_archive("en/ray-charles-nopic", &a);
     }
 }
 

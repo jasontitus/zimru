@@ -27,6 +27,8 @@ file_size() {
     fi
 }
 SIZE_BYTES=$(file_size "$ZIM")
+# hyperfine runs its command strings through `sh -c`; escape the path once.
+ZIM_Q=$(printf "%q" "$ZIM")
 SIZE_HUMAN=$(numfmt --to=iec --suffix=B "$SIZE_BYTES")
 echo "ZIM: $ZIM ($SIZE_HUMAN)"
 echo
@@ -39,6 +41,10 @@ UPSTREAM_DIR="${UPSTREAM_DIR:-/opt/zim-tools-upstream/zim-tools_linux-x86_64-3.8
 UP_CHECK="$UPSTREAM_DIR/zimcheck"
 UP_DUMP="$UPSTREAM_DIR/zimdump"
 OUR_BENCH=./target/release/zimbench
+command -v hyperfine >/dev/null 2>&1 || { echo "hyperfine not on PATH" >&2; exit 1; }
+for tool in "$ZIMRU" "$ZIMRU_CHECK" "$ZIMRU_DUMP" "$OUR_BENCH" "$UP_CHECK" "$UP_DUMP" "$UPSTREAM_DIR/zimbench"; do
+    [[ -x "$tool" ]] || { echo "missing executable: $tool" >&2; exit 1; }
+done
 
 echo "Versions:"
 echo "  zimru   : 0.1.0 (this repo)"
@@ -50,8 +56,8 @@ echo
 # -------------------------------------------------------------------
 echo "## 1. Checksum verification (MD5 of entire file before trailer)"
 hyperfine --warmup 1 --runs 5 --export-markdown bench/results-checksum.md \
-    -n "zimru zimcheck -C" "$ZIMRU_CHECK -C $ZIM" \
-    -n "upstream zimcheck -C" "$UP_CHECK -C $ZIM"
+    -n "zimru zimcheck -C" "$ZIMRU_CHECK -C $ZIM_Q" \
+    -n "upstream zimcheck -C" "$UP_CHECK -C $ZIM_Q"
 echo
 
 # -------------------------------------------------------------------
@@ -59,8 +65,8 @@ echo
 # -------------------------------------------------------------------
 echo "## 2. Read every blob + MD5 each (decompress every cluster)"
 hyperfine --warmup 1 --runs 3 --export-markdown bench/results-readall.md \
-    -n "zimru readall --md5" "$ZIMRU readall $ZIM --md5 --quiet" \
-    -n "upstream zimcheck -R" "$UP_CHECK -R $ZIM"
+    -n "zimru readall --md5" "$ZIMRU readall $ZIM_Q --md5 --quiet" \
+    -n "upstream zimcheck -R" "$UP_CHECK -R $ZIM_Q"
 echo
 
 # -------------------------------------------------------------------
@@ -68,7 +74,7 @@ echo
 # -------------------------------------------------------------------
 echo "## 3. Read every blob (no hash — pure decompress throughput)"
 hyperfine --warmup 1 --runs 3 --export-markdown bench/results-decompress.md \
-    -n "zimru readall" "$ZIMRU readall $ZIM --quiet"
+    -n "zimru readall" "$ZIMRU readall $ZIM_Q --quiet"
 echo
 
 # -------------------------------------------------------------------
@@ -76,8 +82,8 @@ echo
 # -------------------------------------------------------------------
 echo "## 4. Full check sweep (-A: every check)"
 hyperfine -i --warmup 1 --runs 3 --export-markdown bench/results-all.md \
-    -n "zimru zimcheck -A" "$ZIMRU_CHECK -A $ZIM" \
-    -n "upstream zimcheck -A" "$UP_CHECK -A $ZIM"
+    -n "zimru zimcheck -A" "$ZIMRU_CHECK -A $ZIM_Q" \
+    -n "upstream zimcheck -A" "$UP_CHECK -A $ZIM_Q"
 echo
 
 # -------------------------------------------------------------------
@@ -94,11 +100,12 @@ echo
 # 6. Export every entry to the filesystem
 # -------------------------------------------------------------------
 echo "## 6. zimdump dump (export every entry)"
-DUMPDIR="${TMPDIR:-/tmp}/zimru-bench-dump"
+DUMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/zimru-bench-dump.XXXXXX")
+DUMPDIR_Q=$(printf "%q" "$DUMPDIR")
 hyperfine -i --warmup 0 --runs 2 --export-markdown bench/results-dump.md \
-    --prepare "rm -rf $DUMPDIR" \
-    -n "zimru zimdump dump" "$ZIMRU_DUMP dump --dir=$DUMPDIR --redirect $ZIM" \
-    -n "upstream zimdump dump" "$UP_DUMP dump --dir=$DUMPDIR --redirect $ZIM"
+    --prepare "rm -rf $DUMPDIR_Q" \
+    -n "zimru zimdump dump" "$ZIMRU_DUMP dump --dir=$DUMPDIR_Q --redirect $ZIM_Q" \
+    -n "upstream zimdump dump" "$UP_DUMP dump --dir=$DUMPDIR_Q --redirect $ZIM_Q"
 rm -rf "$DUMPDIR"
 echo
 
@@ -107,8 +114,8 @@ echo
 # -------------------------------------------------------------------
 echo "## 7. zimbench -n 1000 (random + sequential entry access)"
 hyperfine -i --warmup 1 --runs 3 --export-markdown bench/results-bench.md \
-    -n "zimru zimbench" "$OUR_BENCH -n 1000 $ZIM" \
-    -n "upstream zimbench" "$UPSTREAM_DIR/zimbench -n 1000 $ZIM"
+    -n "zimru zimbench" "$OUR_BENCH -n 1000 $ZIM_Q" \
+    -n "upstream zimbench" "$UPSTREAM_DIR/zimbench -n 1000 $ZIM_Q"
 echo
 
 echo "All benchmarks complete. Markdown summaries in bench/results-*.md"

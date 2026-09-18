@@ -28,6 +28,10 @@ documentation = true
 
 [export]
 prefix = ""
+include = ["zimru_error_code_t"]
+
+[enum]
+prefix_with_name = true
 
 [parse]
 parse_deps = false

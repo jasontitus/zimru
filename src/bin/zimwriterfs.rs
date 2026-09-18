@@ -215,6 +215,29 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
             format!("HTML_DIR {} is not a directory", html_dir.display()),
         )));
     }
+    let html_dir = fs::canonicalize(html_dir)?;
+    let html_dir = html_dir.as_path();
+    // Check both the destination's directory and any existing symlink target
+    // before creating output. The archive and helper files must stay outside
+    // the input tree, including when either path uses directory aliases.
+    let output_parent = zim_file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let output_parent = fs::canonicalize(output_parent)?;
+    if output_parent.starts_with(html_dir)
+        || fs::canonicalize(zim_file).is_ok_and(|p| p.starts_with(html_dir))
+    {
+        return Err(zimru::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output ZIM must be outside HTML_DIR",
+        )));
+    }
+    let index_tmp = make_index_tmp_dir(zim_file)?;
+    let _index_tmp_cleanup = index_helper::TmpDirCleanup(index_tmp.clone());
+    // Never truncate an existing output inode: it may be a hard link to an
+    // input file. Publish by renaming a completed archive on the same volume.
+    let staged_zim = index_tmp.join("archive.zim");
 
     let mut creator = Creator::new();
     creator.set_compression(Compression::Zstd);
@@ -245,14 +268,14 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
         };
         creator.set_cluster_strategy(s);
     }
-    creator.set_main_path(o.welcome.as_deref().unwrap());
+    creator.try_set_main_path(o.welcome.as_deref().unwrap())?;
 
     // Switch to streaming mode now so each subsequent add_item /
     // add_metadata / add_illustration call bin-packs into the
     // in-flight cluster and stream-encodes-and-writes when the
     // cluster overflows. Peak RSS becomes O(cluster_size_target ×
     // thread_count) instead of O(total input size).
-    creator.start_writing(zim_file)?;
+    creator.start_writing(&staged_zim)?;
 
     // Spin up xapianbuilder helpers (one each for fulltext + title)
     // unless the user opted out. The helpers run in parallel with the
@@ -260,10 +283,6 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     // finish() we stream the output files back in bounded chunks and
     // add them as X/* items before the creator finalises.
     let language = o.language.clone().unwrap_or_default();
-    let index_tmp = make_index_tmp_dir(zim_file)?;
-    // Removes the temp dir on every exit path, including early `?`
-    // returns while walking the input tree.
-    let _index_tmp_cleanup = index_helper::TmpDirCleanup(index_tmp.clone());
     // `-j` matches upstream: it drops the fulltext index only. The title
     // index still gets built, because that is what upstream's `-j` output
     // contains and what kiwix's suggestion box reads.
@@ -281,33 +300,33 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     };
 
     // Mandatory metadata.
-    creator.add_metadata("Title", o.title.clone().unwrap());
-    creator.add_metadata("Description", o.description.clone().unwrap());
-    creator.add_metadata("Language", o.language.clone().unwrap());
-    creator.add_metadata("Creator", o.creator.clone().unwrap());
-    creator.add_metadata("Publisher", o.publisher.clone().unwrap());
-    creator.add_metadata("Name", o.name.clone().unwrap());
-    creator.add_metadata("Date", chrono_today_iso());
+    creator.try_add_metadata("Title", o.title.clone().unwrap())?;
+    creator.try_add_metadata("Description", o.description.clone().unwrap())?;
+    creator.try_add_metadata("Language", o.language.clone().unwrap())?;
+    creator.try_add_metadata("Creator", o.creator.clone().unwrap())?;
+    creator.try_add_metadata("Publisher", o.publisher.clone().unwrap())?;
+    creator.try_add_metadata("Name", o.name.clone().unwrap())?;
+    creator.try_add_metadata("Date", chrono_today_iso())?;
 
     // Optional metadata.
     if let Some(s) = &o.long_description {
-        creator.add_metadata("LongDescription", s.clone());
+        creator.try_add_metadata("LongDescription", s.clone())?;
     }
     if let Some(s) = &o.tags {
-        creator.add_metadata("Tags", s.clone());
+        creator.try_add_metadata("Tags", s.clone())?;
     }
     if let Some(s) = &o.source {
-        creator.add_metadata("Source", s.clone());
+        creator.try_add_metadata("Source", s.clone())?;
     }
     if let Some(s) = &o.flavour {
-        creator.add_metadata("Flavour", s.clone());
+        creator.try_add_metadata("Flavour", s.clone())?;
     }
     // Always emit M/Scraper. Real libzim's zimwriterfs writes its
     // own version string here ("zimwriterfs-3.x.x"); we emit the
     // user-provided value if any, otherwise fall back to our own
     // identifier so downstream tooling has something to read.
     let scraper = o.scraper.clone().unwrap_or_else(|| VERSION.to_string());
-    creator.add_metadata("Scraper", scraper);
+    creator.try_add_metadata("Scraper", scraper)?;
 
     // Illustration (must exist; mandatory upstream).
     let illu_path = html_dir.join(o.illustration.as_ref().unwrap());
@@ -317,7 +336,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
             format!("--illustration {}: {e}", illu_path.display()),
         ))
     })?;
-    creator.add_illustration(48, illu_bytes);
+    creator.try_add_illustration(48, illu_bytes)?;
 
     // Walk HTML_DIR and ingest every file. The illustration is also kept
     // as a regular C entry so links from inside the archive that reference
@@ -344,14 +363,13 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
     const READ_BATCH: usize = 256;
     let mut count = 0usize;
 
-    // Build the (path, relpath, size, is_html) list once. metadata()
-    // is one stat call per file — comparable to the old walk_dir's
-    // `entry.file_type()` call, so no extra cost.
+    // Resolve MIME before choosing full HTML processing versus media streaming.
     struct PrepEntry {
         path: PathBuf,
         rel_str: String,
         size: u64,
         is_html: bool,
+        mime: String,
     }
     let (entries, symlinks) = walk_dir(html_dir)?;
     let prepped: Vec<PrepEntry> = entries
@@ -363,19 +381,36 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
             } else {
                 rel.to_string_lossy().into_owned()
             };
-            let size = p.metadata().map(|m| m.len()).unwrap_or(0);
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let is_html = ext == "html" || ext == "htm";
-            PrepEntry {
+            let size = p.metadata()?.len();
+            let mime = if p.extension().is_some() {
+                mime_for_path(&p)
+            } else {
+                let mut f = fs::File::open(&p)?;
+                let mut head = [0u8; 1024];
+                let mut n = 0;
+                while n < head.len() {
+                    let read = f.read(&mut head[n..])?;
+                    if read == 0 {
+                        break;
+                    }
+                    n += read;
+                }
+                sniff_mime(&head[..n])
+                    .unwrap_or("application/octet-stream")
+                    .to_string()
+            };
+            let is_html = mime.starts_with("text/html");
+            Ok::<_, std::io::Error>(PrepEntry {
                 path: p,
                 rel_str,
                 size,
                 is_html,
-            }
+                mime,
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
-    let needs_full_read = |e: &PrepEntry| e.is_html || o.inflate_html;
+    let needs_full_read = |e: &PrepEntry| e.is_html;
 
     // Processed payload after parallel read.
     struct ReadyItem {
@@ -392,22 +427,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
         // Big non-HTML file → chunked-streaming path one-at-a-time.
         if !needs_full_read(e) && e.size >= STREAMING_THRESHOLD_BIN {
             let mut f = fs::File::open(&e.path)?;
-            // Extension first, content sniff for extensionless files
-            // (rewinding afterwards so the streaming loop sees the
-            // whole body).
-            let mime = match e.path.extension() {
-                Some(_) => mime_for_path(&e.path),
-                None => {
-                    use std::io::Seek as _;
-                    let mut head = [0u8; 1024];
-                    let n = f.read(&mut head)?;
-                    f.seek(std::io::SeekFrom::Start(0))?;
-                    sniff_mime(&head[..n])
-                        .unwrap_or("application/octet-stream")
-                        .to_string()
-                }
-            };
-            let compress_hint = if should_compress(&mime) {
+            let compress_hint = if should_compress(&e.mime) {
                 None
             } else {
                 Some(false)
@@ -422,7 +442,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                 None,
                 e.rel_str.clone(),
                 e.rel_str.clone(),
-                mime,
+                e.mime.clone(),
                 Some(e.size),
                 compress_hint,
             )?;
@@ -477,17 +497,9 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                         )))
                     })?;
                 }
-                // Resolve the mimetype: extension first, then content
-                // sniff for extensionless files (dumped wiki articles).
-                let mime = match e.path.extension() {
-                    Some(_) => mime_for_path(&e.path),
-                    None => sniff_mime(&content)
-                        .unwrap_or("application/octet-stream")
-                        .to_string(),
-                };
                 // HTML gets its title from the <title> tag whether the
                 // file was recognised by extension or by sniffing.
-                let title = if e.is_html || mime.starts_with("text/html") {
+                let title = if e.is_html {
                     derive_title_from_bytes(&content).unwrap_or_else(|| e.rel_str.clone())
                 } else {
                     e.rel_str.clone()
@@ -495,7 +507,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                 Ok(ReadyItem {
                     rel_str: e.rel_str.clone(),
                     title,
-                    mime,
+                    mime: e.mime.clone(),
                     content,
                 })
             })
@@ -523,7 +535,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
             if !should_compress(&item.mimetype) {
                 item = item.with_compress(false);
             }
-            creator.add_item(item);
+            creator.try_add_item(item)?;
             count += 1;
             if o.verbose && count.is_multiple_of(100) {
                 eprintln!("[zimwriterfs] {count} items");
@@ -531,52 +543,17 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
         }
     }
 
-    // Symlinks become redirect entries, matching upstream
-    // zimwriterfs (and round-tripping `zimdump dump --redirect`
-    // output). Each link's target is resolved against the link's own
-    // directory, normalised, and re-expressed relative to
-    // HTML_DIRECTORY; links that point outside the tree or at
-    // nothing we walked are skipped with a warning.
-    if !symlinks.is_empty() {
-        use std::collections::HashSet;
-        let rel_of = |p: &Path| -> String {
-            let rel = p.strip_prefix(html_dir).unwrap_or(p);
-            if cfg!(windows) {
-                rel.to_string_lossy().replace('\\', "/")
-            } else {
-                rel.to_string_lossy().into_owned()
-            }
-        };
-        let mut known: HashSet<String> = prepped.iter().map(|e| e.rel_str.clone()).collect();
-        for link in &symlinks {
-            known.insert(rel_of(link));
-        }
-        for link in &symlinks {
-            let rel = rel_of(link);
-            let raw = match fs::read_link(link) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("zimwriterfs: skipping symlink {rel}: {e}");
-                    continue;
-                }
-            };
-            let joined = link.parent().unwrap_or(html_dir).join(&raw);
-            let target_rel = match normalize_within(html_dir, &joined) {
-                Some(t) if known.contains(&t) => t,
-                _ => {
-                    eprintln!(
-                        "zimwriterfs: skipping symlink {rel}: target {} not inside the html directory",
-                        raw.display()
-                    );
-                    continue;
-                }
-            };
-            creator.add_redirection(rel.clone(), rel.clone(), target_rel.clone());
-            // Redirects also go in the title index, with their
-            // target stored in value slot 1.
-            indexer.feed_title(&rel, &rel, &target_rel);
-            count += 1;
-        }
+    // Resolve the entire graph first. Merely being a discovered symlink does
+    // not make a target valid: every chain must terminate at an ingested file.
+    let redirects = resolve_symlinks(
+        html_dir,
+        &symlinks,
+        prepped.iter().map(|e| e.rel_str.as_str()),
+    );
+    for (rel, target) in redirects {
+        creator.try_add_redirection(rel.clone(), rel.clone(), target.clone())?;
+        indexer.feed_title(&rel, &rel, &target);
+        count += 1;
     }
 
     // Drop the prepped list now that we're done with it.
@@ -594,7 +571,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
                 eprintln!("zimwriterfs: redirect file line {} malformed (need 3 tab-separated fields): {line}", lineno + 1);
                 continue;
             }
-            creator.add_redirection(parts[0], parts[1], parts[2]);
+            creator.try_add_redirection(parts[0], parts[1], parts[2])?;
             // Redirects also go in the title index, with their
             // target stored in value slot 1.
             indexer.feed_title(parts[0], parts[1], parts[2]);
@@ -618,6 +595,7 @@ fn run(o: &Opts) -> Result<(), zimru::Error> {
         eprintln!("[zimwriterfs] {count} items collected; finalising…");
     }
     creator.finish_writing()?;
+    fs::rename(&staged_zim, zim_file)?;
     if o.verbose {
         eprintln!("[zimwriterfs] wrote {}", zim_file.display());
     }
@@ -654,6 +632,56 @@ fn walk_dir(dir: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     out.sort();
     links.sort();
     Ok((out, links))
+}
+
+fn resolve_symlinks<'a>(
+    root: &Path,
+    links: &[PathBuf],
+    files: impl Iterator<Item = &'a str>,
+) -> Vec<(String, String)> {
+    use std::collections::HashSet;
+    let files: HashSet<&str> = files.collect();
+    let graph: HashMap<String, Option<String>> = links
+        .iter()
+        .map(|link| {
+            let rel = normalize_within(root, link).unwrap();
+            let target = fs::read_link(link)
+                .ok()
+                .and_then(|target| normalize_within(root, &link.parent()?.join(target)));
+            (rel, target)
+        })
+        .collect();
+    let mut resolved: HashMap<String, Option<String>> = HashMap::new();
+    let mut redirects = Vec::new();
+    for link in links {
+        let rel = normalize_within(root, link).unwrap();
+        let mut current = rel.clone();
+        let mut chain = HashSet::new();
+        let terminal = loop {
+            if files.contains(current.as_str()) {
+                break Some(current);
+            }
+            if let Some(cached) = resolved.get(&current) {
+                break cached.clone();
+            }
+            if !chain.insert(current.clone()) {
+                break None;
+            }
+            match graph.get(&current).and_then(Option::as_ref) {
+                Some(target) => current = target.clone(),
+                None => break None,
+            }
+        };
+        for node in chain {
+            resolved.insert(node, terminal.clone());
+        }
+        if let Some(target) = terminal {
+            redirects.push((rel, target));
+        } else {
+            eprintln!("zimwriterfs: skipping symlink {rel}: cyclic chain or target not ingested");
+        }
+    }
+    redirects
 }
 
 /// Normalise `p` (which may contain `.` / `..` components) and
@@ -837,7 +865,17 @@ fn derive_title_from_bytes(bytes: &[u8]) -> Option<String> {
     // GB of transient churn on a large build).
     let s = find_ascii_ci(text.as_bytes(), b"<title>")? + "<title>".len();
     let e = find_ascii_ci(&text.as_bytes()[s..], b"</title>")?;
-    Some(text[s..s + e].trim().to_string())
+    // Titles routinely wrap across lines inside the tag; collapse all
+    // whitespace (including newlines/tabs, which the writer rejects as
+    // control characters) to single spaces.
+    let mut title = String::with_capacity(e);
+    for word in text[s..s + e].split_whitespace() {
+        if !title.is_empty() {
+            title.push(' ');
+        }
+        title.push_str(word);
+    }
+    Some(title)
 }
 
 /// Position of the ASCII-case-insensitive `needle` in `hay`; `needle`
@@ -895,10 +933,13 @@ fn make_index_tmp_dir(zim_file: &Path) -> Result<PathBuf, zimru::Error> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "zim".into());
     let pid = std::process::id();
-    let dir = parent.join(format!(".{stem}.xapianbuilder.{pid}"));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
+    for attempt in 0u64.. {
+        let dir = parent.join(format!(".{stem}.xapianbuilder.{pid}.{attempt}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
     }
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    unreachable!()
 }

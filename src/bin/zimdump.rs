@@ -1,12 +1,15 @@
 //! `zimdump` — CLI parity with kiwix `zim-tools`' `zimdump`.
 //!
 //! Subcommands (mirrors upstream):
-//!   zimdump info    [--ns=N]                       <file>
-//!   zimdump list    [--details] [--idx=I|(--url=U [--ns=N])] <file>
-//!   zimdump show    (--idx=I|(--url=U [--ns=N]))   <file>
-//!   zimdump dump    --dir=DIR [--ns=N] [--redirect] <file>
-//!   zimdump analyze [--by-item]                    <file>   (zimru extension)
-//!   zimdump --help | --version
+//!
+//! ```text
+//! zimdump info    [--ns=N]                       <file>
+//! zimdump list    [--details] [--idx=I|(--url=U [--ns=N])] <file>
+//! zimdump show    (--idx=I|(--url=U [--ns=N]))   <file>
+//! zimdump dump    --dir=DIR [--ns=N] [--redirect] <file>
+//! zimdump analyze [--by-item]                    <file>   (zimru extension)
+//! zimdump --help | --version
+//! ```
 //!
 //! Exit codes match upstream: 0 = ok, 1 = no/multiple matches, 2 = dump error.
 //!
@@ -16,7 +19,6 @@
 //! archive: compressed cluster size, decompressed payload, and ratio.
 
 use std::collections::HashMap;
-use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -474,9 +476,9 @@ fn cmd_analyze(args: &[String]) -> Result<ExitCode, Error> {
 // ---------------- subcommand: dump ----------------
 
 fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
+    use parking_lot::Mutex;
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
 
     let opts = parse_opts(args)?;
     let arc = open_archive(&opts)?;
@@ -484,7 +486,7 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
         .dir
         .clone()
         .ok_or_else(|| io_err("dump requires --dir=DIR"))?;
-    fs::create_dir_all(&dir)?;
+    let root = DumpRoot::open(&dir)?;
     let target_ns = opts.ns;
 
     // Filesystem path collisions are expected in real archives: an
@@ -493,31 +495,37 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
     // writing the colliding entry to `DIR/_exceptions/` with the
     // path percent-escaped; we match that behaviour (and never
     // abort the dump over a single entry).
-    let exceptions_dir = dir.join("_exceptions");
+    let exceptions_dir = PathBuf::from("_exceptions");
     let errors = AtomicUsize::new(0);
     let errlog: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let fallback_paths: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+    let record_fallback = |rel: &str, exc: &std::path::Path| {
+        fallback_paths
+            .lock()
+            .insert(rel.to_owned(), exc.to_string_lossy().into_owned());
+        eprintln!(
+            "Wrote {} to {}",
+            dir.join(rel).display(),
+            dir.join(exc).display()
+        );
+    };
     let log_failure = |dest: &std::path::Path, err: &io::Error| {
         errors.fetch_add(1, Ordering::Relaxed);
-        errlog
-            .lock()
-            .unwrap()
-            .push(format!("{}: {}", dest.display(), err));
+        errlog.lock().push(format!("{}: {}", dest.display(), err));
     };
     // Write an entry at its natural path, or — when `exiled` says its
     // path is occupied by a shallower entry — directly under
     // `_exceptions/`. A collision that slips through anyway (unusual
     // filesystems) still falls back to `_exceptions/` at runtime.
     // `attempt` performs the actual filesystem operation (file write
-    // or symlink creation) against the path it is given.
+    // or symlink creation) against a root-relative path.
     let write_with_fallback =
         |rel: &str, exiled: bool, attempt: &dyn Fn(&PathBuf) -> io::Result<()>| {
-            let dest = dir.join(rel);
+            let dest = PathBuf::from(rel);
             if exiled {
-                match exception_dest(&exceptions_dir, rel).and_then(|exc| {
-                    attempt(&exc)?;
-                    Ok(exc)
-                }) {
-                    Ok(exc) => eprintln!("Wrote {} to {}", dest.display(), exc.display()),
+                let exc = exception_dest(&exceptions_dir, rel);
+                match attempt(&exc).map(|()| exc) {
+                    Ok(exc) => record_fallback(rel, &exc),
                     Err(err) => log_failure(&dest, &err),
                 }
                 return;
@@ -525,11 +533,9 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
             match attempt(&dest) {
                 Ok(()) => {}
                 Err(err) if is_collision(&err) => {
-                    match exception_dest(&exceptions_dir, rel).and_then(|exc| {
-                        attempt(&exc)?;
-                        Ok(exc)
-                    }) {
-                        Ok(exc) => eprintln!("Wrote {} to {}", dest.display(), exc.display()),
+                    let exc = exception_dest(&exceptions_dir, rel);
+                    match attempt(&exc).map(|()| exc) {
+                        Ok(exc) => record_fallback(rel, &exc),
                         Err(err2) => log_failure(&dest, &err2),
                     }
                 }
@@ -588,6 +594,19 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
         let r: Vec<bool> = redirects.iter().map(|(r, _)| is_exiled(r)).collect();
         (a, r)
     };
+    // Redirects can refer forward to another redirect. Record statically
+    // known relocations before emitting any links, then record runtime
+    // article fallbacks as they are written.
+    for ((rel, _), &exiled) in redirects.iter().zip(&exiled_redirects) {
+        if exiled {
+            fallback_paths.lock().insert(
+                rel.clone(),
+                exception_dest(&exceptions_dir, rel)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
 
     // Pass 2 — extract articles grouped by cluster so each cluster is
     // decompressed exactly once. URL order visits clusters in a near-
@@ -617,53 +636,42 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
             let cluster = arc.cluster_uncached(*cluster_idx)?;
             for (blob_idx, rel, exiled) in blobs {
                 let data = cluster.blob(*blob_idx)?;
-                write_with_fallback(rel, *exiled, &|dest| write_entry(dest, data));
+                write_with_fallback(rel, *exiled, &|dest| root.write(dest, data));
             }
             Ok(())
         })?;
 
-    // Pass 3 — redirects (no cluster access): symlinks or HTML stubs.
+    // Pass 3 — redirects retain their single-step semantics. Both symlinks
+    // and HTML links are relative to the actual destination of the stub,
+    // including the exception directory when a source path collides.
     for ((rel, target_rel), exiled) in redirects.iter().zip(exiled_redirects) {
-        if opts.redirect {
-            #[cfg(unix)]
-            write_with_fallback(rel, exiled, &|dest| {
-                // Symlink targets resolve relative to the *symlink's*
-                // directory, so prefix one `../` per directory level
-                // between the actual destination (which may be the
-                // `_exceptions/` fallback) and the dump root that
-                // `target_rel` is expressed against (matches upstream
-                // zimdump).
-                let depth = dest
-                    .strip_prefix(&dir)
-                    .map(|r| r.components().count().saturating_sub(1))
-                    .unwrap_or(0);
-                let mut link_target = String::new();
-                for _ in 0..depth {
-                    link_target.push_str("../");
-                }
-                link_target.push_str(target_rel);
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let _ = fs::remove_file(dest);
-                std::os::unix::fs::symlink(&link_target, dest)
-            });
-        } else {
-            // HTML redirect file
-            let html = format!(
-                "<html><head><meta http-equiv=\"refresh\" content=\"0; url={0}\"></head><body><a href=\"{0}\">{0}</a></body></html>",
-                target_rel
-            );
-            write_with_fallback(rel, exiled, &|dest| write_entry(dest, html.as_bytes()));
-        }
+        let relocated_target = fallback_paths.lock().get(target_rel).cloned();
+        let target_rel = relocated_target.as_deref().unwrap_or(target_rel);
+        write_with_fallback(rel, exiled, &|dest| {
+            let target = relative_target(dest, target_rel);
+            if opts.redirect {
+                root.symlink(dest, &target)
+            } else {
+                let url = escape_html(&redirect_url(&target));
+                let label = escape_html(&target);
+                let html = format!(
+                    "<html><head><meta http-equiv=\"refresh\" content=\"0; url={url}\"></head><body><a href=\"{url}\">{label}</a></body></html>"
+                );
+                root.write(dest, html.as_bytes())
+            }
+        });
     }
 
-    let lines = errlog.into_inner().unwrap();
-    if let Ok(mut f) = fs::File::create(dir.join("dump_errors.log")) {
-        for l in &lines {
-            let _ = writeln!(f, "{l}");
-        }
+    let lines = errlog.into_inner();
+    let mut log = String::new();
+    for line in &lines {
+        eprintln!("{line}");
+        log.push_str(line);
+        log.push('\n');
     }
+    // The log is untrusted filesystem output too: never open it by an
+    // absolute path, follow an existing link, or suppress a write failure.
+    root.write(std::path::Path::new("dump_errors.log"), log.as_bytes())?;
     if errors.into_inner() > 0 {
         Ok(ExitCode::from(2))
     } else {
@@ -671,12 +679,233 @@ fn cmd_dump(args: &[String]) -> Result<ExitCode, Error> {
     }
 }
 
-/// Create the parent directory chain and write `data` at `dest`.
-fn write_entry(dest: &PathBuf, data: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+/// A directory capability: all archive-controlled traversal uses `openat`
+/// with `O_NOFOLLOW`, and publication replaces directory entries atomically.
+/// Keeping directory descriptors open avoids check-then-follow races when
+/// a parent path is replaced with a symlink. Replacing (rather than
+/// truncating) final files also leaves external hard-link targets intact.
+#[cfg(unix)]
+struct DumpRoot(std::fs::File);
+
+#[cfg(unix)]
+impl DumpRoot {
+    fn open(path: &std::path::Path) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        // This is the caller-selected root, not an archive-controlled path,
+        // so a symlinked `--dir` (e.g. macOS /tmp) is legitimate: resolve it
+        // once, then open the real directory. Everything below the root is
+        // archive-controlled and opened O_NOFOLLOW.
+        std::fs::create_dir_all(path)?;
+        let path = std::fs::canonicalize(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        Ok(Self(file))
     }
-    fs::write(dest, data)
+
+    fn parent(&self, path: &std::path::Path) -> io::Result<(std::fs::File, std::ffi::CString)> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Component;
+        let mut parts = path.components().peekable();
+        let mut dir = self.0.try_clone()?;
+        while let Some(part) = parts.next() {
+            let Component::Normal(part) = part else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "non-relative dump path",
+                ));
+            };
+            let name = std::ffi::CString::new(part.as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in dump path"))?;
+            if parts.peek().is_none() {
+                return Ok((dir, name));
+            }
+            let open = || unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            let mut fd = open();
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+                let made = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o777) };
+                if made < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(error);
+                    }
+                }
+                // Even if another process won mkdirat, never follow its link.
+                fd = open();
+            }
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            dir = unsafe { std::fs::File::from_raw_fd(fd) };
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty dump path",
+        ))
+    }
+
+    fn publish(
+        &self,
+        path: &std::path::Path,
+        create: impl Fn(&std::fs::File, &std::ffi::CStr) -> io::Result<()>,
+    ) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let (parent, name) = self.parent(path)?;
+        loop {
+            let temp = std::ffi::CString::new(format!(
+                ".zimdump-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+            .unwrap();
+            match create(&parent, &temp) {
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+                Ok(()) => {}
+            }
+            let result = unsafe {
+                libc::renameat(
+                    parent.as_raw_fd(),
+                    temp.as_ptr(),
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                )
+            };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            unsafe { libc::unlinkat(parent.as_raw_fd(), temp.as_ptr(), 0) };
+            return Err(error);
+        }
+    }
+
+    fn write(&self, path: &std::path::Path, data: &[u8]) -> io::Result<()> {
+        use std::io::Write as _;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        self.publish(path, |parent, name| {
+            let fd = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o666,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let result = file.write_all(data);
+            if result.is_err() {
+                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+            }
+            result
+        })
+    }
+
+    fn symlink(&self, path: &std::path::Path, target: &str) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let target = std::ffi::CString::new(target)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in redirect target"))?;
+        self.publish(path, |parent, name| {
+            let result =
+                unsafe { libc::symlinkat(target.as_ptr(), parent.as_raw_fd(), name.as_ptr()) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
+    }
+}
+
+// std::fs path-based writes cannot guarantee confinement against Windows
+// reparse-point races. Refuse extraction rather than claim a lexical path
+// filter provides that guarantee (or silently omit --redirect output).
+#[cfg(not(unix))]
+struct DumpRoot;
+
+#[cfg(not(unix))]
+impl DumpRoot {
+    fn open(_: &std::path::Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "root-confined extraction is not supported on this platform",
+        ))
+    }
+
+    fn write(&self, _: &std::path::Path, _: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "root-confined extraction is not supported on this platform",
+        ))
+    }
+
+    fn symlink(&self, _: &std::path::Path, _: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "root-confined extraction is not supported on this platform",
+        ))
+    }
+}
+
+/// Express a root-relative target from the directory containing `dest`.
+fn relative_target(dest: &std::path::Path, target: &str) -> String {
+    let depth = dest.components().count().saturating_sub(1);
+    let mut out = "../".repeat(depth);
+    if depth == 0 {
+        out.push_str("./");
+    }
+    out.push_str(target);
+    out
+}
+
+/// Encode filesystem path bytes as a URL, not a query/fragment or scheme.
+fn redirect_url(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(out, "%{byte:02X}").unwrap();
+        }
+    }
+    out
+}
+
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// True for errors caused by a file-vs-directory path collision:
@@ -694,8 +923,7 @@ fn is_collision(err: &std::io::Error) -> bool {
 /// entries whose natural path collides. `/` is escaped as `%2f` (and
 /// `%` as `%25`) so the entry lands as a single flat file, matching
 /// upstream zimdump.
-fn exception_dest(exceptions_dir: &PathBuf, rel: &str) -> std::io::Result<PathBuf> {
-    fs::create_dir_all(exceptions_dir)?;
+fn exception_dest(exceptions_dir: &std::path::Path, rel: &str) -> PathBuf {
     let mut esc = String::with_capacity(rel.len());
     for c in rel.chars() {
         match c {
@@ -710,7 +938,7 @@ fn exception_dest(exceptions_dir: &PathBuf, rel: &str) -> std::io::Result<PathBu
     if esc.is_empty() || esc == "." || esc == ".." {
         esc.insert(0, '_');
     }
-    Ok(exceptions_dir.join(esc))
+    exceptions_dir.join(esc)
 }
 
 /// Sanitize an entry path for use relative to the dump root. Entry
@@ -762,7 +990,3 @@ fn format_uuid(u: &[u8; 16]) -> String {
         u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15],
     )
 }
-
-// Re-use HashMap import for future expansions; keep noisy items at bottom.
-#[allow(dead_code)]
-fn _unused_hashmap_import_marker(_: HashMap<u32, u32>) {}

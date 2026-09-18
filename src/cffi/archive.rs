@@ -138,7 +138,9 @@ pub unsafe extern "C" fn zimru_archive_check(
     }
 }
 
-/// Look up an entry by its full namespaced path (e.g. `"C/index.html"`).
+/// Look up a content entry by path (e.g. `"home"`) on modern archives.
+/// Legacy archives require a full namespaced path (e.g. `"A/home"`).
+/// Use [`zimru_archive_get_entry_by_ns_path`] for explicit namespaces.
 /// Returns NULL with `*err` set if not found.
 #[no_mangle]
 pub unsafe extern "C" fn zimru_archive_get_entry_by_path(
@@ -543,7 +545,7 @@ pub unsafe extern "C" fn zimru_archive_main_entry(
 }
 
 /// URL-pointer index of the archive's main entry, or
-/// [`NO_MAIN_PAGE`] (`0xFFFFFFFF`) when no main entry is set in the
+/// [`crate::header::NO_MAIN_PAGE`] (`0xFFFFFFFF`) when no main entry is set in the
 /// header. Cheaper than [`zimru_archive_main_entry`] — avoids the
 /// dirent parse and the entry-handle allocation — for callers that
 /// only need the index (e.g. the libzim-shim's `getMainEntryIndex()`,

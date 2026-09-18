@@ -200,3 +200,125 @@ fn small_chunked_item_uses_buffered_path_and_bin_packs() {
 
     let _ = std::fs::remove_file(&out);
 }
+
+#[test]
+fn exact_chunk_sizes_are_enforced_and_recoverable_on_every_encoding_route() {
+    for (compression, threshold) in [
+        (Compression::None, 1),
+        (Compression::Zstd, 1),
+        (Compression::Xz, 1),
+        (Compression::Zstd, usize::MAX),
+    ] {
+        let out = tmp_path("exact-chunk-size");
+        let mut c = Creator::new();
+        c.set_compression(compression).set_compression_level(1);
+        c.set_streaming_encode_threshold(threshold);
+        c.start_writing(&out).unwrap();
+        assert!(c
+            .begin_chunked_item(
+                None,
+                "data".into(),
+                "bad\0title".into(),
+                "text/plain".into(),
+                Some(4),
+                None
+            )
+            .is_err());
+        c.begin_chunked_item(
+            None,
+            "data".into(),
+            "Data".into(),
+            "text/plain".into(),
+            Some(4),
+            None,
+        )
+        .unwrap();
+        c.chunked_item_chunk(b"ab").unwrap();
+        assert!(
+            c.end_chunked_item().is_err(),
+            "short input is not an exact-size item"
+        );
+        assert!(
+            c.chunked_item_chunk(b"XYZ").is_err(),
+            "overrun is rejected before writing"
+        );
+        c.chunked_item_chunk(b"cd").unwrap();
+        c.end_chunked_item().unwrap();
+        assert!(c.try_add_item(Item::text("data", "", "duplicate")).is_err());
+        c.begin_chunked_item(
+            None,
+            "unknown".into(),
+            "".into(),
+            "text/plain".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        c.chunked_item_chunk(b"unknown size").unwrap();
+        c.end_chunked_item().unwrap();
+        c.finish_writing().unwrap();
+        let arc = zimru::Archive::open(&out).unwrap();
+        assert_eq!(arc.get_bytes("data").unwrap(), b"abcd");
+        assert_eq!(arc.get_bytes("unknown").unwrap(), b"unknown size");
+        let _ = std::fs::remove_file(out);
+    }
+}
+
+#[test]
+fn item_builder_validates_before_reserving_and_commits_duplicate_protection() {
+    let out = tmp_path("builder-key");
+    let mut c = Creator::new();
+    c.start_writing(&out).unwrap();
+    assert!(c
+        .begin_item("item", "bad\0title", "text/plain", None, Some(usize::MAX))
+        .is_err());
+    assert!(c.begin_item("item", "", "", None, None).is_err());
+    let mut item = c
+        .begin_item("item", "", "text/plain", None, Some(1))
+        .unwrap();
+    item.write_chunk(b"a nonbinding size hint");
+    item.finish().unwrap();
+    assert!(c.begin_item("item", "", "text/plain", None, None).is_err());
+    c.finish_writing().unwrap();
+    let arc = zimru::Archive::open(&out).unwrap();
+    assert_eq!(arc.get_bytes("item").unwrap(), b"a nonbinding size hint");
+    let _ = std::fs::remove_file(out);
+}
+
+#[test]
+fn oversized_pipeline_items_roundtrip_with_a_tiny_cap_and_reproducible_bytes() {
+    let paths = [tmp_path("byte-cap-first"), tmp_path("byte-cap-second")];
+    for path in &paths {
+        let mut c = Creator::new();
+        c.set_compression(Compression::Zstd)
+            .set_compression_level(1);
+        c.set_uuid([0x51; 16]);
+        c.set_cluster_size_target(256);
+        c.set_max_in_flight_bytes(32);
+        c.start_writing(path).unwrap();
+        for i in 0u8..12 {
+            let body: Vec<u8> = (0..8192).map(|n| (n as u8).wrapping_add(i)).collect();
+            c.try_add_item(Item::new(
+                format!("blob-{i:02}"),
+                "",
+                "application/octet-stream",
+                body,
+            ))
+            .unwrap();
+        }
+        c.finish_writing().unwrap();
+        let arc = zimru::Archive::open(path).unwrap();
+        for i in 0u8..12 {
+            let expected: Vec<u8> = (0..8192).map(|n| (n as u8).wrapping_add(i)).collect();
+            assert_eq!(arc.get_bytes(&format!("blob-{i:02}")).unwrap(), expected);
+        }
+        assert!(arc.check().unwrap());
+    }
+    assert_eq!(
+        std::fs::read(&paths[0]).unwrap(),
+        std::fs::read(&paths[1]).unwrap()
+    );
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}

@@ -6,8 +6,8 @@
 //!   4. (If upstream is installed) run upstream `zimcheck -A` and confirm
 //!      the file passes.
 //!
-//! Skipped silently if `target/release/zimwriterfs` isn't built — the
-//! test is meant to run after `cargo build --release`.
+//! Cargo supplies the binary under test; optional installed tools are used only
+//! for additional interoperability checks.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,8 +16,7 @@ use std::process::Command;
 use zimru::Archive;
 
 fn binary() -> PathBuf {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(manifest).join("target/release/zimwriterfs")
+    PathBuf::from(env!("CARGO_BIN_EXE_zimwriterfs"))
 }
 
 fn upstream_zimcheck() -> Option<PathBuf> {
@@ -312,4 +311,233 @@ fn zimwriterfs_matches_upstream_writerfs_shape() {
     fs::remove_dir_all(&site).ok();
     fs::remove_file(&our_zim).ok();
     fs::remove_file(&up_zim).ok();
+}
+
+fn writer_command() -> Command {
+    let mut cmd = Command::new(binary());
+    cmd.args([
+        "--welcome=index.html",
+        "--illustration=icon48.png",
+        "--language=eng",
+        "--name=filesystem-regressions",
+        "--title=Filesystem regressions",
+        "--description=Original filesystem regression fixtures",
+        "--creator=zimru-tests",
+        "--publisher=zimru",
+    ]);
+    cmd
+}
+
+#[test]
+fn output_inside_source_is_rejected_before_creation_or_truncation() {
+    let root = tmp_dir("output-inside");
+    let site = root.join("site");
+    build_site(&site);
+    let original = fs::read(site.join("index.html")).unwrap();
+    for output in [site.join("archive.zim"), site.join("index.html")] {
+        let result = writer_command()
+            .arg("--without-indexes")
+            .arg(&site)
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "output inside source was accepted"
+        );
+        assert_eq!(fs::read(site.join("index.html")).unwrap(), original);
+        assert!(!site.join("archive.zim").exists());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn output_symlink_aliases_cannot_bypass_source_protection() {
+    use std::os::unix::fs::symlink;
+    let root = tmp_dir("output-alias");
+    let site = root.join("site");
+    build_site(&site);
+    let original = fs::read(site.join("index.html")).unwrap();
+    let alias = root.join("source-alias");
+    symlink(&site, &alias).unwrap();
+    let output_alias = root.join("output.zim");
+    symlink(site.join("index.html"), &output_alias).unwrap();
+    for (input, output) in [
+        (&site, alias.join("archive.zim")),
+        (&alias, site.join("index.html")),
+        (&site, output_alias.clone()),
+    ] {
+        let result = writer_command()
+            .arg("--without-indexes")
+            .arg(input)
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "aliased source output was accepted"
+        );
+        assert_eq!(fs::read(site.join("index.html")).unwrap(), original);
+        assert!(!site.join("archive.zim").exists());
+    }
+    assert!(fs::symlink_metadata(output_alias).unwrap().is_symlink());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replacing_hardlinked_output_preserves_source_bytes() {
+    let root = tmp_dir("output-hardlink");
+    let site = root.join("site");
+    build_site(&site);
+    let original = fs::read(site.join("index.html")).unwrap();
+    let output = root.join("archive.zim");
+    fs::hard_link(site.join("index.html"), &output).unwrap();
+    let result = writer_command()
+        .arg("--without-indexes")
+        .arg(&site)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read(site.join("index.html")).unwrap(), original);
+    let archive = Archive::open(&output).unwrap();
+    assert_eq!(archive.get_bytes("index.html").unwrap(), original);
+    assert!(archive.get_entry_by_path("archive.zim").is_err());
+    drop(archive);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_chains_must_end_at_an_ingested_file() {
+    use std::os::unix::fs::symlink;
+    let root = tmp_dir("symlink-graph");
+    let site = root.join("site");
+    build_site(&site);
+    fs::write(site.join(".hidden.html"), b"not ingested").unwrap();
+    fs::write(root.join("outside.html"), b"outside").unwrap();
+    for (link, target) in [
+        ("a", "b"),
+        ("b", "missing"),
+        ("cycle-a", "cycle-b"),
+        ("cycle-b", "cycle-a"),
+        ("cycle-parent", "cycle-a"),
+        ("self", "self"),
+        ("hidden", ".hidden.html"),
+        ("hidden-parent", "hidden"),
+        ("outside", "../outside.html"),
+        ("outside-parent", "outside"),
+        ("valid-a", "valid-b"),
+        ("valid-b", "index.html"),
+    ] {
+        symlink(target, site.join(link)).unwrap();
+    }
+    let output = root.join("archive.zim");
+    let result = writer_command()
+        .arg("--without-indexes")
+        .arg(&site)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let archive = Archive::open(&output).unwrap();
+    for missing in [
+        "a",
+        "b",
+        "cycle-a",
+        "cycle-b",
+        "cycle-parent",
+        "self",
+        "hidden",
+        "hidden-parent",
+        "outside",
+        "outside-parent",
+    ] {
+        assert!(archive.get_entry_by_path(missing).is_err(), "{missing}");
+    }
+    for valid in ["valid-a", "valid-b"] {
+        let entry = archive.get_entry_by_path(valid).unwrap();
+        assert!(entry.is_redirect());
+        assert_eq!(entry.resolve().unwrap().path(), "index.html");
+        assert_eq!(
+            archive.get_bytes(valid).unwrap(),
+            fs::read(site.join("index.html")).unwrap()
+        );
+    }
+    assert!(archive.check().unwrap());
+    drop(archive);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn large_extensionless_html_keeps_title_and_fulltext_body() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tmp_dir("large-sniffed-html");
+    let site = root.join("site");
+    build_site(&site);
+    let mut html = String::from(
+        "<!doctype html><html><head><title>Large sniffed article</title></head><body>",
+    );
+    html.push_str(&"x".repeat(4 * 1024 * 1024));
+    html.push_str("END-OF-LARGE-ARTICLE</body></html>");
+    fs::write(site.join("article"), &html).unwrap();
+    let mut media = vec![0x55; 4 * 1024 * 1024];
+    media[..3].copy_from_slice(b"\xff\xd8\xff");
+    fs::write(site.join("media"), &media).unwrap();
+    let helper = root.join("capture-helper");
+    fs::write(
+        &helper,
+        "#!/bin/sh\ncat > \"$CAPTURE_DIR/$1.jsonl\"\nprintf 'captured index' > \"$5\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = root.join("archive.zim");
+    let result = writer_command()
+        .arg("--xapianbuilder-path")
+        .arg(&helper)
+        .env("CAPTURE_DIR", &root)
+        .arg(&site)
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let archive = Archive::open(&output).unwrap();
+    assert_eq!(
+        archive.get_entry_by_path("article").unwrap().title(),
+        "Large sniffed article",
+    );
+    assert_eq!(archive.get_text("article").unwrap(), html);
+    assert_eq!(archive.get_bytes("media").unwrap(), media);
+    let title_docs = fs::read_to_string(root.join("title.jsonl")).unwrap();
+    assert!(title_docs
+        .lines()
+        .any(|line| line == r#"{"path":"article","title":"Large sniffed article"}"#));
+    let fulltext_docs = fs::read_to_string(root.join("fulltext.jsonl")).unwrap();
+    let article_doc = fulltext_docs
+        .lines()
+        .find(|line| line.starts_with(r#"{"path":"article","#))
+        .expect("sniffed HTML must be sent to the fulltext helper");
+    assert_eq!(
+        article_doc,
+        format!(
+            r#"{{"path":"article","title":"Large sniffed article","mimetype":"text/html","language":"eng","body":"{html}"}}"#
+        ),
+    );
+    assert!(!fulltext_docs.contains(r#""path":"media""#));
+    drop(archive);
+    fs::remove_dir_all(root).unwrap();
 }

@@ -58,7 +58,7 @@ fn usage() {
          zimru get <file> <path>\n  \
          zimru check <file>\n  \
          zimru mimes <file>\n  \
-         zimru readall <file> [--md5] [--quiet]"
+         zimru readall <file> [--md5] [--content-md5] [--quiet]"
     );
 }
 
@@ -201,9 +201,11 @@ fn cmd_readall(args: &[String]) -> Result<(), Error> {
     let path = args.first().ok_or_else(io_arg)?;
     let mut hash_md5 = false;
     let mut quiet = false;
+    let mut content_md5 = false;
     for a in &args[1..] {
         match a.as_str() {
             "--md5" => hash_md5 = true,
+            "--content-md5" => content_md5 = true,
             "--quiet" | "-q" => quiet = true,
             _ => {}
         }
@@ -228,8 +230,42 @@ fn cmd_readall(args: &[String]) -> Result<(), Error> {
     } else {
         None
     };
+    let mut content = content_md5.then(md5::Md5::new);
+    let mut content_entries = 0u64;
     for i in 0..n {
         let entry = arc.entry_by_url_index(i)?;
+        if let Some(h) = content.as_mut() {
+            let modern = arc.header().uses_new_namespaces();
+            // Mirrors zimrecreate's content rule: legacy Z (old Xapian
+            // index) is regenerated, not user content.
+            let included = if modern {
+                entry.namespace() == b'C'
+            } else {
+                !matches!(entry.namespace(), b'M' | b'X' | b'Z')
+            };
+            if included {
+                content_entries += 1;
+                // Length framing distinguishes boundaries, empty blobs and types.
+                // Legacy recreation qualifies paths before moving them into C.
+                let canonical_path = |e: &zimru::Entry| {
+                    if modern {
+                        e.path().to_owned()
+                    } else {
+                        format!("{}/{}", char::from(e.namespace()), e.path())
+                    }
+                };
+                hash_field(h, canonical_path(&entry).as_bytes());
+                hash_field(h, entry.title().as_bytes());
+                h.update([u8::from(entry.is_redirect())]);
+                if entry.is_redirect() {
+                    hash_field(h, canonical_path(&entry.get_redirect_entry()?).as_bytes());
+                } else {
+                    let item = entry.get_item(false)?;
+                    hash_field(h, item.mimetype().as_bytes());
+                    hash_field(h, item.get_data()?.data());
+                }
+            }
+        }
         if entry.is_redirect() {
             redirects += 1;
             continue;
@@ -259,7 +295,19 @@ fn cmd_readall(args: &[String]) -> Result<(), Error> {
             println!("blob_md5:       {}", hex_lower(&d));
         }
     }
+    if let Some(h) = content {
+        let digest: [u8; 16] = h.finalize().into();
+        // Explicit requested digests are machine-readable even with --quiet.
+        // This compares user entries, not regenerated M/X/W metadata or layout.
+        println!("content_entries: {content_entries}");
+        println!("content_md5: {}", hex_lower(&digest));
+    }
     Ok(())
+}
+
+fn hash_field(h: &mut md5::Md5, value: &[u8]) {
+    h.update((value.len() as u64).to_le_bytes());
+    h.update(value);
 }
 
 fn cmd_mimes(args: &[String]) -> Result<(), Error> {

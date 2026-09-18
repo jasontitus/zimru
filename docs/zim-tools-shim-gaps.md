@@ -1,5 +1,10 @@
 # Primitives needed for zim-tools 3.6.0 to build through libzim-shim
 
+> **Historical note.** This document describes an earlier revision and its
+> measurements or plans at the time of writing. It is not a statement of
+> current behavior, support or open bugs; for those see the README
+> compatibility matrix, the generated API docs and CHANGELOG.md.
+
 The `libzim-shim` repo (separate, GPL) presents a libzim-shaped
 C++ API on top of zimru's C ABI. It is currently good enough for
 `libkiwix` / `kiwix-tools` / `kiwix-serve` to build and run end-
@@ -16,7 +21,7 @@ methods named to match libzim's API.
 ## How to scope this work
 
 The right reference is **`zim-tools` source itself**, at
-`/Users/jasontitus/experiments/zim-tools/src/`. For each missing
+a local checkout of `zim-tools` (`src/`). For each missing
 method (the C++ build errors below list them) find the call
 sites in `zim-tools` and reason about what the *caller* needs to
 know about the underlying ZIM file. Then expose a primitive in

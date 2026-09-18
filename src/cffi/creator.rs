@@ -113,7 +113,7 @@ pub unsafe extern "C" fn zimru_creator_free(c: *mut zimru_creator_t) {
 /// * `5` — zstd, the default (`Compression::Zstd`)
 ///
 /// Other IDs return `false` with `*err` set to
-/// [`zimru_error_code::UnsupportedCompression`].
+/// [`crate::cffi::error::zimru_error_code_t::UnsupportedCompression`].
 #[no_mangle]
 pub unsafe extern "C" fn zimru_creator_set_compression(
     c: *mut zimru_creator_t,
@@ -213,7 +213,10 @@ pub unsafe extern "C" fn zimru_creator_set_main_path(
     if inner.is_null() {
         return false;
     }
-    (*inner).set_main_path(path);
+    if let Err(e) = (*inner).try_set_main_path(path) {
+        set_err(err, e);
+        return false;
+    }
     true
 }
 
@@ -361,7 +364,10 @@ pub unsafe extern "C" fn zimru_creator_add_metadata(
     if inner.is_null() {
         return false;
     }
-    (*inner).add_metadata_with_mimetype(name_str, mime_str, bytes);
+    if let Err(e) = (*inner).try_add_metadata_with_mimetype(name_str, mime_str, bytes) {
+        set_err(err, e);
+        return false;
+    }
     true
 }
 
@@ -383,7 +389,10 @@ pub unsafe extern "C" fn zimru_creator_add_illustration(
     if inner.is_null() {
         return false;
     }
-    (*inner).add_illustration(side, bytes);
+    if let Err(e) = (*inner).try_add_illustration(side, bytes) {
+        set_err(err, e);
+        return false;
+    }
     true
 }
 
@@ -411,7 +420,10 @@ pub unsafe extern "C" fn zimru_creator_add_redirection(
     if inner.is_null() {
         return false;
     }
-    (*inner).add_redirection(path_str, title_str, target_str);
+    if let Err(e) = (*inner).try_add_redirection(path_str, title_str, target_str) {
+        set_err(err, e);
+        return false;
+    }
     true
 }
 
@@ -534,7 +546,7 @@ pub unsafe extern "C" fn zimru_creator_finish_writing(
         set_err(err, crate::Error::EntryNotFound);
         return false;
     }
-    let Some(creator) = (*c).inner.take() else {
+    let Some(creator) = (*c).inner.as_ref() else {
         set_err(
             err,
             crate::Error::Io(std::io::Error::other(
@@ -543,6 +555,16 @@ pub unsafe extern "C" fn zimru_creator_finish_writing(
         );
         return false;
     };
+    if creator.peek_streaming().is_none() {
+        set_err(
+            err,
+            crate::Error::Io(std::io::Error::other(
+                "zimru_creator: finish_writing called before start_writing",
+            )),
+        );
+        return false;
+    }
+    let creator = (*c).inner.take().expect("creator checked above");
     match creator.finish_writing() {
         Ok(()) => true,
         Err(e) => {
@@ -565,16 +587,16 @@ pub unsafe extern "C" fn zimru_creator_finish_writing(
 /// Pass `0` for `namespace` to use the default routing
 /// (`X/...` peel, otherwise `'C'`).
 ///
-/// `size_hint` is a non-binding capacity hint used to pre-allocate
-/// the in-flight buffer. Pass `0` to skip.
+/// `size_hint` is non-binding: the body may be shorter or longer.
+/// Currently ignored; chunks are buffered until `end_item`. Pass `0`
+/// when the size is unknown.
 ///
 /// Errors:
 ///
 /// * Creator not in streaming mode → `*err` set, returns `false`.
 ///   Call `start_writing` first.
 /// * Another chunked item is already in flight → `*err` set,
-///   returns `false`. Call `end_item` (or `cancel_item` — TODO if
-///   needed) before starting a new one.
+///   returns `false`. Call `end_item` before starting a new one.
 #[no_mangle]
 pub unsafe extern "C" fn zimru_creator_begin_item(
     c: *mut zimru_creator_t,
@@ -616,19 +638,10 @@ pub unsafe extern "C" fn zimru_creator_begin_item(
         (Some(namespace), path_str)
     };
 
-    let expected_size = if size_hint > 0 {
-        Some(size_hint as u64)
-    } else {
-        None
-    };
-    match creator.begin_chunked_item(
-        resolved_ns,
-        resolved_path,
-        title_str,
-        mime_str,
-        expected_size,
-        None,
-    ) {
+    // A capacity hint is not an exact length. Passing Some to the Rust
+    // API would impose an exact-size contract on the C caller.
+    let _ = size_hint;
+    match creator.begin_chunked_item(resolved_ns, resolved_path, title_str, mime_str, None, None) {
         Ok(()) => true,
         Err(e) => {
             set_err(err, e);

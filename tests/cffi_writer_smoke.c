@@ -52,6 +52,63 @@ static const uint8_t MINIMAL_PNG[] = {
     0xae,0x42,0x60,0x82,
 };
 
+/* A recoverable lifecycle error must leave buffered content intact, and
+ * a capacity estimate must never become an exact byte-count promise. */
+static int streaming_contracts(const char *out_path, uint8_t compression) {
+    zimru_error_t *err = NULL;
+    zimru_creator_t *c = zimru_creator_new();
+    if (!c) DIE("streaming creator_new returned NULL");
+    if (!zimru_creator_set_compression(c, compression, &err))
+        DIE("streaming compression: %s", zimru_error_message(err));
+    if (!zimru_creator_add_item(c, "buffered", "Buffered", "text/plain",
+                               (const uint8_t *)"retained", 8, &err))
+        DIE("buffered add: %s", zimru_error_message(err));
+    if (zimru_creator_finish_writing(c, &err))
+        DIE("finish before start unexpectedly succeeded");
+    if (!err) DIE("finish before start did not report an error");
+    zimru_error_free(err);
+    err = NULL;
+
+    if (!zimru_creator_start_writing(c, out_path, &err))
+        DIE("start after premature finish: %s", zimru_error_message(err));
+    /* Exactly the streaming-encode threshold: previously this hint
+     * committed to a 256 MiB body and rejected the valid one-byte body. */
+    if (!zimru_creator_begin_item(c, 0, "hinted", "Hinted", "text/plain",
+                                  (size_t)256 * 1024 * 1024, &err))
+        DIE("begin hinted: %s", zimru_error_message(err));
+    if (!zimru_creator_item_chunk(c, (const uint8_t *)"x", 1, &err))
+        DIE("hinted chunk: %s", zimru_error_message(err));
+    if (!zimru_creator_end_item(c, &err))
+        DIE("end hinted: %s", zimru_error_message(err));
+    if (!zimru_creator_finish_writing(c, &err))
+        DIE("stream finish: %s", zimru_error_message(err));
+    zimru_creator_free(c);
+
+    zimru_archive_t *a = zimru_archive_open(out_path, &err);
+    if (!a) DIE("stream reopen: %s", zimru_error_message(err));
+    const char *paths[] = {"buffered", "hinted"};
+    const char *bodies[] = {"retained", "x"};
+    for (size_t i = 0; i < 2; ++i) {
+        zimru_entry_t *entry = zimru_archive_get_entry_by_path(a, paths[i], &err);
+        if (!entry) DIE("stream lookup %s: %s", paths[i], zimru_error_message(err));
+        zimru_item_t *item = zimru_entry_get_item(entry, false, &err);
+        if (!item) DIE("stream item: %s", zimru_error_message(err));
+        zimru_blob_t *blob = zimru_item_get_data(item, &err);
+        if (!blob) DIE("stream data: %s", zimru_error_message(err));
+        size_t len = strlen(bodies[i]);
+        if (zimru_blob_size(blob) != len ||
+            memcmp(zimru_blob_data(blob), bodies[i], len) != 0)
+            DIE("stream body mismatch for %s", paths[i]);
+        zimru_blob_free(blob);
+        zimru_item_free(item);
+        zimru_entry_free(entry);
+    }
+    if (!zimru_archive_check(a, &err))
+        DIE("stream checksum: %s", err ? zimru_error_message(err) : "mismatch");
+    zimru_archive_close(a);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) DIE("usage: %s <out.zim>", argv[0]);
     const char *out_path = argv[1];
@@ -75,6 +132,8 @@ int main(int argc, char **argv) {
         DIE("expected set_compression(99) to fail");
     }
     if (!bad_err) DIE("set_compression(99) failed silently");
+    if (zimru_error_code(bad_err) != zimru_error_code_t_UnsupportedCompression)
+        DIE("unsupported compression returned the wrong public error code");
     fprintf(stderr, "expected-bad-compression: %s\n", zimru_error_message(bad_err));
     zimru_error_free(bad_err);
 
@@ -139,6 +198,15 @@ int main(int argc, char **argv) {
     if (!zimru_creator_add_metadata(c, "Language", "text/plain;charset=utf-8",
                                     (const uint8_t *)"eng", 3, &err))
         DIE("add_metadata Language: %s", err ? zimru_error_message(err) : "?");
+
+    /* A rejected duplicate must cross the C boundary as an error, not
+     * a Rust panic, and must not replace the original metadata. */
+    zimru_error_t *duplicate_err = NULL;
+    if (zimru_creator_add_metadata(c, "Title", "text/plain",
+                                   (const uint8_t *)"replacement", 11, &duplicate_err))
+        DIE("duplicate metadata unexpectedly succeeded");
+    if (!duplicate_err) DIE("duplicate metadata failed silently");
+    zimru_error_free(duplicate_err);
 
     /* Metadata with a non-text mime — proves the per-entry mimetype
      * round-trips, not just the historical default. */
@@ -337,6 +405,9 @@ int main(int argc, char **argv) {
         DIE("check_mimetypes: %s", err ? zimru_error_message(err) : "false");
 
     zimru_archive_close(a);
+
+    if (streaming_contracts(out_path, 1 /* raw */)) return 1;
+    if (streaming_contracts(out_path, 5 /* zstd */)) return 1;
 
     fprintf(stderr, "writer-smoke: OK (%s)\n", out_path);
     return 0;

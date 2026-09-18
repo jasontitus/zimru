@@ -228,6 +228,7 @@ struct LogLine {
 /// Structured payload attached to each log entry, so the JSON output can
 /// reproduce the per-check field shapes upstream emits.
 enum JsonExtra {
+    Plain,
     /// `-M` findings carry the message twice: once as `message`, once as
     /// `error` (upstream 3.8.0 emits both keys).
     Metadata,
@@ -271,7 +272,7 @@ struct Report {
     pass: bool,
     checks: Vec<Check>,
     /// Warnings emitted BEFORE the per-check phase (e.g. "integrity skipped"
-    /// from libzim's preamble). Printed right after the preamble [INFO]s.
+    /// from libzim's preamble). Printed right after the preamble `[INFO]`s.
     preamble_warns: Vec<String>,
     /// Every log line in emission order. zim-tools 3.8.0 interleaves
     /// findings with the phase headers that produced them (a dangling-link
@@ -317,6 +318,15 @@ impl Report {
             bucket: Bucket::Error,
             is_header: true,
             text: s.into(),
+        });
+    }
+    fn add_read_error(&mut self, check: Check, message: String) {
+        self.add_error(check, message.clone());
+        self.entries.push(JsonLog {
+            check,
+            level: "ERROR",
+            message,
+            extra: JsonExtra::Plain,
         });
     }
     fn add_error_body<S: Into<String>>(&mut self, _c: Check, s: S) {
@@ -412,6 +422,9 @@ impl Report {
                 println!("      \"check\" : \"{}\",", e.check.name());
                 println!("      \"level\" : \"{}\",", e.level);
                 match &e.extra {
+                    JsonExtra::Plain => {
+                        println!("      \"message\" : \"{}\"", esc(&e.message));
+                    }
                     JsonExtra::Metadata => {
                         println!("      \"message\" : \"{}\",", esc(&e.message));
                         println!("      \"error\" : \"{}\"", esc(&e.message));
@@ -488,7 +501,7 @@ fn run_checks(file: &str, arc: &Archive, o: &Opts) -> Report {
     if o.checks.contains(&Check::Integrity) {
         report.add_info("Verifying ZIM-archive structure integrity...".to_string());
         if let Err(e) = check_integrity(arc) {
-            report.add_error(
+            report.add_read_error(
                 Check::Integrity,
                 format!("ZIM file's low level structure is invalid: {e}"),
             );
@@ -564,26 +577,93 @@ fn run_checks(file: &str, arc: &Archive, o: &Opts) -> Report {
 fn check_integrity(arc: &Archive) -> Result<(), Error> {
     let h = arc.header();
     let n = h.entry_count;
-    // sample ~min(N, 256) dirents spread across the file, then validate every cluster
-    let sample = (n / 256).max(1);
-    for i in (0..n).step_by(sample as usize) {
-        let _ = arc.entry_by_url_index(i)?;
+    for (valid, name) in [
+        (arc.check_dirent_ptrs()?, "directory pointers"),
+        (arc.check_dirent_order()?, "directory order"),
+        (arc.check_title_index()?, "title indices"),
+        (arc.check_cluster_ptrs()?, "cluster pointers"),
+        (arc.check_mimetypes()?, "mimetype references"),
+    ] {
+        if !valid {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid {name}"),
+            )));
+        }
     }
-    // Validate every cluster parses and yields valid blob ranges.
-    //
-    // Parallel by cluster, like the -A content scan: each cluster is
-    // self-contained, and decoding them is what dominates -I on a
-    // gigabyte-scale archive (1.8 s of a 3.8 s run on the 1.1 GB Bashkir
-    // Wikipedia, against 2.0 s for the MD5 pass that follows). Running it
-    // one cluster at a time left -I as the only workload where upstream was
-    // faster.
-    //
-    // `min_by_key` rather than "first error wins": with work stealing the
-    // order failures surface in depends on scheduling, and the reported
-    // cluster has to be the same one on every run.
+    for index in [h.main_page, h.layout_page] {
+        if index != u32::MAX {
+            arc.entry_by_url_index(index)?;
+        }
+    }
+    let mut references: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut redirects = vec![None; n as usize];
+    // Parse every dirent, including ones omitted by article/title listings.
+    // A valid cluster table does not make an article's cluster/blob valid.
+    for i in 0..n {
+        let entry = arc.entry_by_url_index(i)?;
+        match entry.dirent() {
+            Dirent::Article(article) => {
+                if article.cluster >= h.cluster_count {
+                    return Err(Error::BadClusterIndex(article.cluster, h.cluster_count));
+                }
+                if arc.mime_list().get(article.mimetype).is_none() {
+                    return Err(Error::BadMimeIndex(article.mimetype));
+                }
+                references
+                    .entry(article.cluster)
+                    .or_default()
+                    .push(article.blob);
+            }
+            Dirent::Redirect(redirect) => {
+                if redirect.redirect_index >= n {
+                    return Err(Error::BadUrlIndex(redirect.redirect_index, n));
+                }
+                redirects[i as usize] = Some(redirect.redirect_index);
+            }
+        }
+    }
+    // Validate the graph in linear time without imposing an arbitrary
+    // redirect-depth limit on an otherwise valid chain.
+    let mut visited = vec![0u8; n as usize];
+    for start in 0..n as usize {
+        if visited[start] != 0 {
+            continue;
+        }
+        let mut current = start;
+        loop {
+            if visited[current] == 1 {
+                return Err(Error::RedirectLoop);
+            }
+            if visited[current] == 2 {
+                break;
+            }
+            visited[current] = 1;
+            match redirects[current] {
+                Some(next) => current = next as usize,
+                None => break,
+            }
+        }
+        current = start;
+        while visited[current] == 1 {
+            visited[current] = 2;
+            match redirects[current] {
+                Some(next) => current = next as usize,
+                None => break,
+            }
+        }
+    }
+    // Every cluster, including unreferenced ones, is validated. References
+    // are checked in the same pass to decode compressed clusters only once.
+    // Select failures by cluster index, independent of parallel scheduling.
     let first_err = (0..h.cluster_count)
         .into_par_iter()
-        .filter_map(|c| touch_cluster(arc, c).err().map(|e| (c, e)))
+        .filter_map(|c| {
+            let blobs = references.get(&c).map(Vec::as_slice).unwrap_or(&[]);
+            arc.validate_cluster_references(c, blobs)
+                .err()
+                .map(|e| (c, e))
+        })
         .min_by_key(|(c, _)| *c);
     if let Some((_, e)) = first_err {
         return Err(e);
@@ -596,16 +676,6 @@ fn check_integrity(arc: &Archive) -> Result<(), Error> {
         });
     }
     Ok(())
-}
-
-fn touch_cluster(arc: &Archive, c: u32) -> Result<(), Error> {
-    // Decode-and-walk each cluster's blob table so a corrupt or
-    // undecompressible payload actually fails `-I` instead of
-    // false-Passing on checksum-less archives. `validate_cluster`
-    // checks uncompressed clusters against the offset table in place —
-    // no multi-GB copy of conventionally-uncompressed Xapian/media
-    // clusters — and decodes compressed ones without caching.
-    arc.validate_cluster(c)
 }
 
 const REQUIRED_METADATA: &[&str] = &[
@@ -726,6 +796,7 @@ struct PerEntryFinding {
     url_index: u32,
     path: String,
     is_empty: bool,
+    read_error: Option<String>,
     md5: Option<[u8; 16]>,
     /// `(raw link exactly as written in the HTML, normalized target)` for
     /// every in-archive link whose target is missing.
@@ -760,9 +831,26 @@ fn scan_content(
     }
     let mime_list = arc.mime_list();
     let mut by_cluster: HashMap<u32, Vec<BlobRef>> = HashMap::new();
-    for entry in arc.iter_by_path() {
-        let Ok(e) = entry else { continue };
-        if e.is_redirect() || e.namespace() != b'C' {
+    let mut failures = Vec::new();
+    let content_ns = if arc.header().uses_new_namespaces() {
+        b'C'
+    } else {
+        b'A'
+    };
+    for (index, entry) in arc.iter_by_path().enumerate() {
+        let e = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(PerEntryFinding {
+                    url_index: index as u32,
+                    path: format!("directory entry {index}"),
+                    read_error: Some(error.to_string()),
+                    ..Default::default()
+                });
+                continue;
+            }
+        };
+        if e.is_redirect() || e.namespace() != content_ns {
             continue;
         }
         // Borrow the dirent (cloning it would copy url + title Strings
@@ -771,10 +859,16 @@ fn scan_content(
         let Dirent::Article(a) = e.dirent() else {
             continue;
         };
-        let is_html = mime_list
-            .get(a.mimetype)
-            .unwrap_or("application/octet-stream")
-            .starts_with("text/html");
+        let Some(mime) = mime_list.get(a.mimetype) else {
+            failures.push(PerEntryFinding {
+                url_index: e.index(),
+                path: a.url.clone(),
+                read_error: Some(Error::BadMimeIndex(a.mimetype).to_string()),
+                ..Default::default()
+            });
+            continue;
+        };
+        let is_html = mime.starts_with("text/html");
         by_cluster.entry(a.cluster).or_default().push(BlobRef {
             url_index: e.index(),
             path: a.url.clone(),
@@ -799,11 +893,21 @@ fn scan_content(
     let findings: Vec<PerEntryFinding> = cluster_keys
         .par_iter()
         .map(|&cidx| {
+            let blobs = by_cluster.get(&cidx).expect("cluster present");
             let cluster = match arc.cluster_uncached(cidx) {
                 Ok(c) => c,
-                Err(_) => return Vec::<PerEntryFinding>::new(),
+                Err(error) => {
+                    return blobs
+                        .iter()
+                        .map(|b| PerEntryFinding {
+                            url_index: b.url_index,
+                            path: b.path.clone(),
+                            read_error: Some(format!("cluster {cidx}: {error}")),
+                            ..Default::default()
+                        })
+                        .collect();
+                }
             };
-            let blobs = by_cluster.get(&cidx).expect("cluster present");
             let mut out = Vec::with_capacity(blobs.len());
             for b in blobs {
                 let mut f = PerEntryFinding {
@@ -811,9 +915,13 @@ fn scan_content(
                     path: b.path.clone(),
                     ..Default::default()
                 };
-                let Ok(bytes) = cluster.blob(b.blob) else {
-                    out.push(f);
-                    continue;
+                let bytes = match cluster.blob(b.blob) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        f.read_error = Some(format!("cluster {cidx}, blob {}: {error}", b.blob));
+                        out.push(f);
+                        continue;
+                    }
                 };
                 if do_empty && bytes.is_empty() {
                     f.is_empty = true;
@@ -853,6 +961,7 @@ fn scan_content(
 
     // Aggregate in url-pointer order so the report is deterministic.
     let mut findings = findings;
+    findings.append(&mut failures);
     findings.sort_by_key(|f| f.url_index);
     findings
 }
@@ -911,6 +1020,21 @@ fn emit_per_entry_findings(
     do_external: bool,
 ) {
     for f in findings {
+        if let Some(error) = &f.read_error {
+            let check = [
+                Check::Integrity,
+                Check::Empty,
+                Check::UrlEmpty,
+                Check::Redundant,
+                Check::UrlInternal,
+                Check::UrlExternal,
+            ]
+            .into_iter()
+            .find(|check| report.checks.contains(check))
+            .expect("content check selected");
+            report.add_read_error(check, format!("Cannot read article {}: {error}", f.path));
+            continue;
+        }
         if do_empty && f.is_empty {
             let msg = format!("Entry {} is empty", f.path);
             report.add_error(Check::Empty, format!("Empty Article: {msg}"));

@@ -128,38 +128,29 @@ fn compress_true_honours_creator_default() {
 
 #[test]
 fn streaming_raw_passthrough_for_huge_uncompressed_items() {
-    // Threshold for the streaming-encode dispatch is 256 MiB (real
-    // streetzim builds), but we don't want to allocate that in a unit
-    // test. Drive the same path with a small expected_size by using
-    // the buffered fallback — the dispatch logic that picks
-    // StreamingRaw for raw items is exercised by the higher-level
-    // `compress=Some(false)` flow regardless of size. The code path
-    // that matters here is "raw cluster header (info_byte=1) for a
-    // raw-flagged item routed through `begin_item`", which the
-    // following exercises via the buffered chunked path.
-    use std::io::Write as _;
+    // Exercise the raw streaming route with a small test payload.
 
     let out = tmp_path("chunked-raw");
     let mut c = Creator::new();
     c.set_compression(Compression::Zstd);
     c.set_cluster_strategy(ClusterStrategy::ByMime);
+    c.set_streaming_encode_threshold(1);
     c.start_writing(&out).expect("start");
 
     let body = vec![0xCD; 8 * 1024];
-    {
-        let mut b = c
-            .begin_item(
-                "huge.bin",
-                "Huge",
-                "application/octet-stream",
-                None,
-                Some(body.len()),
-            )
-            .expect("begin_item");
-        b.set_compress(Some(false));
-        b.write_chunk(&body);
-        b.finish().expect("finish");
+    c.begin_chunked_item(
+        None,
+        "huge.bin".into(),
+        "Huge".into(),
+        "application/octet-stream".into(),
+        Some(body.len() as u64),
+        Some(false),
+    )
+    .unwrap();
+    for chunk in body.chunks(1024) {
+        c.chunked_item_chunk(chunk).unwrap();
     }
+    c.end_chunked_item().unwrap();
 
     // Sibling compressed item to confirm both still coexist.
     c.add_item(Item::html("home", "Home", "<h1>Hi</h1>"));
@@ -179,8 +170,64 @@ fn streaming_raw_passthrough_for_huge_uncompressed_items() {
         Compression::Zstd
     );
     let _ = std::fs::remove_file(&out);
+}
 
-    // Use a noop write_all to keep the import alive (Drop ordering).
-    let mut sink = Vec::new();
-    sink.write_all(b"").unwrap();
+#[test]
+fn index_items_are_raw_even_with_explicit_compression_and_streaming() {
+    let out = tmp_path("raw-indexes");
+    let mut c = Creator::new();
+    c.set_compression(Compression::Zstd)
+        .set_compression_level(1);
+    c.set_streaming_encode_threshold(1);
+    c.start_writing(&out).unwrap();
+    c.add_item(Item::html("home", "Home", "<p>home</p>"));
+    c.add_item(
+        Item::in_namespace(
+            b'X',
+            "title/xapian",
+            "",
+            "application/octet-stream+xapian",
+            b"title index",
+        )
+        .with_compress(true),
+    );
+    c.begin_chunked_item(
+        Some(b'X'),
+        "fulltext/xapian".into(),
+        "".into(),
+        "application/octet-stream+xapian".into(),
+        Some(14),
+        Some(true),
+    )
+    .unwrap();
+    c.chunked_item_chunk(b"fulltext index").unwrap();
+    c.end_chunked_item().unwrap();
+    c.finish_writing().unwrap();
+    let arc = Archive::open(&out).unwrap();
+    for (path, expected) in [
+        ("title/xapian", b"title index".as_slice()),
+        ("fulltext/xapian", b"fulltext index".as_slice()),
+    ] {
+        let entry = arc
+            .iter_by_path()
+            .map(Result::unwrap)
+            .find(|e| e.namespace() == b'X' && e.path() == path)
+            .unwrap();
+        let item = entry.get_item(false).unwrap();
+        assert_eq!(item.bytes().unwrap(), expected);
+        assert_eq!(
+            arc.cluster(item.cluster_index()).unwrap().compression(),
+            Compression::None
+        );
+    }
+    let home = arc
+        .get_entry_by_path("home")
+        .unwrap()
+        .get_item(false)
+        .unwrap();
+    assert_eq!(
+        arc.cluster(home.cluster_index()).unwrap().compression(),
+        Compression::Zstd
+    );
+    let _ = std::fs::remove_file(out);
 }

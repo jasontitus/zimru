@@ -1,5 +1,10 @@
 # Wikipedia ZIM from dumps — feasibility study
 
+> **Historical note.** This document describes an earlier revision and its
+> measurements or plans at the time of writing. It is not a statement of
+> current behavior, support or open bugs; for those see the README
+> compatibility matrix, the generated API docs and CHANGELOG.md.
+
 The current Wikipedia ZIM build (zimfarm's `wikipedia_en_all_maxi`)
 is a **~10 day live crawl** of `en.wikipedia.org` via the
 MediaWiki Action API. The writer is a tiny fraction of that wall

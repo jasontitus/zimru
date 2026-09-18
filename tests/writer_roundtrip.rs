@@ -439,30 +439,28 @@ fn empty_title_normalises_to_url_for_correct_title_sort() {
         "text/css".to_string(),
         b"body{}".to_vec(),
     ));
+    c.add_item(Item::html("untitled.html", "", "<p>untitled</p>"));
     c.write_to(&out).expect("write");
 
     let arc = Archive::open(&out).expect("open");
-    // Expected title order using the url-fallback for empty-title
-    // items: "Article 1", "Test Site", "icon.png", "style.css".
-    // Auto-emitted "Counter" (M ns) and "listing/titleOrdered/v1"
-    // (X ns) trail the user-content C-namespace entries — namespace
-    // sorts after C bytewise. Filter them out for the equality
-    // check; what matters here is the relative ordering of the
-    // user items.
+    // Modern iteration uses the v1 article subset. Resources stay out,
+    // while an HTML entry with an empty title sorts by its path.
     let titles: Vec<String> = arc
         .iter_by_title()
         .map(|r| r.unwrap().title().to_string())
-        .filter(|t| t != "Counter" && t != "listing/titleOrdered/v1")
         .collect();
     assert_eq!(
         titles,
         vec![
             "Article 1".to_string(),
             "Test Site".to_string(),
-            "icon.png".to_string(),
-            "style.css".to_string(),
+            "untitled.html".to_string(),
         ],
         "title order should sort by effective title (url-fallback for empty)"
+    );
+    assert!(
+        arc.check_title_index().unwrap(),
+        "the full v0 table remains valid"
     );
 
     // Independent validation: real zimcheck -I must report Pass on the
@@ -574,4 +572,238 @@ fn auto_counter_counts_pending_content() {
         "M-namespace metadata must not be counted, got {counter:?}"
     );
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn v1_listing_contains_only_front_articles_at_final_url_indices() {
+    let out = tmp_path("article-listing");
+    let mut c = Creator::new();
+    c.set_compression(Compression::Zstd)
+        .set_compression_level(1);
+    c.add_item(Item::in_namespace(
+        b'A',
+        "legacy",
+        "Legacy",
+        "text/html",
+        b"legacy",
+    ));
+    c.add_item(Item::html("home", "Home", "<p>home</p>"));
+    c.add_item(Item::new(
+        "parameterized",
+        "Parameters",
+        "text/html;charset=utf-8",
+        b"<p>p</p>",
+    ));
+    c.add_item(Item::html("untitled.html", "", "<p>untitled</p>"));
+    c.add_item(Item::png("icon.png", "Icon", vec![1, 2, 3]));
+    c.add_item(Item::text("robots.txt", "Robots", "no"));
+    c.add_redirection("alias", "First", "chain");
+    c.add_redirection("chain", "Second", "home");
+    c.add_redirection("image-alias", "Not an article", "icon.png");
+    c.add_metadata_with_mimetype("HTML", "text/html", "<p>metadata</p>");
+    c.set_main_path("home");
+    for (namespace, path) in [(b'X', "aaa"), (b'X', "zzz"), (b'Z', "after-listing")] {
+        c.add_item(Item::in_namespace(
+            namespace,
+            path,
+            path,
+            "text/plain",
+            b"other",
+        ));
+    }
+    c.write_to(&out).unwrap();
+
+    let arc = Archive::open(&out).unwrap();
+    let entries: Vec<_> = arc.iter_by_path().map(Result::unwrap).collect();
+    let listing = entries
+        .iter()
+        .find(|e| e.namespace() == b'X' && e.path() == "listing/titleOrdered/v1")
+        .unwrap()
+        .get_item(false)
+        .unwrap();
+    assert_eq!(
+        arc.cluster(listing.cluster_index()).unwrap().compression(),
+        Compression::None
+    );
+    let bytes = listing.bytes().unwrap();
+    let expected_paths = ["alias", "home", "parameterized", "chain", "untitled.html"];
+    let expected_indices: Vec<u32> = expected_paths
+        .iter()
+        .map(|path| {
+            entries
+                .iter()
+                .position(|e| e.namespace() == b'C' && e.path() == *path)
+                .unwrap() as u32
+        })
+        .collect();
+    let expected_bytes: Vec<u8> = expected_indices
+        .iter()
+        .flat_map(|idx| idx.to_le_bytes())
+        .collect();
+    assert_eq!(
+        bytes, expected_bytes,
+        "listing must reference the final URL table"
+    );
+    assert_eq!(arc.title_count().unwrap(), expected_paths.len() as u32);
+    assert_eq!(
+        arc.iter_by_title()
+            .map(|e| e.unwrap().path().to_string())
+            .collect::<Vec<_>>(),
+        expected_paths
+    );
+    assert!(arc.check_title_index().unwrap());
+    let _ = std::fs::remove_file(out);
+}
+
+#[test]
+fn invalid_strings_are_rejected_without_reserving_keys_or_corrupting_output() {
+    for streaming in [false, true] {
+        let out = tmp_path("invalid-strings");
+        let mut c = Creator::new();
+        c.set_compression(Compression::None);
+        if streaming {
+            c.start_writing(&out).unwrap();
+        }
+        for item in [
+            Item::html("bad\0path", "Title", "x"),
+            Item::html("bad\npath", "Title", "x"),
+            Item::html("reusable", "bad\u{0085}title", "x"),
+            Item::in_namespace(0, "bad-ns", "Title", "text/plain", b"x"),
+        ] {
+            assert!(matches!(
+                c.try_add_item(item),
+                Err(zimru::Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput
+            ));
+        }
+        for mime in [
+            "",
+            "plain",
+            "/plain",
+            "text/",
+            "text/plain\0evil",
+            "text/\nplain",
+            "text/plain;missing-value",
+            "text/plain;charset=\"unterminated",
+        ] {
+            assert!(
+                c.try_add_item(Item::new("reusable", "Title", mime, b"x"))
+                    .is_err(),
+                "{mime:?}"
+            );
+        }
+        assert!(c.try_add_metadata("bad\0name", b"x").is_err());
+        assert!(c
+            .try_add_metadata_with_mimetype("Title", "text/plain\r\nbad", b"x")
+            .is_err());
+        assert!(c
+            .try_add_redirection("alias", "Alias", "bad\0target")
+            .is_err());
+        assert!(c.try_set_main_path("bad\0target").is_err());
+
+        c.try_add_item(Item::html("reusable", "Reusable", "original"))
+            .unwrap();
+        c.try_add_item(Item::new(
+            "café/日本語 page",
+            "A \"quoted\" title",
+            "text/plain; charset=\"utf-8\"",
+            b"unicode path",
+        ))
+        .unwrap();
+        c.try_add_metadata("Title", "valid title").unwrap();
+        c.try_add_redirection("alias", "Alias", "reusable").unwrap();
+        c.try_set_main_path("reusable").unwrap();
+        c.write_to(&out).unwrap();
+        let arc = Archive::open(&out).unwrap();
+        assert_eq!(arc.get_text("reusable").unwrap(), "original");
+        assert_eq!(arc.get_text("café/日本語 page").unwrap(), "unicode path");
+        assert_eq!(arc.get_text("alias").unwrap(), "original");
+        assert_eq!(arc.metadata_str("Title").unwrap(), "valid title");
+        assert_eq!(arc.main_path().unwrap(), "reusable");
+        assert!(arc.check().unwrap());
+        let _ = std::fs::remove_file(out);
+    }
+}
+
+#[test]
+fn duplicate_keys_are_rejected_across_entry_creation_apis() {
+    let out = tmp_path("duplicate-keys");
+    let mut c = Creator::new();
+    c.try_add_item(Item::html("home", "Home", "original"))
+        .unwrap();
+    assert!(c
+        .try_add_item(Item::html("home", "Replacement", "wrong"))
+        .is_err());
+    assert!(c.try_add_redirection("home", "Alias", "home").is_err());
+    c.try_add_metadata("Title", "original title").unwrap();
+    assert!(c
+        .try_add_item(Item::in_namespace(
+            b'M',
+            "Title",
+            "",
+            "text/plain",
+            b"wrong"
+        ))
+        .is_err());
+    c.try_add_illustration(48, b"original illustration")
+        .unwrap();
+    assert!(c
+        .try_add_metadata("Illustration_48x48@1", b"wrong")
+        .is_err());
+    c.try_set_main_path("home").unwrap();
+    assert!(c
+        .try_add_item(Item::in_namespace(
+            b'W',
+            "mainPage",
+            "",
+            "text/plain",
+            b"wrong"
+        ))
+        .is_err());
+    c.start_writing(&out).unwrap();
+    assert!(c
+        .try_add_item(Item::html("home", "Replacement", "wrong"))
+        .is_err());
+    assert!(c.try_add_metadata("Title", "replacement").is_err());
+    // Same path in a different namespace is a distinct key.
+    c.try_add_metadata("home", "metadata home").unwrap();
+    c.finish_writing().unwrap();
+    let arc = Archive::open(&out).unwrap();
+    assert_eq!(arc.get_text("home").unwrap(), "original");
+    assert_eq!(arc.metadata_str("Title").unwrap(), "original title");
+    assert_eq!(
+        arc.get_metadata("Illustration_48x48@1").unwrap(),
+        b"original illustration"
+    );
+    assert_eq!(arc.metadata_str("home").unwrap(), "metadata home");
+    let _ = std::fs::remove_file(out);
+}
+
+#[test]
+fn infallible_builders_panic_before_adding_invalid_entries() {
+    let out = tmp_path("builder-validation");
+    let mut c = Creator::new();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.add_item(Item::html("home", "invalid\0title", "wrong"));
+    }))
+    .is_err());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.add_metadata("bad\nname", "wrong");
+    }))
+    .is_err());
+    c.add_item(Item::html("home", "Home", "valid"));
+    c.write_to(&out).unwrap();
+    let arc = Archive::open(&out).unwrap();
+    assert_eq!(arc.get_text("home").unwrap(), "valid");
+    assert!(!arc.has_metadata("bad"));
+    let _ = std::fs::remove_file(out);
+}
+
+#[test]
+fn cyclic_redirects_return_an_error_instead_of_an_invalid_listing() {
+    let out = tmp_path("redirect-cycle");
+    let mut c = Creator::new();
+    c.add_redirection("a", "A", "b");
+    c.add_redirection("b", "B", "a");
+    assert!(c.write_to(&out).is_err());
+    let _ = std::fs::remove_file(out);
 }

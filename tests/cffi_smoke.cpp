@@ -106,6 +106,8 @@ int main(int argc, char** argv) {
         Err er(raw_err);
         die("get_entry_by_path(home): " + err_msg(er.get()));
     }
+    if (std::string_view(zimru_entry_path(e.get())) != "home")
+        die("modern entry path must be home without namespace prefix");
     std::cerr << "home title: " << zimru_entry_title(e.get()) << '\n';
 
     raw_err = nullptr;
@@ -114,6 +116,8 @@ int main(int argc, char** argv) {
         Err er(raw_err);
         die("get_item: " + err_msg(er.get()));
     }
+    if (std::string_view(zimru_item_path(it.get())) != "home")
+        die("modern item path must be home without namespace prefix");
     std::string_view mime = zimru_item_mimetype(it.get());
     std::cerr << "home mime: " << mime << '\n';
     if (mime != "text/html") die("expected text/html, got " + std::string(mime));

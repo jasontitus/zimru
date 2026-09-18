@@ -1,5 +1,10 @@
 # Real-archive round-trip benchmark: 1.1 GB Bashkir Wikipedia
 
+> **Historical note.** This document describes an earlier revision and its
+> measurements or plans at the time of writing. It is not a statement of
+> current behavior, support or open bugs; for those see the README
+> compatibility matrix, the generated API docs and CHANGELOG.md.
+
 Date: 2026-06-10. Environment: 4-core x86-64 Linux container, 15 GB RAM,
 4096 fd hard limit. Reference: official zim-tools static builds
 (3.6.0 musl; 3.2.0 from Ubuntu apt where noted). Source archive:

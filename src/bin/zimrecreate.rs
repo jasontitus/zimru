@@ -19,7 +19,7 @@
 //!   --cluster-size BYTES       cluster size target (default 2MiB)
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use zimru::writer::{ClusterStrategy, Creator, Item};
@@ -175,7 +175,15 @@ fn run(
     without_indexes: bool,
     xapianbuilder_path: Option<&std::path::Path>,
 ) -> Result<(), zimru::Error> {
+    ensure_distinct_output(Path::new(src), Path::new(dst))?;
     let source = Archive::open(src)?;
+    let legacy = !source.header().uses_new_namespaces();
+    // Keep all intermediate files beside the destination, but inside a
+    // directory exclusively created by this invocation. Only a completed
+    // archive is published; failures never truncate the source or destination.
+    let output_tmp = make_output_tmp_dir(Path::new(dst))?;
+    let _output_cleanup = index_helper::TmpDirCleanup(output_tmp.clone());
+    let output_path = output_tmp.join("archive.zim");
     // We're about to walk every entry + every cluster end-to-end,
     // so hint the kernel to prefetch sequentially.
     source.advise_sequential_scan();
@@ -192,24 +200,26 @@ fn run(
 
     // Forward the main path (if any).
     if source.has_main_entry() {
-        if let Ok(main) = source.main_path() {
-            creator.set_main_path(&main);
-        }
+        let main = source.main_entry()?.resolve()?;
+        let path = content_path(legacy, main.namespace(), main.path()).ok_or_else(|| {
+            zimru::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "main entry is outside the content namespace",
+            ))
+        })?;
+        creator.try_set_main_path(&path)?;
     }
 
     // Switch to streaming mode — bodies bin-pack into clusters and
     // stream-encode-write as we iterate the source. Peak RSS becomes
     // O(cluster_size_target × bucket_count) instead of O(total content).
-    creator.start_writing(dst)?;
+    creator.start_writing(&output_path)?;
 
     // Pull the source's M/Language metadata so we can pass it to
     // xapianbuilder. Empty (the helper will skip stemming if so).
     let language = read_metadata_string(&source, "Language").unwrap_or_default();
-    let dst_path = std::path::Path::new(dst);
-    let index_tmp = make_index_tmp_dir(dst_path)?;
-    // Removes the temp dir on every exit path, including early `?`
-    // returns (a corrupt source entry mid-iteration, say).
-    let _index_tmp_cleanup = index_helper::TmpDirCleanup(index_tmp.clone());
+    let index_tmp = output_tmp.join("indexes");
+    std::fs::create_dir(&index_tmp)?;
     // `-j` matches upstream: it drops the fulltext index only. The title
     // index still gets built, because that is what upstream's `-j` output
     // contains and what kiwix's suggestion box reads.
@@ -237,43 +247,9 @@ fn run(
     let ml = source.mime_list();
     let mut seen_metadata = std::collections::HashSet::new();
 
-    // Legacy (major-5) archives store user content spread over the old
-    // namespaces — 'A' articles, 'I'/'J' media, '-' layout — instead of
-    // the unified 'C'. Normalize those to 'C' before gating, so legacy
-    // input recreates with its content instead of silently producing a
-    // metadata-only archive whose regenerated `W/mainPage` redirect
-    // then dangles. The old 'B' (article meta) and 'U'/'V' (category)
-    // namespaces are deliberately NOT folded in: they key entries by
-    // the same url as their 'A' article, so folding them would mint
-    // duplicate C/<url> dirents; they're auxiliary data with no
-    // new-namespace equivalent and are dropped like 'X'.
-    let legacy = !source.header().uses_new_namespaces();
-    let effective_ns = |ns: u8| -> u8 {
-        if legacy && matches!(ns, b'A' | b'I' | b'J' | b'-') {
-            b'C'
-        } else {
-            ns
-        }
-    };
-    // Folding several legacy namespaces into one can still collide
-    // (e.g. 'A/foo' vs 'I/foo'); the writer has no duplicate-path
-    // detection, so dedupe here — first entry wins, matching the
-    // URL-pointer sort order of the source.
-    let mut seen_content_paths: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let mut note_content_path = |ns: u8, path: &str| -> bool {
-        if !legacy {
-            return true;
-        }
-        let fresh = seen_content_paths.insert(path.to_string());
-        if !fresh {
-            eprintln!(
-                "zimrecreate: skipping duplicate content path {}/{path} (legacy namespace fold)",
-                char::from(ns)
-            );
-        }
-        fresh
-    };
+    // A legacy URL includes its namespace. Retaining that prefix inside
+    // modern C preserves relative links (A/home -> ../I/icon), and avoids
+    // collisions between A/foo, I/foo and auxiliary B/U/V/W entries.
 
     // Pass 1 — dirents only (no cluster decompression): redirects and
     // small M-namespace entries are handled immediately; content
@@ -291,11 +267,12 @@ fn run(
     let mut pending: Vec<PendingContent> = Vec::new();
     for entry in source.iter_by_path() {
         let entry = entry?;
-        let ns = effective_ns(entry.namespace());
+        let ns = entry.namespace();
+        let content = is_content_namespace(legacy, ns);
         let path = entry.path();
         let title = entry.title();
 
-        if ns == b'W' && path == "mainPage" {
+        if !legacy && ns == b'W' && path == "mainPage" {
             continue;
         }
         if ns == b'X' {
@@ -307,58 +284,56 @@ fn run(
 
         match entry.dirent() {
             Dirent::Redirect(r) => {
-                if ns == b'C' {
+                if content {
+                    let path = content_path(legacy, ns, path).expect("content namespace");
                     // Look up the target's path so we can add it via the
                     // public redirection API.
                     let target = source.entry_by_url_index(r.redirect_index)?;
                     // `add_redirection` targets the content namespace —
                     // a redirect whose target lives elsewhere would be
                     // rewritten as C/<path>, never resolve, and fail the
-                    // build at finish_writing. Skip those instead.
-                    if effective_ns(target.namespace()) != b'C' {
-                        eprintln!(
-                            "zimrecreate: skipping redirect {} -> {}/{} (target outside the content namespace)",
-                            path,
-                            char::from(target.namespace()),
-                            target.path()
-                        );
-                    } else if !note_content_path(entry.namespace(), path) {
-                        // duplicate path after legacy namespace fold — skipped
-                    } else {
-                        let target_path = target.path().to_string();
-                        creator.add_redirection(
-                            path.to_string(),
+                    // build at finish_writing. Reject rather than lose it.
+                    if let Some(target_path) =
+                        content_path(legacy, target.namespace(), target.path())
+                    {
+                        creator.try_add_redirection(
+                            path.clone(),
                             title.to_string(),
                             target_path.clone(),
-                        );
+                        )?;
                         // Redirects belong in the title index only when their
                         // target is a front article (text/html), mirroring the
                         // content gate above and libzim's FRONT_ARTICLE rule.
                         // Without this, redirects pointing at assets (tiles,
                         // fonts, vector chunks) pollute the suggestion index.
-                        let target_is_front = match target.dirent() {
+                        let target_is_front = match target.resolve()?.dirent() {
                             Dirent::Article(a) => ml
                                 .get(a.mimetype)
                                 .is_some_and(|m| m.starts_with("text/html")),
                             Dirent::Redirect(_) => false,
                         };
                         if target_is_front {
-                            indexer.feed_title(path, title, &target_path);
+                            indexer.feed_title(&path, title, &target_path);
                         }
+                    } else {
+                        return Err(zimru::Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "redirect {path} targets an entry outside the content namespace"
+                            ),
+                        )));
                     }
                 }
                 // Redirects in W/M/X namespaces are rebuilt implicitly by
                 // re-adding the underlying entries.
             }
             Dirent::Article(a) => {
-                if ns == b'C' {
-                    if note_content_path(entry.namespace(), path) {
-                        pending.push(PendingContent {
-                            cluster: a.cluster,
-                            blob: a.blob,
-                            url_index: entry.index(),
-                        });
-                    }
+                if content {
+                    pending.push(PendingContent {
+                        cluster: a.cluster,
+                        blob: a.blob,
+                        url_index: entry.index(),
+                    });
                 } else if ns == b'M' {
                     // M-namespace entries are few and tiny; fetch them
                     // directly. Strip the special illustration path back
@@ -373,9 +348,9 @@ fn run(
                         .to_string();
                     let data = entry.get_item(false)?.bytes()?;
                     if let Some(side) = parse_illustration_path(path) {
-                        creator.add_illustration(side, data);
+                        creator.try_add_illustration(side, data)?;
                     } else if seen_metadata.insert(path.to_string()) {
-                        creator.add_metadata_with_mimetype(path, mime, data);
+                        creator.try_add_metadata_with_mimetype(path, mime, data)?;
                     }
                 }
             }
@@ -391,7 +366,7 @@ fn run(
         Some(orig) if !orig.is_empty() => format!("{orig}; recreated by {VERSION}"),
         _ => VERSION.to_string(),
     };
-    creator.add_metadata("Scraper", scraper);
+    creator.try_add_metadata("Scraper", scraper)?;
 
     // Pass 2 — content, grouped by source cluster so each cluster is
     // decompressed exactly once. Iterating in URL order instead visits
@@ -421,7 +396,8 @@ fn run(
                 i += 1;
                 continue;
             };
-            let path = entry.path();
+            let path = content_path(legacy, entry.namespace(), entry.path())
+                .expect("pending entries belong to the content namespace");
             let title = entry.title();
             let mime = ml.get(a.mimetype).unwrap_or("application/octet-stream");
             // The blob copy here is a known extra memcpy: the bytes
@@ -438,17 +414,17 @@ fn run(
             // 822k docs / 130 MB on a Hawaii OSM archive vs libzim's
             // handful of real place pages).
             if mime.starts_with("text/html") {
-                indexer.feed_title(path, title, "");
+                indexer.feed_title(&path, title, "");
                 let body = std::str::from_utf8(&data)
                     .map(std::borrow::Cow::Borrowed)
                     .unwrap_or_else(|_| String::from_utf8_lossy(&data));
-                indexer.feed_fulltext(path, title, mime, &body, &language);
+                indexer.feed_fulltext(&path, title, mime, &body, &language);
             }
-            let mut item = Item::new(path.to_string(), title.to_string(), mime.to_string(), data);
+            let mut item = Item::new(path, title.to_string(), mime.to_string(), data);
             if keep_raw {
                 item = item.with_compress(false);
             }
-            creator.add_item(item);
+            creator.try_add_item(item)?;
             i += 1;
         }
     }
@@ -465,6 +441,7 @@ fn run(
     }
 
     creator.finish_writing()?;
+    std::fs::rename(&output_path, dst)?;
     Ok(())
 }
 
@@ -473,26 +450,74 @@ fn read_metadata_string(archive: &Archive, name: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn make_index_tmp_dir(zim_file: &std::path::Path) -> Result<PathBuf, zimru::Error> {
-    let parent = zim_file.parent().unwrap_or(std::path::Path::new("."));
-    let stem = zim_file
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "zim".into());
-    let pid = std::process::id();
-    let dir = parent.join(format!(".{stem}.xapianbuilder.{pid}"));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
+/// Legacy `Z` held the old Xapian fulltext index (now rebuilt under `X`);
+/// copying it as content would re-pack a useless multi-hundred-MB database.
+fn is_content_namespace(legacy: bool, namespace: u8) -> bool {
+    if legacy {
+        !matches!(namespace, b'M' | b'X' | b'Z')
+    } else {
+        namespace == b'C'
     }
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+}
+
+fn content_path(legacy: bool, namespace: u8, path: &str) -> Option<String> {
+    is_content_namespace(legacy, namespace).then(|| {
+        if legacy {
+            format!("{}/{path}", char::from(namespace))
+        } else {
+            path.to_owned()
+        }
+    })
+}
+fn ensure_distinct_output(source: &Path, destination: &Path) -> Result<(), zimru::Error> {
+    let source_metadata = std::fs::metadata(source)?;
+    let destination_metadata = match std::fs::metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    let aliases = {
+        use std::os::unix::fs::MetadataExt;
+        source_metadata.dev() == destination_metadata.dev()
+            && source_metadata.ino() == destination_metadata.ino()
+    };
+    // Without a portable file-identity API, refuse existing destinations
+    // conservatively rather than risk replacing an alias of the input.
+    #[cfg(not(unix))]
+    let aliases = {
+        let _ = (source_metadata, destination_metadata);
+        true
+    };
+    if aliases {
+        return Err(zimru::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source and destination must be distinct files",
+        )));
+    }
+    Ok(())
+}
+
+fn make_output_tmp_dir(destination: &Path) -> Result<PathBuf, zimru::Error> {
+    let parent = destination.parent().unwrap_or(Path::new("."));
+    let pid = std::process::id();
+    for sequence in 0u64.. {
+        let dir = parent.join(format!(".zimrecreate-{pid}-{sequence}"));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("temporary directory sequence exhausted")
 }
 
 fn parse_illustration_path(path: &str) -> Option<u32> {
-    // "Illustration_NxN@1" -> Some(N)
+    // Only "Illustration_NxN@1" maps onto `add_illustration` (whose key is
+    // always `@1`); other scales are copied verbatim as metadata so they
+    // neither collide with the @1 key nor get silently dropped.
     let rest = path.strip_prefix("Illustration_")?;
-    let at_idx = rest.find('@')?;
-    let dims = &rest[..at_idx];
+    let dims = rest.strip_suffix("@1")?;
     let (w, h) = dims.split_once('x')?;
     let w: u32 = w.parse().ok()?;
     let h: u32 = h.parse().ok()?;

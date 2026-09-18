@@ -33,8 +33,7 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 
 # Each [[bin]] sets `test = false` so `cargo test` doesn't compile a
 # zero-test harness for it — integration tests live under `tests/` and shell
-# out to the built binaries. The exception is `zimsplit`, which does carry
-# `#[test]` fns for its part-suffix sequence.
+# out to the Cargo-built binaries (`env!("CARGO_BIN_EXE_*")`).
 
 [[bin]]
 name = "zimru"
@@ -59,9 +58,7 @@ test = false
 [[bin]]
 name = "zimsplit"
 path = "src/bin/zimsplit.rs"
-# Unlike the other bins this one carries unit tests (the part-suffix
-# sequence), so it needs a harness.
-test = true
+test = false
 
 [[bin]]
 name = "zimrecreate"
@@ -83,6 +80,8 @@ md-5 = { version = "0.10", features = ["asm"] }
 rayon = "1"
 thiserror = "2"
 lru = "0.12"
+# Poison-free locks for the writer byte budget and zimdump's shared state.
+parking_lot = "0.12"
 # Pure-Rust gzip (miniz_oxide backend) for `zimwriterfs --inflateHtml`.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
 
@@ -126,3 +125,8 @@ features = ["writer", "cffi"]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+# Cargo's default `strip = "debuginfo"` runs Apple `strip` on the cdylib,
+# which leaves the LINKEDIT string pool 4-byte aligned; Xcode 16+ `ld`
+# refuses to link against it ("mis-aligned LINKEDIT string pool"). macOS
+# debuginfo is unpacked into .o files regardless, so nothing is lost.
+strip = "none"

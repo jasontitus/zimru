@@ -22,13 +22,15 @@
 //! payload reaches `cluster_size_target` bytes (default 2 MiB, matching
 //! upstream `zimwriterfs`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write as _};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use md5::{Digest, Md5};
+use parking_lot::{Condvar, Mutex};
 
 use crate::cluster::Compression;
 use crate::error::{Error, Result};
@@ -73,6 +75,8 @@ pub struct Item {
     /// separate clusters, so a single ZIM can mix compressed and raw
     /// content (use case: streetzim's >500 MB routing chunks that bust
     /// PWA fzstd's per-cluster decompression cap).
+    /// Index/listing items in namespace `X` are always uncompressed, as
+    /// required by the public Search_indexes format, regardless of this flag.
     pub compress: Option<bool>,
 }
 
@@ -144,14 +148,16 @@ impl Item {
 /// Resolve an item's effective cluster compression given the
 /// Creator's default. `compress = Some(false)` always wins (raw); the
 /// other branches use the default verbatim.
-fn effective_compression(default: Compression, compress: Option<bool>) -> Compression {
-    match compress {
-        Some(false) => Compression::None,
-        // Some(true) and None both honour the Creator default. The
-        // explicit `true` exists so callers can document intent /
-        // round-trip a value that was originally `false` elsewhere
-        // without losing the override grammar.
-        _ => default,
+fn effective_compression(
+    default: Compression,
+    compress: Option<bool>,
+    namespace: Option<u8>,
+) -> Compression {
+    // Search_indexes requires every X-namespace index/listing to be raw.
+    if namespace == Some(b'X') || compress == Some(false) {
+        Compression::None
+    } else {
+        default
     }
 }
 
@@ -186,7 +192,7 @@ pub struct MetadataEntry {
 }
 
 /// Per-build statistics emitted by the streaming writer at finalize
-/// time. Held inside [`Streamer`] and printed to stderr if the
+/// time. Held by the writer and printed to stderr if the
 /// `ZIMRU_STATS=1` env var is set, or always when the binary
 /// passed `--verbose`-style instrumentation is wired in. The user-
 /// visible breakdown lets us pin where wall-time and bytes-out are
@@ -210,6 +216,9 @@ pub struct BuildStats {
     pub clusters_buffered: u64,
     pub clusters_streamed: u64,
     pub bytes_clusters_written: u64,
+    /// Peak allocated blob bytes queued or being processed by the encode pipeline.
+    /// A cluster larger than the configured limit runs alone.
+    pub peak_in_flight_bytes: usize,
     pub parallel_encode: Duration,
     pub streaming_encode: Duration,
     pub table_write: Duration,
@@ -277,6 +286,10 @@ impl BuildStats {
             mb(self.bytes_clusters_written),
             ratio
         );
+        eprintln!(
+            "  peak in-flight raw:   {:.1} MB",
+            mb(self.peak_in_flight_bytes as u64)
+        );
     }
 }
 
@@ -291,9 +304,8 @@ impl BuildStats {
 /// * **Buffered path**: each item gets its own cluster (since it
 ///   busts the 2 MiB bin-pack target) and is handed to the
 ///   continuous encode pipeline, where one worker per CPU
-///   compresses clusters concurrently. Peak memory is
-///   `queued_clusters × max_item_size + encoded_output`. Wall-time
-///   is excellent — every core compresses a cluster at full speed.
+///   compresses clusters concurrently. Allocated blob bytes are bounded by
+///   the pipeline's byte budget, except that one oversized cluster runs alone.
 /// * **Streaming-encode path**: chunks feed a zstd encoder writing
 ///   to a per-item temp file; zstdmt parallelises within the one
 ///   frame. Memory is bounded at ~zstd-encoder-state (~50 MB)
@@ -301,12 +313,8 @@ impl BuildStats {
 ///   finalize-time splice make it the slower path for items that
 ///   could have been buffered.
 ///
-/// Conclusion: streaming-encode is only worth it on items so big
-/// that buffering them would blow the memory budget. We pick
-/// 256 MiB as the cutoff: items below that go through the pipeline
-/// (memory peak `~workers × 256 MiB` worst case, fine), only truly
-/// huge items (e.g. texas's 1.74 GB `addr.json` and 516 MB
-/// `poi.json`) take the bounded-memory streaming path.
+/// The default cutoff is 256 MiB. Large known-size items use a dedicated
+/// streaming encoder; smaller items use the byte-budgeted cluster pipeline.
 pub(crate) const STREAMING_ENCODE_THRESHOLD: usize = 256 * 1024 * 1024;
 
 /// Builder for a chunked-input item — see [`Creator::begin_item`].
@@ -350,13 +358,7 @@ impl ItemBuilder<'_> {
             namespace: self.namespace,
             compress: self.compress,
         };
-        // Safe to unwrap because `begin_item` checked stream.is_some().
-        let s = self
-            .creator
-            .stream
-            .as_mut()
-            .expect("ItemBuilder requires streaming mode");
-        s.push_item(item)
+        self.creator.try_add_item(item)
     }
 }
 
@@ -381,7 +383,11 @@ pub(crate) enum ChunkedInFlight {
     /// Buffered: chunks append to `content`. At `finish` time the
     /// assembled body goes through `Streamer::push_item` like a
     /// regular `add_item` call.
-    Buffered { meta: ChunkedMeta, content: Vec<u8> },
+    Buffered {
+        meta: ChunkedMeta,
+        content: Vec<u8>,
+        expected_size: Option<u64>,
+    },
     /// Streaming-encode: chunks feed a zstd encoder that writes to
     /// a per-item *temp file* (not the main output). At
     /// `end_chunked_item` we hand the encoder + temp-file path off
@@ -393,7 +399,7 @@ pub(crate) enum ChunkedInFlight {
     StreamingZstd {
         meta: ChunkedMeta,
         encoder: zstd::stream::Encoder<'static, File>,
-        temp_path: std::path::PathBuf,
+        temp_path: TempPath,
         cluster_idx: u32,
         bytes_written: u64,
         expected_size: u64,
@@ -409,7 +415,7 @@ pub(crate) enum ChunkedInFlight {
     StreamingRaw {
         meta: ChunkedMeta,
         temp_file: File,
-        temp_path: std::path::PathBuf,
+        temp_path: TempPath,
         cluster_idx: u32,
         bytes_written: u64,
         expected_size: u64,
@@ -424,42 +430,106 @@ pub(crate) enum ChunkedInFlight {
 /// correct offset.
 pub(crate) struct StreamingTask {
     pub(crate) cluster_idx: u32,
-    pub(crate) handle: std::thread::JoinHandle<Result<(std::path::PathBuf, u64)>>,
+    pub(crate) handle: std::thread::JoinHandle<Result<(TempPath, u64)>>,
 }
 
-/// One queued cluster awaiting compression: `(cluster_idx, raw
-/// blobs, compression)`.
-type EncodeJob = (u32, Vec<Vec<u8>>, Compression);
+/// Owns cleanup on success, errors, and thread unwinding.
+pub(crate) struct TempPath(std::path::PathBuf);
+
+impl AsRef<Path> for TempPath {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A queued cluster and its byte-budget reservation. Sequence is local to
+/// the pipeline because streamed clusters can leave gaps in cluster indices.
+type EncodeJob = (u64, u32, Vec<Vec<u8>>, Compression, BytePermit);
+
+#[derive(Default)]
+struct ByteBudgetState {
+    used: usize,
+    peak: usize,
+}
+
+struct ByteBudget {
+    limit: usize,
+    state: Mutex<ByteBudgetState>,
+    available: Condvar,
+}
+
+impl ByteBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            state: Mutex::new(ByteBudgetState::default()),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>, bytes: usize) -> BytePermit {
+        let mut state = self.state.lock();
+        // Oversized jobs run alone. Subtraction avoids overflow both for
+        // oversized jobs and for a caller-supplied usize::MAX limit.
+        while state.used != 0 && bytes > self.limit.saturating_sub(state.used) {
+            self.available.wait(&mut state);
+        }
+        state.used += bytes;
+        state.peak = state.peak.max(state.used);
+        BytePermit {
+            budget: self.clone(),
+            bytes,
+        }
+    }
+}
+
+/// Held until the ordered writer consumes the encoded cluster: this also
+/// bounds out-of-order completions while an earlier cluster is still encoding.
+struct BytePermit {
+    budget: Arc<ByteBudget>,
+    bytes: usize,
+}
+
+impl Drop for BytePermit {
+    fn drop(&mut self) {
+        let mut state = self.budget.state.lock();
+        state.used -= self.bytes;
+        self.budget.available.notify_all();
+    }
+}
 
 /// What the pipeline's writer thread hands back at shutdown:
 /// `(file, advanced_file_pos, (cluster_idx, offset) pairs,
 /// cluster_count, bytes_written)`.
 type PipelineWriterDone = (File, u64, Vec<(u32, u64)>, u64, u64);
 
-/// Continuous encode pipeline: N worker threads pull cluster jobs
-/// from a bounded channel, compress them, and hand the encoded bytes
-/// to a dedicated writer thread that owns the output `File` and
-/// appends clusters in *completion* order (the ZIM format maps
-/// cluster index → offset through the cluster-pointer table, so
-/// on-disk order is free). Compared to the previous join-spawn batch
-/// model this removes the convoy barrier at the end of every batch —
-/// at high zstd levels a single slow cluster used to idle every
-/// other core until the batch completed.
-///
-/// Lifecycle: started lazily on the first cluster flush (taking the
-/// `File` from the `Streamer`), shut down by `shutdown_pipeline`
-/// before anything else needs the file. The bounded job channel is
-/// the memory backpressure: at most `bound` raw clusters are queued
-/// ahead of the workers.
+/// Continuous encode pipeline with byte-based backpressure. Workers encode
+/// concurrently; the writer appends in submission order for reproducible files.
+/// Every handle is joined even if encoding or writing fails.
 struct EncodePipeline {
-    job_tx: std::sync::mpsc::SyncSender<EncodeJob>,
-    /// Each worker returns the total time it spent inside
-    /// `encode_cluster` (for BuildStats).
+    job_tx: Option<std::sync::mpsc::SyncSender<EncodeJob>>,
+    budget: Arc<ByteBudget>,
+    next_sequence: u64,
     workers: Vec<std::thread::JoinHandle<Duration>>,
-    /// The writer thread returns the file, the advanced write
-    /// position, per-cluster offsets, cluster count, and bytes
-    /// written — or the first encode/write error.
-    writer: std::thread::JoinHandle<Result<PipelineWriterDone>>,
+    writer: Option<std::thread::JoinHandle<Result<PipelineWriterDone>>>,
+}
+
+impl Drop for EncodePipeline {
+    fn drop(&mut self) {
+        self.job_tx.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
+    }
 }
 
 /// Reserved bytes after the 80-byte header for the mime-type list.
@@ -507,25 +577,21 @@ pub enum ClusterStrategy {
 ///   stays in RAM until finalize. Convenient for tests.
 /// * **Streaming** — call `start_writing(path)`, then `add_*`, then
 ///   `finish_writing()`. Bodies are bin-packed into clusters and
-///   stream-encoded-and-written as items arrive; only dirent metadata
-///   (small, ~50 B/item) and the in-flight cluster's bytes
-///   (≤ `cluster_size_target × thread_count`) stay resident. Use this
-///   for production builds where peak RSS matters — typical reduction
-///   is ~600× on a multi-GB workload.
+///   stream-encoded-and-written as items arrive. Resident data includes dirent
+///   metadata, producer buckets, the byte-budgeted encode pipeline, and encoder
+///   state. See [`Creator::set_max_in_flight_bytes`] for the pipeline limit.
 pub struct Creator {
     items: Vec<Item>,
     redirections: Vec<Redirection>,
     metadata: Vec<MetadataEntry>,
     illustrations: Vec<(u32, Vec<u8>)>,
+    entry_keys: HashSet<[u8; 16]>,
     main_path: Option<String>,
     compression: Compression,
     compression_level: Option<i32>,
     cluster_size_target: usize,
-    /// Soft cap on raw bytes queued ahead of the encode workers.
-    /// `0` means "default" (2 queued clusters per worker). A
-    /// non-zero value sizes the pipeline's bounded job channel so
-    /// queued-but-unencoded clusters stay under the cap — trades
-    /// encoder utilisation for a tighter peak-RSS bound.
+    /// Limit on allocated blob bytes queued or in flight in the encode pipeline.
+    /// Zero selects a default based on worker count and cluster target size.
     max_in_flight_bytes: usize,
     uuid: [u8; 16],
     cluster_strategy: ClusterStrategy,
@@ -556,6 +622,7 @@ impl Creator {
             redirections: Vec::new(),
             metadata: Vec::new(),
             illustrations: Vec::new(),
+            entry_keys: HashSet::new(),
             main_path: None,
             compression: Compression::Zstd,
             compression_level: None,
@@ -570,7 +637,7 @@ impl Creator {
 
     /// Override the chunked-item size cutoff above which bodies take the
     /// bounded-memory streaming-encode path instead of being buffered
-    /// (default: [`STREAMING_ENCODE_THRESHOLD`], 256 MiB). Mainly for
+    /// (default: 256 MiB). Mainly for
     /// tests and memory-constrained builds; must be called before
     /// [`Creator::start_writing`].
     pub fn set_streaming_encode_threshold(&mut self, bytes: usize) -> &mut Self {
@@ -595,6 +662,39 @@ impl Creator {
         self
     }
 
+    /// 128-bit digest of `(namespace, path)`: duplicate detection must not
+    /// retain a second copy of every path for the whole build (hundreds of
+    /// MB on multi-million-entry recreates). MD5 is already linked for the
+    /// archive checksum; a collision can only cause a spurious duplicate
+    /// rejection, never a missed one.
+    fn entry_key_digest(namespace: u8, path: &str) -> [u8; 16] {
+        let mut h = Md5::new();
+        h.update([namespace]);
+        h.update(path.as_bytes());
+        h.finalize().into()
+    }
+
+    fn check_entry_key(&self, namespace: u8, path: &str) -> Result<()> {
+        if self
+            .entry_keys
+            .contains(&Self::entry_key_digest(namespace, path))
+        {
+            return Err(invalid_input(format!(
+                "duplicate entry key {}/{}",
+                char::from(namespace),
+                path
+            )));
+        }
+        Ok(())
+    }
+
+    fn record_entry_key(&mut self, namespace: u8, path: &str) {
+        self.entry_keys
+            .insert(Self::entry_key_digest(namespace, path));
+    }
+
+    /// Add an item, panicking on invalid input or an I/O error.
+    /// Use [`Creator::try_add_item`] to handle these errors.
     pub fn add_item(&mut self, item: Item) -> &mut Self {
         // Errors panic because the `&mut Self` builder return shape has
         // nowhere to put them. Callers that need to handle failure —
@@ -602,7 +702,7 @@ impl Creator {
         // `extern "C"` function is undefined behaviour — use
         // [`try_add_item`] instead.
         if let Err(e) = self.try_add_item(item) {
-            panic!("streaming add_item: {e}");
+            panic!("add_item: {e}");
         }
         self
     }
@@ -614,13 +714,21 @@ impl Creator {
     /// body into the current cluster and may encode and write that cluster
     /// out — so it can fail on a full disk or an I/O error partway through
     /// a build.
+    /// Paths and titles must not contain control characters; MIME types must
+    /// be valid media types. Duplicate `(namespace, path)` keys are rejected
+    /// before altering either the buffered or streaming build.
     pub fn try_add_item(&mut self, item: Item) -> Result<()> {
+        let namespace = item.namespace.unwrap_or(b'C');
+        validate_article(namespace, &item.path, &item.title, &item.mimetype)?;
+        self.check_entry_key(namespace, &item.path)?;
+        let key = Self::entry_key_digest(namespace, &item.path);
         if let Some(s) = self.stream.as_mut() {
-            s.push_item(item)
+            s.push_item(item)?;
         } else {
             self.items.push(item);
-            Ok(())
         }
+        self.entry_keys.insert(key);
+        Ok(())
     }
 
     /// True iff `start_writing` has been called and the creator is
@@ -642,12 +750,10 @@ impl Creator {
     /// mode hasn't been started.
     #[doc(hidden)]
     pub fn push_streaming_item(&mut self, item: Item) -> Result<()> {
-        match self.stream.as_mut() {
-            Some(s) => s.push_item(item),
-            None => Err(Error::Io(std::io::Error::other(
-                "push_streaming_item before start_writing",
-            ))),
+        if self.stream.is_none() {
+            return Err(invalid_input("push_streaming_item before start_writing"));
         }
+        self.try_add_item(item)
     }
 
     /// C-ABI-shape chunked-item begin. Internally dispatches between
@@ -656,6 +762,9 @@ impl Creator {
     /// `expected_size` and the effective compression. Streaming-encode
     /// bounds peak memory at ~zstd encoder state regardless of body
     /// size; the raw-passthrough variant is even cheaper.
+    /// `Some(size)` is an exact contract on every route, not a hint. A short
+    /// `end_chunked_item` call leaves the item open for additional chunks;
+    /// an oversized chunk is rejected without appending any of its bytes.
     #[doc(hidden)]
     pub fn begin_chunked_item(
         &mut self,
@@ -666,6 +775,9 @@ impl Creator {
         expected_size: Option<u64>,
         compress: Option<bool>,
     ) -> Result<()> {
+        validate_article(namespace.unwrap_or(b'C'), &path, &title, &mimetype)?;
+        self.check_entry_key(namespace.unwrap_or(b'C'), &path)?;
+        let key = Self::entry_key_digest(namespace.unwrap_or(b'C'), &path);
         let s = self.stream.as_mut().ok_or_else(|| {
             Error::Io(std::io::Error::other(
                 "begin_chunked_item before start_writing",
@@ -680,7 +792,9 @@ impl Creator {
                 compress,
             },
             expected_size,
-        )
+        )?;
+        self.entry_keys.insert(key);
+        Ok(())
     }
 
     /// Append a chunk to the in-flight chunked item. See
@@ -732,38 +846,63 @@ impl Creator {
                 "begin_item requires start_writing first",
             )));
         }
+        let path = path.into();
+        let title = title.into();
+        let mimetype = mimetype.into();
+        validate_article(namespace.unwrap_or(b'C'), &path, &title, &mimetype)?;
+        self.check_entry_key(namespace.unwrap_or(b'C'), &path)?;
         let mut content = Vec::new();
         if let Some(n) = size_hint {
-            content.reserve(n);
+            content
+                .try_reserve(n)
+                .map_err(|e| invalid_input(e.to_string()))?;
         }
         Ok(ItemBuilder {
             creator: self,
-            path: path.into(),
-            title: title.into(),
-            mimetype: mimetype.into(),
+            path,
+            title,
+            mimetype,
             namespace,
             content,
             compress: None,
         })
     }
 
+    /// Add a content redirect, panicking on invalid strings or duplicate keys.
+    /// Use [`Creator::try_add_redirection`] to handle these errors.
     pub fn add_redirection(
         &mut self,
         path: impl Into<String>,
         title: impl Into<String>,
         target: impl Into<String>,
     ) -> &mut Self {
+        self.try_add_redirection(path, title, target)
+            .unwrap_or_else(|e| panic!("add_redirection: {e}"));
+        self
+    }
+
+    /// Fallible sibling of [`Creator::add_redirection`].
+    pub fn try_add_redirection(
+        &mut self,
+        path: impl Into<String>,
+        title: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Result<()> {
         let r = Redirection {
             path: path.into(),
             title: title.into(),
             target_path: target.into(),
         };
+        validate_entry(b'C', &r.path, &r.title)?;
+        validate_text("redirect target", &r.target_path)?;
+        self.check_entry_key(b'C', &r.path)?;
+        self.record_entry_key(b'C', &r.path);
         if let Some(s) = self.stream.as_mut() {
             s.redirections.push(r);
         } else {
             self.redirections.push(r);
         }
-        self
+        Ok(())
     }
 
     /// Metadata entry, stored in the `M` namespace. The recorded mimetype
@@ -778,51 +917,107 @@ impl Creator {
         self.add_metadata_with_mimetype(name, DEFAULT_METADATA_MIMETYPE, value)
     }
 
+    /// Fallible sibling of [`Creator::add_metadata`].
+    pub fn try_add_metadata(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<()> {
+        self.try_add_metadata_with_mimetype(name, DEFAULT_METADATA_MIMETYPE, value)
+    }
+
     /// Metadata entry with an explicit mimetype. The mimetype is stored
     /// verbatim in the dirent's mimetype index — callers are responsible
     /// for choosing a value that downstream readers will recognise.
+    /// Panics on invalid strings or duplicate keys; use the fallible sibling
+    /// [`Creator::try_add_metadata_with_mimetype`] to handle these errors.
     pub fn add_metadata_with_mimetype(
         &mut self,
         name: impl Into<String>,
         mimetype: impl Into<String>,
         value: impl Into<Vec<u8>>,
     ) -> &mut Self {
+        self.try_add_metadata_with_mimetype(name, mimetype, value)
+            .unwrap_or_else(|e| panic!("add_metadata_with_mimetype: {e}"));
+        self
+    }
+
+    /// Fallible sibling of [`Creator::add_metadata_with_mimetype`].
+    pub fn try_add_metadata_with_mimetype(
+        &mut self,
+        name: impl Into<String>,
+        mimetype: impl Into<String>,
+        value: impl Into<Vec<u8>>,
+    ) -> Result<()> {
         let m = MetadataEntry {
             name: name.into(),
             mimetype: mimetype.into(),
             value: value.into(),
         };
+        validate_article(b'M', &m.name, &m.name, &m.mimetype)?;
+        self.check_entry_key(b'M', &m.name)?;
+        self.record_entry_key(b'M', &m.name);
         if let Some(s) = self.stream.as_mut() {
             s.metadata.push(m);
         } else {
             self.metadata.push(m);
         }
-        self
+        Ok(())
     }
 
     /// ZIM illustration (PNG) of the given side length. Stored at
     /// `M/Illustration_NxN@1`.
+    /// Panics on duplicate keys; use [`Creator::try_add_illustration`] to
+    /// handle these errors.
     pub fn add_illustration(&mut self, side: u32, png: impl Into<Vec<u8>>) -> &mut Self {
+        self.try_add_illustration(side, png)
+            .unwrap_or_else(|e| panic!("add_illustration: {e}"));
+        self
+    }
+
+    /// Fallible sibling of [`Creator::add_illustration`].
+    pub fn try_add_illustration(&mut self, side: u32, png: impl Into<Vec<u8>>) -> Result<()> {
+        let path = format!("Illustration_{side}x{side}@1");
+        self.check_entry_key(b'M', &path)?;
+        self.record_entry_key(b'M', &path);
         let il = (side, png.into());
         if let Some(s) = self.stream.as_mut() {
             s.illustrations.push(il);
         } else {
             self.illustrations.push(il);
         }
-        self
+        Ok(())
     }
 
     /// Declare the archive's main page. A `W/mainPage` redirect to this
     /// path is written at finalize time, matching how upstream tools
     /// expect to find the main page.
+    /// Panics on invalid strings or a conflicting `W/mainPage` entry; use
+    /// [`Creator::try_set_main_path`] to handle these errors.
     pub fn set_main_path(&mut self, path: impl Into<String>) -> &mut Self {
+        self.try_set_main_path(path)
+            .unwrap_or_else(|e| panic!("set_main_path: {e}"));
+        self
+    }
+
+    /// Fallible sibling of [`Creator::set_main_path`].
+    pub fn try_set_main_path(&mut self, path: impl Into<String>) -> Result<()> {
         let p: String = path.into();
+        validate_text("main path", &p)?;
+        let already_set = self
+            .stream
+            .as_ref()
+            .map_or(self.main_path.is_some(), |s| s.main_path.is_some());
+        if !already_set {
+            self.check_entry_key(b'W', "mainPage")?;
+            self.record_entry_key(b'W', "mainPage");
+        }
         if let Some(s) = self.stream.as_mut() {
             s.main_path = Some(p);
         } else {
             self.main_path = Some(p);
         }
-        self
+        Ok(())
     }
 
     pub fn set_compression(&mut self, c: Compression) -> &mut Self {
@@ -849,21 +1044,21 @@ impl Creator {
         self
     }
 
-    /// Soft cap on the number of raw bytes queued ahead of the
-    /// encode workers. Zero (the default) sizes the pipeline's
-    /// bounded job channel at 2 queued clusters per worker — enough
-    /// look-ahead that encoders never starve while the producer
-    /// reads source data.
+    /// Limit allocated blob bytes queued or being processed by the encode
+    /// pipeline, including active workers. Zero selects a default of three
+    /// target-sized clusters per worker.
     ///
-    /// A non-zero value re-sizes that channel so the raw clusters
-    /// waiting to be compressed stay under the cap, trading encoder
-    /// utilisation for a tighter peak RSS. Useful in
-    /// memory-constrained environments (Kiwix zimfarm worker,
-    /// embedded builds): for example pass `512 * 1024 * 1024` to
-    /// keep the queue under ~512 MiB on top of zimru's other
-    /// in-process state. Clusters being actively compressed (one
-    /// per worker) are additional to the cap.
+    /// Backpressure uses actual blob allocation sizes, not the number of
+    /// clusters. A single cluster larger than the limit is admitted only
+    /// when the pipeline is otherwise empty, so oversized items cannot
+    /// deadlock. Encoder state, encoded output, caller-owned data, and the
+    /// producer's current buckets are separate from this limit.
+    /// Must be called before [`Creator::start_writing`].
     pub fn set_max_in_flight_bytes(&mut self, bytes: usize) -> &mut Self {
+        assert!(
+            self.stream.is_none(),
+            "set_max_in_flight_bytes called after start_writing"
+        );
         self.max_in_flight_bytes = bytes;
         self
     }
@@ -991,6 +1186,95 @@ impl RawDirent {
     }
 }
 
+fn invalid_input(message: impl Into<String>) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message.into(),
+    ))
+}
+
+fn validate_text(field: &str, value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        return Err(invalid_input(format!(
+            "{field} contains a control character"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_entry(namespace: u8, path: &str, title: &str) -> Result<()> {
+    if !namespace.is_ascii_graphic() {
+        return Err(invalid_input("namespace must be a printable ASCII byte"));
+    }
+    validate_text("path", path)?;
+    validate_text("title", title)
+}
+
+fn validate_article(namespace: u8, path: &str, title: &str, mime: &str) -> Result<()> {
+    validate_entry(namespace, path, title)?;
+    validate_mime(mime)
+}
+
+fn validate_mime(mime: &str) -> Result<()> {
+    fn token(input: &mut &[u8]) -> bool {
+        let len = input
+            .iter()
+            .take_while(|&&b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+            .count();
+        *input = &input[len..];
+        len != 0
+    }
+    let invalid = || invalid_input(format!("invalid MIME type: {mime:?}"));
+    if mime.len() > MIME_LIST_RESERVE - 2
+        || !mime.is_ascii()
+        || mime.bytes().any(|b| b.is_ascii_control())
+    {
+        return Err(invalid());
+    }
+    let mut rest = mime.as_bytes();
+    if !token(&mut rest) || rest.first() != Some(&b'/') {
+        return Err(invalid());
+    }
+    rest = &rest[1..];
+    if !token(&mut rest) {
+        return Err(invalid());
+    }
+    loop {
+        rest = rest.trim_ascii_start();
+        if rest.is_empty() {
+            return Ok(());
+        }
+        if rest[0] != b';' {
+            return Err(invalid());
+        }
+        rest = rest[1..].trim_ascii_start();
+        if !token(&mut rest) {
+            return Err(invalid());
+        }
+        rest = rest.trim_ascii_start();
+        if rest.first() != Some(&b'=') {
+            return Err(invalid());
+        }
+        rest = rest[1..].trim_ascii_start();
+        if rest.first() == Some(&b'"') {
+            rest = &rest[1..];
+            loop {
+                match rest.first() {
+                    Some(b'"') => {
+                        rest = &rest[1..];
+                        break;
+                    }
+                    Some(b'\\') if rest.len() >= 2 => rest = &rest[2..],
+                    Some(b'\\') | None => return Err(invalid()),
+                    Some(_) => rest = &rest[1..],
+                }
+            }
+        } else if !token(&mut rest) {
+            return Err(invalid());
+        }
+    }
+}
+
 fn intern_mime(m: &str, mimes: &mut Vec<String>, index: &mut BTreeMap<String, u16>) -> Result<u16> {
     if let Some(&i) = index.get(m) {
         return Ok(i);
@@ -1004,6 +1288,12 @@ fn intern_mime(m: &str, mimes: &mut Vec<String>, index: &mut BTreeMap<String, u1
             "too many distinct mimetypes (limit {})",
             crate::dirent::MIME_DELETED
         ))));
+    }
+    let encoded_size = mimes.iter().map(|mime| mime.len() + 1).sum::<usize>() + m.len() + 2;
+    if encoded_size > MIME_LIST_RESERVE {
+        return Err(invalid_input(
+            "MIME list exceeds the reserved serialization space",
+        ));
     }
     let i = mimes.len() as u16;
     mimes.push(m.to_string());
@@ -1089,9 +1379,7 @@ struct Streamer {
     compression: Compression,
     compression_level: Option<i32>,
     cluster_size_target: usize,
-    /// Soft cap on raw bytes queued ahead of the encode workers (see
-    /// [`Creator::set_max_in_flight_bytes`]). 0 = unlimited; sizes
-    /// the pipeline's bounded job channel.
+    /// Byte-based pipeline limit; zero selects the worker/target-sized default.
     max_in_flight_bytes: usize,
     uuid: [u8; 16],
     main_path: Option<String>,
@@ -1217,19 +1505,17 @@ impl Streamer {
     fn start_pipeline(&mut self) -> Result<()> {
         use std::sync::mpsc::sync_channel;
         let threads = rayon::current_num_threads().max(1);
-        // Job-channel bound = memory backpressure. With a byte cap
-        // configured, size the queue so queued raw clusters stay
-        // under the cap; otherwise allow 2 queued clusters per
-        // worker so encoders never starve while the producer reads
-        // ahead.
-        let bound = if self.max_in_flight_bytes > 0 {
-            (self.max_in_flight_bytes / self.cluster_size_target.max(1)).max(1)
+        let limit = if self.max_in_flight_bytes == 0 {
+            self.cluster_size_target
+                .saturating_mul(threads)
+                .saturating_mul(3)
         } else {
-            threads * 2
+            self.max_in_flight_bytes
         };
-        let (job_tx, job_rx) = sync_channel::<EncodeJob>(bound);
-        let (out_tx, out_rx) = sync_channel::<Result<(u32, Vec<u8>)>>(threads * 2);
-        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+        let budget = Arc::new(ByteBudget::new(limit));
+        let (job_tx, job_rx) = sync_channel::<EncodeJob>(threads * 2);
+        let (out_tx, out_rx) = sync_channel::<(u64, u32, Result<Vec<u8>>, BytePermit)>(threads * 2);
+        let job_rx = Arc::new(Mutex::new(job_rx));
         let level = self.compression_level;
 
         let mut workers = Vec::with_capacity(threads);
@@ -1241,16 +1527,21 @@ impl Streamer {
                 loop {
                     // Hold the lock only for the recv handshake, not
                     // while encoding.
-                    let job = match job_rx.lock().unwrap().recv() {
+                    let job = match job_rx.lock().recv() {
                         Ok(j) => j,
                         Err(_) => break, // producer closed — done
                     };
-                    let (idx, blobs, comp) = job;
+                    let (sequence, idx, blobs, comp, permit) = job;
                     let t = Instant::now();
-                    let encoded = encode_cluster(&blobs, comp, level).map(|b| (idx, b));
+                    let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        encode_cluster(&blobs, comp, level)
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(Error::Io(std::io::Error::other("encode worker panicked")))
+                    });
                     busy += t.elapsed();
                     drop(blobs);
-                    if out_tx.send(encoded).is_err() {
+                    if out_tx.send((sequence, idx, encoded, permit)).is_err() {
                         break; // writer died (error already recorded there)
                     }
                 }
@@ -1265,35 +1556,58 @@ impl Streamer {
             let mut pos = file_pos;
             let mut offsets: Vec<(u32, u64)> = Vec::new();
             let mut bytes_written = 0u64;
-            while let Ok(msg) = out_rx.recv() {
-                let (idx, bytes) = msg?;
-                offsets.push((idx, pos));
-                file.write_all(&bytes)?;
-                pos += bytes.len() as u64;
-                bytes_written += bytes.len() as u64;
+            let mut next_sequence = 0;
+            let mut pending = BTreeMap::new();
+            while let Ok((sequence, idx, encoded, permit)) = out_rx.recv() {
+                pending.insert(sequence, (idx, encoded?, permit));
+                while let Some((idx, bytes, permit)) = pending.remove(&next_sequence) {
+                    offsets.push((idx, pos));
+                    file.write_all(&bytes)?;
+                    pos += bytes.len() as u64;
+                    bytes_written += bytes.len() as u64;
+                    next_sequence += 1;
+                    drop(bytes);
+                    drop(permit);
+                }
+            }
+            if !pending.is_empty() {
+                return Err(Error::Io(std::io::Error::other("missing encoded cluster")));
             }
             let clusters = offsets.len() as u64;
             Ok((file, pos, offsets, clusters, bytes_written))
         });
 
         self.pipeline = Some(EncodePipeline {
-            job_tx,
+            job_tx: Some(job_tx),
+            budget,
+            next_sequence: 0,
             workers,
-            writer,
+            writer: Some(writer),
         });
         Ok(())
     }
 
-    /// Queue one cluster for compression, starting the pipeline if
-    /// needed. Blocks only when the bounded job queue is full
-    /// (memory backpressure) — compression and file writes happen on
-    /// the pipeline's own threads.
+    /// Submit a cluster, waiting for its actual allocated blob bytes to fit
+    /// the pipeline budget before it can become queued or active work.
     fn send_cluster(&mut self, idx: u32, blobs: Vec<Vec<u8>>, comp: Compression) -> Result<()> {
         if self.pipeline.is_none() {
             self.start_pipeline()?;
         }
-        let tx = &self.pipeline.as_ref().expect("pipeline running").job_tx;
-        if tx.send((idx, blobs, comp)).is_err() {
+        let p = self.pipeline.as_mut().expect("pipeline running");
+        let bytes = blobs.iter().try_fold(0usize, |total, blob| {
+            total
+                .checked_add(blob.capacity())
+                .ok_or_else(|| invalid_input("cluster allocation size overflow"))
+        })?;
+        let permit = p.budget.acquire(bytes);
+        let sequence = p.next_sequence;
+        p.next_sequence += 1;
+        if p.job_tx
+            .as_ref()
+            .expect("pipeline sender")
+            .send((sequence, idx, blobs, comp, permit))
+            .is_err()
+        {
             // Workers/writer went away — shut down to surface the
             // underlying encode/write error.
             self.shutdown_pipeline()?;
@@ -1309,18 +1623,31 @@ impl Streamer {
     /// and fold the results into `cluster_offsets` / `file_pos` /
     /// stats. Must be called before any access to `self.file`.
     fn shutdown_pipeline(&mut self) -> Result<()> {
-        if let Some(p) = self.pipeline.take() {
-            drop(p.job_tx); // workers drain the queue then exit
+        if let Some(mut p) = self.pipeline.take() {
+            p.job_tx.take();
             let mut busy = Duration::ZERO;
-            for w in p.workers {
-                busy += w
-                    .join()
-                    .map_err(|_| Error::Io(std::io::Error::other("encode worker panicked")))?;
+            let mut worker_panicked = false;
+            for worker in p.workers.drain(..) {
+                match worker.join() {
+                    Ok(duration) => busy += duration,
+                    Err(_) => worker_panicked = true,
+                }
             }
-            let (file, file_pos, offsets, clusters, bytes_written) = p
+            // Join the writer even when a worker failed.
+            let result = p
                 .writer
+                .take()
+                .expect("pipeline writer")
                 .join()
-                .map_err(|_| Error::Io(std::io::Error::other("cluster writer panicked")))??;
+                .map_err(|_| Error::Io(std::io::Error::other("cluster writer panicked")))?;
+            if worker_panicked {
+                return Err(Error::Io(std::io::Error::other("encode worker panicked")));
+            }
+            let (file, file_pos, offsets, clusters, bytes_written) = result?;
+            self.stats.peak_in_flight_bytes = self
+                .stats
+                .peak_in_flight_bytes
+                .max(p.budget.state.lock().peak);
             self.file = Some(file);
             self.file_pos = file_pos;
             for (idx, off) in offsets {
@@ -1399,15 +1726,22 @@ impl Streamer {
                 "begin_chunked_item: another chunked item is already in flight",
             )));
         }
-        let comp = effective_compression(self.compression, meta.compress);
-        let big_enough = expected_size.is_some_and(|s| s as usize >= self.streaming_threshold);
+        validate_article(
+            meta.namespace.unwrap_or(b'C'),
+            &meta.path,
+            &meta.title,
+            &meta.mimetype,
+        )?;
+        if expected_size.is_some_and(|size| size > u64::MAX - 16) {
+            return Err(invalid_input("chunked item size overflows cluster offsets"));
+        }
+        let comp = effective_compression(self.compression, meta.compress, meta.namespace);
+        let big_enough = expected_size.is_some_and(|s| s >= self.streaming_threshold as u64);
         let stream_zstd = big_enough && matches!(comp, Compression::Zstd);
         let stream_raw = big_enough && matches!(comp, Compression::None);
 
         if stream_zstd || stream_raw {
             let expected = expected_size.unwrap();
-            self.stats.items_streamed += 1;
-            self.stats.raw_bytes_total += expected;
 
             // Allocate cluster_idx now (placeholder offset filled in
             // at finalize, when we splice the temp file's bytes into
@@ -1417,7 +1751,6 @@ impl Streamer {
             // doing whatever they were doing — they write to
             // `self.file`, we write somewhere else.
             let cluster_idx = self.cluster_offsets.len() as u32;
-            self.cluster_offsets.push(0);
 
             // Intern this item's mime so we can record it in the dirent.
             let mime_idx = intern_mime(&meta.mimetype, &mut self.mimes, &mut self.mime_index)?;
@@ -1470,9 +1803,9 @@ impl Streamer {
             let mut tmp_file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .open(&temp_path)?;
+            let temp_path = TempPath(temp_path);
             tmp_file.write_all(&[info_byte])?;
 
             if stream_zstd {
@@ -1527,18 +1860,29 @@ impl Streamer {
                     mime_idx,
                 });
             }
+            self.cluster_offsets.push(0);
+            self.stats.items_streamed += 1;
+            self.stats.raw_bytes_total += expected;
             return Ok(());
         }
 
         // Buffered path — accumulate chunks into a Vec, push as a
         // regular item at end_chunked_item time. The per-item compress
         // flag rides through `meta` and is honoured at push_item.
-        let capacity = expected_size.map(|s| s as usize).unwrap_or(0);
+        let capacity = expected_size
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| invalid_input("chunked item does not fit address space"))?
+            .unwrap_or(0);
         let mut content = Vec::new();
-        if capacity > 0 {
-            content.reserve(capacity);
-        }
-        self.in_flight = Some(ChunkedInFlight::Buffered { meta, content });
+        content
+            .try_reserve(capacity)
+            .map_err(|e| invalid_input(e.to_string()))?;
+        self.in_flight = Some(ChunkedInFlight::Buffered {
+            meta,
+            content,
+            expected_size,
+        });
         Ok(())
     }
 
@@ -1547,7 +1891,16 @@ impl Streamer {
             None => Err(Error::Io(std::io::Error::other(
                 "chunked_item_chunk: no item in flight",
             ))),
-            Some(ChunkedInFlight::Buffered { content, .. }) => {
+            Some(ChunkedInFlight::Buffered {
+                content,
+                expected_size,
+                ..
+            }) => {
+                if expected_size.is_some_and(|size| {
+                    chunk.len() as u64 > size.saturating_sub(content.len() as u64)
+                }) {
+                    return Err(invalid_input("chunked body exceeds expected size"));
+                }
                 content.extend_from_slice(chunk);
                 Ok(())
             }
@@ -1557,12 +1910,8 @@ impl Streamer {
                 expected_size,
                 ..
             }) => {
-                if *bytes_written + chunk.len() as u64 > *expected_size {
-                    return Err(Error::Io(std::io::Error::other(format!(
-                        "chunked_item_chunk: body exceeds expected size {} > {}",
-                        *bytes_written + chunk.len() as u64,
-                        *expected_size
-                    ))));
+                if chunk.len() as u64 > expected_size.saturating_sub(*bytes_written) {
+                    return Err(invalid_input("chunked body exceeds expected size"));
                 }
                 let phase_start = Instant::now();
                 let r = encoder
@@ -1583,12 +1932,8 @@ impl Streamer {
                 expected_size,
                 ..
             }) => {
-                if *bytes_written + chunk.len() as u64 > *expected_size {
-                    return Err(Error::Io(std::io::Error::other(format!(
-                        "chunked_item_chunk: body exceeds expected size {} > {}",
-                        *bytes_written + chunk.len() as u64,
-                        *expected_size
-                    ))));
+                if chunk.len() as u64 > expected_size.saturating_sub(*bytes_written) {
+                    return Err(invalid_input("chunked body exceeds expected size"));
                 }
                 let phase_start = Instant::now();
                 let r = temp_file
@@ -1603,11 +1948,38 @@ impl Streamer {
     }
 
     fn end_chunked_item(&mut self) -> Result<()> {
+        // Keep an incomplete item open so callers can append missing bytes and
+        // retry. Taking it first would strand a streaming cluster-offset slot.
+        let lengths = match self.in_flight.as_ref() {
+            Some(ChunkedInFlight::Buffered {
+                content,
+                expected_size: Some(size),
+                ..
+            }) => Some((content.len() as u64, *size)),
+            Some(ChunkedInFlight::StreamingZstd {
+                bytes_written,
+                expected_size,
+                ..
+            })
+            | Some(ChunkedInFlight::StreamingRaw {
+                bytes_written,
+                expected_size,
+                ..
+            }) => Some((*bytes_written, *expected_size)),
+            _ => None,
+        };
+        if let Some((actual, expected)) = lengths {
+            if actual != expected {
+                return Err(invalid_input(format!(
+                    "chunked body size mismatch: got {actual}, expected {expected}"
+                )));
+            }
+        }
         match self.in_flight.take() {
             None => Err(Error::Io(std::io::Error::other(
                 "end_chunked_item: no item in flight",
             ))),
-            Some(ChunkedInFlight::Buffered { meta, content }) => self.push_item(Item {
+            Some(ChunkedInFlight::Buffered { meta, content, .. }) => self.push_item(Item {
                 path: meta.path,
                 title: meta.title,
                 mimetype: meta.mimetype,
@@ -1620,16 +1992,9 @@ impl Streamer {
                 encoder,
                 temp_path,
                 cluster_idx,
-                bytes_written,
-                expected_size,
                 mime_idx,
+                ..
             }) => {
-                if bytes_written != expected_size {
-                    return Err(Error::Io(std::io::Error::other(format!(
-                        "end_chunked_item: body size mismatch (got {}, expected {})",
-                        bytes_written, expected_size
-                    ))));
-                }
                 // Commit the dirent now — the cluster_idx is already
                 // allocated. The actual cluster-offset slot stays at
                 // its placeholder 0 until finalize splices the
@@ -1654,14 +2019,13 @@ impl Streamer {
                 // continue feeding the encode pipeline. The bg
                 // thread also returns the final compressed-byte
                 // count so finalize knows how many bytes to splice.
-                let temp_path_for_thread = temp_path.clone();
-                let handle = std::thread::spawn(move || -> Result<(std::path::PathBuf, u64)> {
+                let handle = std::thread::spawn(move || -> Result<(TempPath, u64)> {
                     let file = encoder
                         .finish()
                         .map_err(|e| Error::Decompression(format!("zstd finish: {e}")))?;
                     let bytes = file.metadata()?.len();
                     drop(file); // close the temp file
-                    Ok((temp_path_for_thread, bytes))
+                    Ok((temp_path, bytes))
                 });
                 self.streaming_tasks.push(StreamingTask {
                     cluster_idx,
@@ -1674,16 +2038,9 @@ impl Streamer {
                 temp_file,
                 temp_path,
                 cluster_idx,
-                bytes_written,
-                expected_size,
                 mime_idx,
+                ..
             }) => {
-                if bytes_written != expected_size {
-                    return Err(Error::Io(std::io::Error::other(format!(
-                        "end_chunked_item: body size mismatch (got {}, expected {})",
-                        bytes_written, expected_size
-                    ))));
-                }
                 let title = if meta.title.is_empty() {
                     meta.path.clone()
                 } else {
@@ -1703,11 +2060,10 @@ impl Streamer {
                 // finalize splice. Wrap in a JoinHandle-shaped task
                 // so `drain_streaming_tasks` can treat both variants
                 // uniformly.
-                let temp_path_for_thread = temp_path.clone();
-                let handle = std::thread::spawn(move || -> Result<(std::path::PathBuf, u64)> {
+                let handle = std::thread::spawn(move || -> Result<(TempPath, u64)> {
                     let bytes = temp_file.metadata()?.len();
                     drop(temp_file);
-                    Ok((temp_path_for_thread, bytes))
+                    Ok((temp_path, bytes))
                 });
                 self.streaming_tasks.push(StreamingTask {
                     cluster_idx,
@@ -1732,16 +2088,24 @@ impl Streamer {
         }
         let phase_start = Instant::now();
         let tasks = std::mem::take(&mut self.streaming_tasks);
-        // Collect (cluster_idx, temp_path, bytes) tuples; bail on
-        // any thread panic / encode error.
-        let mut completed: Vec<(u32, std::path::PathBuf, u64)> = Vec::new();
+        // Join every task before returning an error; completed scratch files
+        // are owned by TempPath and cleaned even if a later join or splice fails.
+        let mut completed: Vec<(u32, TempPath, u64)> = Vec::new();
+        let mut error = None;
         for t in tasks {
-            let cluster_idx = t.cluster_idx;
-            let res = t.handle.join().map_err(|_| {
-                Error::Io(std::io::Error::other("streaming-encode thread panicked"))
-            })?;
-            let (temp_path, encoded_bytes) = res?;
-            completed.push((cluster_idx, temp_path, encoded_bytes));
+            let result = t
+                .handle
+                .join()
+                .map_err(|_| Error::Io(std::io::Error::other("streaming-encode thread panicked")))
+                .and_then(|result| result);
+            match result {
+                Ok((temp_path, bytes)) => completed.push((t.cluster_idx, temp_path, bytes)),
+                Err(e) if error.is_none() => error = Some(e),
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = error {
+            return Err(error);
         }
         // Splice in cluster_idx order — readers index into
         // cluster_ptrs by cluster_idx, so the on-disk byte order
@@ -1761,8 +2125,6 @@ impl Streamer {
             let mut tf = std::fs::File::open(&temp_path)?;
             let copied = std::io::copy(&mut tf, self.file_mut())?;
             drop(tf);
-            // Best-effort cleanup; non-fatal if it fails.
-            let _ = std::fs::remove_file(&temp_path);
             self.file_pos += copied;
             self.stats.clusters_streamed += 1;
             self.stats.bytes_clusters_written += bytes;
@@ -1819,6 +2181,12 @@ impl Streamer {
     /// it belongs to, flush that bucket if it overflows, record the
     /// pending dirent (committed at the bucket's next flush).
     fn push_item(&mut self, item: Item) -> Result<()> {
+        validate_article(
+            item.namespace.unwrap_or(b'C'),
+            &item.path,
+            &item.title,
+            &item.mimetype,
+        )?;
         let mime_idx = intern_mime(&item.mimetype, &mut self.mimes, &mut self.mime_index)?;
         let title = if item.title.is_empty() {
             item.path.clone()
@@ -1829,7 +2197,7 @@ impl Streamer {
         let body_len = body.len();
         self.stats.items_buffered += 1;
         self.stats.raw_bytes_total += body_len as u64;
-        let comp = effective_compression(self.compression, item.compress);
+        let comp = effective_compression(self.compression, item.compress, item.namespace);
         // Take the scratch buffer out of `self` so composing the key can
         // borrow it while the rest of `self` stays free for the calls
         // below; it goes back at the end, keeping its capacity.
@@ -1861,6 +2229,9 @@ impl Streamer {
             mime_idx,
             blob_idx,
         });
+        if bucket.size_bytes >= self.cluster_size_target {
+            self.flush_bucket(key)?;
+        }
         self.key_scratch = scratch;
         Ok(())
     }
@@ -2060,12 +2431,39 @@ impl Streamer {
         }
         self.dirents.extend(pending_redirects);
 
+        // Reserve the auto-listing's dirent before sorting. Every index below
+        // therefore refers to the final URL list, even with custom namespaces.
+        let generate_listing = !self
+            .dirents
+            .iter()
+            .any(|d| d.namespace() == b'X' && d.url() == "listing/titleOrdered/v1");
+        if generate_listing {
+            let mime_idx = intern_mime(
+                "application/octet-stream+zimlisting",
+                &mut self.mimes,
+                &mut self.mime_index,
+            )?;
+            self.dirents.push(RawDirent::Article {
+                namespace: b'X',
+                url: "listing/titleOrdered/v1".to_string(),
+                title: "listing/titleOrdered/v1".to_string(),
+                mime_idx,
+                cluster: u32::MAX,
+                blob: 0,
+            });
+        }
+
         // 4. Sort dirents by (ns, url) → URL-pointer order.
         self.dirents.sort_unstable_by(|a, b| {
             a.namespace()
                 .cmp(&b.namespace())
                 .then_with(|| a.url().cmp(b.url()))
         });
+        if self.dirents.windows(2).any(|pair| {
+            pair[0].namespace() == pair[1].namespace() && pair[0].url() == pair[1].url()
+        }) {
+            return Err(invalid_input("duplicate archive entry key"));
+        }
 
         // 5. Resolve redirect targets to URL-pointer-order indices.
         //    Two passes (collect then apply) so the binary search can
@@ -2121,59 +2519,75 @@ impl Streamer {
             }
         }
 
-        // 6a. Compute the title-pointer order for the dirents we
-        //     have so far. This becomes the body of the
-        //     `X/listing/titleOrdered/v1` listing entry we're
-        //     about to emit. The listing entry itself isn't in
-        //     this snapshot — its content lists every other
-        //     entry's URL-pointer index in title order, but not
-        //     its own. Real libzim's reader doesn't need the
-        //     listing entry to refer to itself, so this is fine.
-        let title_order_snapshot: Vec<u32> = {
-            let mut t: Vec<u32> = (0..self.dirents.len() as u32).collect();
-            t.sort_unstable_by(|&a, &b| {
-                let da = &self.dirents[a as usize];
-                let db = &self.dirents[b as usize];
-                da.namespace()
-                    .cmp(&db.namespace())
-                    .then_with(|| da.title().cmp(db.title()))
+        // v1 is an article-only listing, unlike the full v0 header table.
+        // Follow redirect chains once, memoizing eligibility and detecting
+        // cycles without quadratic walks or recursion on adversarial input.
+        let mut eligibility = vec![0u8; self.dirents.len()];
+        let mut chain = Vec::new();
+        for start in 0..self.dirents.len() {
+            let mut current = start;
+            let eligible = loop {
+                match eligibility[current] {
+                    1 => return Err(invalid_input("redirect cycle")),
+                    2 => break false,
+                    3 => break true,
+                    _ => {}
+                }
+                eligibility[current] = 1;
+                chain.push(current);
+                match &self.dirents[current] {
+                    RawDirent::Article {
+                        namespace,
+                        mime_idx,
+                        ..
+                    } => {
+                        let media_type = self.mimes[*mime_idx as usize]
+                            .split(';')
+                            .next()
+                            .unwrap()
+                            .trim();
+                        break *namespace == b'C' && media_type.eq_ignore_ascii_case("text/html");
+                    }
+                    RawDirent::Redirect { resolved_index, .. } => {
+                        current = resolved_index.expect("redirect targets resolved") as usize;
+                    }
+                }
+            };
+            for idx in chain.drain(..) {
+                eligibility[idx] = if eligible { 3 } else { 2 };
+            }
+        }
+        if generate_listing {
+            let mut title_order: Vec<u32> = self
+                .dirents
+                .iter()
+                .enumerate()
+                .filter(|(idx, d)| d.namespace() == b'C' && eligibility[*idx] == 3)
+                .map(|(idx, _)| idx as u32)
+                .collect();
+            title_order.sort_unstable_by(|&a, &b| {
+                self.dirents[a as usize]
+                    .title()
+                    .cmp(self.dirents[b as usize].title())
+                    .then_with(|| a.cmp(&b))
             });
-            t
-        };
-
-        // 6b. Emit `X/listing/titleOrdered/v1`. Its body is the
-        //     `title_order_snapshot` serialised as little-endian
-        //     u32s (4 bytes per entry). Real libzim writes this
-        //     entry uncompressed; ours goes through the same zstd
-        //     path as everything else, which is fine — the
-        //     reader-side just zstd-decodes and indexes into the
-        //     resulting bytes. Mimetype matches real libzim's so
-        //     `zimcheck -A` is happy.
-        //
-        //     Skip if a caller already added an
-        //     `X/listing/titleOrdered/v1` (e.g. zimrecreate
-        //     forwarding from the source ZIM).
-        let listing_already_set = self
-            .dirents
-            .iter()
-            .any(|d| d.namespace() == b'X' && d.url() == "listing/titleOrdered/v1");
-        if !listing_already_set {
-            let mut listing_bytes: Vec<u8> = Vec::with_capacity(title_order_snapshot.len() * 4);
-            for idx in &title_order_snapshot {
+            let mut listing_bytes = Vec::with_capacity(title_order.len() * 4);
+            for idx in title_order {
                 listing_bytes.extend_from_slice(&idx.to_le_bytes());
             }
-            self.push_item(Item {
-                path: "listing/titleOrdered/v1".to_string(),
-                title: "listing/titleOrdered/v1".to_string(),
-                mimetype: "application/octet-stream+zimlisting".to_string(),
-                content: listing_bytes,
-                namespace: Some(b'X'),
-                compress: None,
-            })?;
-            // Flush so the listing's cluster commits and its
-            // dirent lands in `self.dirents` for the final sort
-            // below.
-            self.flush_all_buckets()?;
+            let cluster_idx = self.cluster_offsets.len() as u32;
+            self.cluster_offsets.push(0);
+            let listing = self
+                .dirents
+                .iter_mut()
+                .find(|d| d.namespace() == b'X' && d.url() == "listing/titleOrdered/v1")
+                .expect("listing placeholder");
+            if let RawDirent::Article { cluster, .. } = listing {
+                *cluster = cluster_idx;
+            }
+            self.stats.items_buffered += 1;
+            self.stats.raw_bytes_total += listing_bytes.len() as u64;
+            self.send_cluster(cluster_idx, vec![listing_bytes], Compression::None)?;
         }
 
         // 6b.5. Drain background streaming-encode tasks now that
@@ -2182,17 +2596,6 @@ impl Streamer {
         //       in cluster_idx order; cluster_offsets slots that
         //       were placeholders get their final positions.
         self.drain_streaming_tasks()?;
-
-        // 6c. Re-sort dirents with the new listing entry in place.
-        //     Adding an X-namespace entry doesn't shift C-, M-, or
-        //     W-namespace URL-pointer indices, so resolved redirect
-        //     targets (always C in our pipeline) stay valid — no
-        //     re-resolution needed.
-        self.dirents.sort_unstable_by(|a, b| {
-            a.namespace()
-                .cmp(&b.namespace())
-                .then_with(|| a.url().cmp(b.url()))
-        });
 
         // 6d. Final title-pointer order — over all dirents
         //     including the listing entry. This is what gets
@@ -2370,6 +2773,16 @@ impl Streamer {
     }
 }
 
+impl Drop for Streamer {
+    fn drop(&mut self) {
+        let _ = self.shutdown_pipeline();
+        self.in_flight.take();
+        for task in self.streaming_tasks.drain(..) {
+            let _ = task.handle.join();
+        }
+    }
+}
+
 /// Re-open `path` and run zimru's structural integrity checks.
 /// Returns `Err` with a descriptive message on the first failure.
 ///
@@ -2540,16 +2953,15 @@ fn encode_cluster(
         return Ok(bytes);
     }
 
-    let mut payload = Vec::with_capacity(payload_len);
+    // Only materialize offsets. Feed the blobs directly to each encoder,
+    // rather than duplicating the entire raw cluster while it is in flight.
+    let mut header = Vec::with_capacity(header_len);
     let mut cursor: u64 = header_len as u64;
     for b in blobs {
-        push_offset(&mut payload, cursor, extended);
+        push_offset(&mut header, cursor, extended);
         cursor += b.len() as u64;
     }
-    push_offset(&mut payload, cursor, extended);
-    for b in blobs {
-        payload.extend_from_slice(b);
-    }
+    push_offset(&mut header, cursor, extended);
 
     // When the caller didn't pin a compression level, honour
     // `ZSTD_CLEVEL` / `XZ_DEFAULTS` env vars so cross-stack tooling
@@ -2576,38 +2988,39 @@ fn encode_cluster(
             // allocation down to a few MiB, matching libzim's default
             // behaviour. Cap at 27 (the zstd / fzstd ceiling) just in
             // case payloads ever exceed 128 MiB.
-            let payload_len = payload.len().max(1) as u64;
+            let payload_len = payload_len.max(1) as u64;
             let mut window_log = 64 - (payload_len - 1).leading_zeros();
             // zstd requires windowLog >= 10 (1 KiB). Anything below
             // that wastes space; clamp.
             window_log = window_log.clamp(10, 27);
-            // The one-shot bulk compressor (ZSTD_compress2 under the
-            // hood) knows the source size up front, so the produced
-            // frame carries the frame-content-size field. Readers —
-            // zimru's own `decode_zstd` fast path, libzim, fzstd —
-            // use it to pre-allocate the exact decompressed size and
-            // skip the streaming-decoder hop entirely.
-            let mut enc = zstd::bulk::Compressor::new(lvl)
+            // Pledge the exact size so readers can allocate once, while
+            // streaming borrowed blob slices avoids an extra raw payload copy.
+            let mut out = Vec::with_capacity(1 + payload_len as usize / 4);
+            out.push(5u8 | ext_bit);
+            let mut enc = zstd::stream::Encoder::new(out, lvl)
                 .map_err(|e| Error::Decompression(format!("zstd encoder: {e}")))?;
-            enc.set_parameter(zstd::stream::raw::CParameter::WindowLog(window_log))
+            enc.window_log(window_log)
                 .map_err(|e| Error::Decompression(format!("zstd window_log: {e}")))?;
-            let body = enc
-                .compress(&payload)
-                .map_err(|e| Error::Decompression(format!("zstd compress: {e}")))?;
-            let mut bytes = Vec::with_capacity(1 + body.len());
-            bytes.push(5u8 | ext_bit);
-            bytes.extend_from_slice(&body);
-            Ok(bytes)
+            enc.set_pledged_src_size(Some(payload_len))
+                .map_err(|e| Error::Decompression(format!("zstd pledged size: {e}")))?;
+            enc.write_all(&header)?;
+            for blob in blobs {
+                enc.write_all(blob)?;
+            }
+            enc.finish()
+                .map_err(|e| Error::Decompression(format!("zstd finish: {e}")))
         }
         Compression::Xz => {
             let lvl = level.unwrap_or(3).clamp(0, 9) as u32;
             // Seed the output with the info byte and let the encoder
             // append — skips the prepend-copy of the compressed body.
-            let mut out = Vec::with_capacity(1 + payload.len() / 3);
+            let mut out = Vec::with_capacity(1 + payload_len / 4);
             out.push(4u8 | ext_bit);
             let mut enc = xz2::write::XzEncoder::new(out, lvl);
-            enc.write_all(&payload)
-                .map_err(|e| Error::Decompression(format!("xz encode: {e}")))?;
+            enc.write_all(&header)?;
+            for blob in blobs {
+                enc.write_all(blob)?;
+            }
             enc.finish()
                 .map_err(|e| Error::Decompression(format!("xz finish: {e}")))
         }
@@ -2632,4 +3045,90 @@ fn default_uuid() -> [u8; 16] {
     u[..8].copy_from_slice(&nanos.to_le_bytes());
     u[8..].copy_from_slice(&pid.wrapping_mul(0x9E3779B97F4A7C15).to_le_bytes());
     u
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output_path(tag: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "zimru-writer-{tag}-{}-{stamp}.zim",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn pipeline_accounts_allocations_and_admits_oversized_clusters_alone() {
+        let path = output_path("budget");
+        let mut creator = Creator::new();
+        creator.set_compression_level(1);
+        creator.set_cluster_size_target(1);
+        creator.set_max_in_flight_bytes(512);
+        creator.start_writing(&path).unwrap();
+        for i in 0..24 {
+            let mut body = Vec::with_capacity(384);
+            body.extend_from_slice(b"small body");
+            creator
+                .try_add_item(Item::text(format!("normal-{i}"), "", body))
+                .unwrap();
+        }
+        let streamer = creator.stream.as_mut().unwrap();
+        streamer.shutdown_pipeline().unwrap();
+        assert!(
+            streamer.stats.peak_in_flight_bytes >= 384,
+            "account allocation, not payload length"
+        );
+        assert!(
+            streamer.stats.peak_in_flight_bytes <= 512,
+            "queued and active jobs share one byte cap"
+        );
+        for i in 0..8 {
+            let mut body = Vec::with_capacity(8192);
+            body.push(i);
+            creator
+                .try_add_item(Item::text(format!("oversized-{i}"), "", body))
+                .unwrap();
+        }
+        let streamer = creator.stream.as_mut().unwrap();
+        streamer.shutdown_pipeline().unwrap();
+        assert_eq!(
+            streamer.stats.peak_in_flight_bytes, 8192,
+            "oversized allocations must never overlap"
+        );
+        creator.finish_writing().unwrap();
+        let archive = crate::Archive::open(&path).unwrap();
+        for i in 0u8..8 {
+            assert_eq!(archive.get_bytes(&format!("oversized-{i}")).unwrap(), [i]);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pipeline_write_failure_joins_workers_and_releases_every_reservation() {
+        let path = output_path("pipeline-failure");
+        let mut creator = Creator::new();
+        creator.set_cluster_size_target(1);
+        creator.set_max_in_flight_bytes(32);
+        creator.start_writing(&path).unwrap();
+        let streamer = creator.stream.as_mut().unwrap();
+        // Force an actual I/O failure in the background writer, not a mock.
+        streamer.file = Some(File::open(&path).unwrap());
+        streamer
+            .push_item(Item::text("fails", "", b"body"))
+            .unwrap();
+        let budget = streamer.pipeline.as_ref().unwrap().budget.clone();
+        assert!(streamer.shutdown_pipeline().is_err());
+        assert_eq!(
+            budget.state.lock().used,
+            0,
+            "failed output releases all byte permits"
+        );
+        drop(creator);
+        let _ = std::fs::remove_file(path);
+    }
 }

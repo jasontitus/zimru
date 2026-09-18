@@ -1,5 +1,10 @@
 # Before/after benchmarks for the 2026-08-13 review fixes
 
+> **Historical note.** This document describes an earlier revision and its
+> measurements or plans at the time of writing. It is not a statement of
+> current behavior, support or open bugs; for those see the README
+> compatibility matrix, the generated API docs and CHANGELOG.md.
+
 Measured old `main` (`b6e9440`) vs post-fix `main` (`c67e9d7`) on the same
 machine with generated archives, ABBA-ordered (each pair run old→new cold,
 then new→old with the page cache pre-warmed via `cat file > /dev/null`).

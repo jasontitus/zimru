@@ -30,13 +30,8 @@ fn tmp_path(tag: &str) -> PathBuf {
     p
 }
 
-fn zimdump_binary() -> Option<PathBuf> {
-    let candidate = PathBuf::from("target/release/zimdump");
-    if candidate.exists() {
-        Some(candidate)
-    } else {
-        None
-    }
+fn zimdump_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_zimdump"))
 }
 
 #[test]
@@ -96,10 +91,7 @@ fn cluster_byte_ranges_cover_the_cluster_region() {
 
 #[test]
 fn analyze_subcommand_prints_one_row_per_cluster() {
-    let Some(zimdump) = zimdump_binary() else {
-        eprintln!("skip: target/release/zimdump not built (run `cargo build --release`)");
-        return;
-    };
+    let zimdump = zimdump_binary();
     let out = tmp_path("analyze");
     let mut c = Creator::new();
     c.set_compression(Compression::Zstd);
@@ -145,10 +137,7 @@ fn analyze_subcommand_prints_one_row_per_cluster() {
 
 #[test]
 fn analyze_by_item_lists_every_article() {
-    let Some(zimdump) = zimdump_binary() else {
-        eprintln!("skip: target/release/zimdump not built");
-        return;
-    };
+    let zimdump = zimdump_binary();
     let out = tmp_path("analyze-byitem");
     let mut c = Creator::new();
     c.set_compression(Compression::Zstd);

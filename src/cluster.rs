@@ -87,7 +87,8 @@ impl Cluster {
         };
         let (payload, compression): (Arc<[u8]>, Compression) = match compression_id {
             COMPRESSION_NONE_LEGACY | COMPRESSION_NONE => {
-                (Arc::from(body.to_vec()), Compression::None)
+                validate_offsets(body, extended)?;
+                (Arc::from(body), Compression::None)
             }
             COMPRESSION_XZ => (Arc::from(decode_xz(body, limit)?), Compression::Xz),
             COMPRESSION_ZSTD => (Arc::from(decode_zstd(body, limit)?), Compression::Zstd),
@@ -97,20 +98,11 @@ impl Cluster {
             other => return Err(Error::UnsupportedCompression(other)),
         };
 
-        let ptr_size = if extended { 8 } else { 4 };
-        if payload.len() < ptr_size {
-            return Err(Error::Truncated(0));
-        }
-        let first = read_off(&payload, 0, extended)?;
-        if first == 0 || first as usize > payload.len() {
-            return Err(Error::Truncated(first));
-        }
-        // first = (N + 1) * ptr_size  =>  N = first/ptr_size - 1
-        let total_ptrs = first as usize / ptr_size;
-        if total_ptrs == 0 {
-            return Err(Error::Truncated(0));
-        }
-        let blob_count = (total_ptrs - 1) as u32;
+        let blob_count = if compression == Compression::None {
+            offset_count(&payload, extended)?
+        } else {
+            validate_offsets(&payload, extended)?
+        };
 
         Ok(Cluster {
             payload,
@@ -147,11 +139,13 @@ impl Cluster {
         }
         let ptr_size = if self.extended { 8 } else { 4 };
         let off_pos = idx as usize * ptr_size;
-        let start = read_off(&self.payload, off_pos, self.extended)? as usize;
-        let end = read_off(&self.payload, off_pos + ptr_size, self.extended)? as usize;
-        if end < start || end > self.payload.len() {
-            return Err(Error::Truncated(end as u64));
+        let start = read_off(&self.payload, off_pos, self.extended)?;
+        let end = read_off(&self.payload, off_pos + ptr_size, self.extended)?;
+        let first = (self.blob_count as u64 + 1) * ptr_size as u64;
+        if start < first || end < start || end > self.payload.len() as u64 {
+            return Err(Error::Truncated(end));
         }
+        let (start, end) = (start as usize, end as usize);
         Ok(start..end)
     }
 }
@@ -177,15 +171,8 @@ pub(crate) fn raw_blob_range(raw: &[u8], blob_idx: u32) -> Result<Option<Range<u
     let extended = info & EXTENDED_FLAG != 0;
     let body = &raw[1..];
     let ptr_size = if extended { 8 } else { 4 };
-    let first = read_off(body, 0, extended)?;
-    if first == 0 || first as usize > body.len() {
-        return Err(Error::Truncated(first));
-    }
-    let total_ptrs = first as usize / ptr_size;
-    if total_ptrs == 0 {
-        return Err(Error::Truncated(0));
-    }
-    let blob_count = (total_ptrs - 1) as u32;
+    let blob_count = offset_count(body, extended)?;
+    let first = (blob_count as u64 + 1) * ptr_size as u64;
     if blob_idx >= blob_count {
         return Err(Error::BadBlobIndex {
             cluster: u32::MAX,
@@ -194,11 +181,12 @@ pub(crate) fn raw_blob_range(raw: &[u8], blob_idx: u32) -> Result<Option<Range<u
         });
     }
     let off_pos = blob_idx as usize * ptr_size;
-    let start = read_off(body, off_pos, extended)? as usize;
-    let end = read_off(body, off_pos + ptr_size, extended)? as usize;
-    if end < start || end > body.len() {
-        return Err(Error::Truncated(end as u64));
+    let start = read_off(body, off_pos, extended)?;
+    let end = read_off(body, off_pos + ptr_size, extended)?;
+    if start < first || end < start || end > body.len() as u64 {
+        return Err(Error::Truncated(end));
     }
+    let (start, end) = (start as usize, end as usize);
     Ok(Some(start..end))
 }
 
@@ -217,42 +205,53 @@ pub(crate) fn validate_raw_offsets(raw: &[u8]) -> Result<bool> {
         COMPRESSION_XZ | COMPRESSION_ZSTD => return Ok(false),
         other => return Err(Error::UnsupportedCompression(other)),
     }
-    let extended = info & EXTENDED_FLAG != 0;
-    let body = &raw[1..];
-    let ptr_size = if extended { 8 } else { 4 };
+    validate_offsets(&raw[1..], info & EXTENDED_FLAG != 0)?;
+    Ok(true)
+}
+
+fn offset_count(body: &[u8], extended: bool) -> Result<u32> {
+    let width = if extended { 8 } else { 4 };
     let first = read_off(body, 0, extended)?;
-    if first == 0 || first as usize > body.len() {
+    if first < width || !first.is_multiple_of(width) || first > body.len() as u64 {
         return Err(Error::Truncated(first));
     }
-    let total_ptrs = first as usize / ptr_size;
-    if total_ptrs == 0 {
-        return Err(Error::Truncated(0));
-    }
-    let mut prev = first;
-    for i in 1..total_ptrs {
-        let off = read_off(body, i * ptr_size, extended)?;
-        if off < prev || off as usize > body.len() {
-            return Err(Error::Truncated(off));
+    u32::try_from(first / width - 1).map_err(|_| Error::Truncated(first))
+}
+
+fn validate_offsets(body: &[u8], extended: bool) -> Result<u32> {
+    let count = offset_count(body, extended)?;
+    let width = if extended { 8 } else { 4 };
+    let mut prev = (count as u64 + 1) * width as u64;
+    for i in 1..=count as usize {
+        let next = read_off(body, i * width, extended)?;
+        if next < prev || next > body.len() as u64 {
+            return Err(Error::Truncated(next));
         }
-        prev = off;
+        prev = next;
     }
-    Ok(true)
+    Ok(count)
 }
 
 fn read_off(buf: &[u8], off: usize, extended: bool) -> Result<u64> {
     if extended {
-        let s = buf.get(off..off + 8).ok_or(Error::Truncated(off as u64))?;
-        Ok(u64::from_le_bytes(s.try_into().unwrap()))
+        crate::raw::u64_at(buf, off)
     } else {
-        let s = buf.get(off..off + 4).ok_or(Error::Truncated(off as u64))?;
-        Ok(u32::from_le_bytes(s.try_into().unwrap()) as u64)
+        crate::raw::u32_at(buf, off).map(u64::from)
     }
 }
 
 fn decode_xz(body: &[u8], limit: u64) -> Result<Vec<u8>> {
-    let cap = (body.len().saturating_mul(4) as u64).min(limit) as usize;
+    let cap = (body.len().saturating_mul(4) as u64)
+        .min(limit)
+        .min(1 << 20) as usize;
     let mut out = Vec::with_capacity(cap);
-    let dec = xz2::read::XzDecoder::new(body);
+    // Bound liblzma's memory (dictionary sized from the LZMA2 props byte
+    // before any output exists) by the same cap as the output: a tiny
+    // cluster declaring a 4 GiB dictionary is rejected with MemLimit
+    // instead of requesting the allocation.
+    let stream = xz2::stream::Stream::new_stream_decoder(limit.saturating_add(64 << 20), 0)
+        .map_err(|e| Error::Decompression(format!("xz decoder: {e}")))?;
+    let dec = xz2::read::XzDecoder::new_stream(body, stream);
     // `limit + 1` so an over-limit stream is detected rather than
     // silently truncated at exactly `limit` bytes.
     dec.take(limit + 1)
@@ -267,29 +266,23 @@ fn decode_xz(body: &[u8], limit: u64) -> Result<Vec<u8>> {
 }
 
 fn decode_zstd(body: &[u8], limit: u64) -> Result<Vec<u8>> {
-    // Fast path: when the frame header carries pledgedSrcSize (libzim and
-    // zimru's writer both set it on every cluster), `bulk::decompress`
-    // pre-allocates the exact output size and runs the whole
-    // decompression in libzstd's tight inner loop with no streaming-
-    // reader hop. This is the dominant case for real ZIMs and is what
-    // makes the difference on zstd22 clusters.
-    //
-    // The declared size is untrusted input — reject it before allocating
-    // when it exceeds the cluster-size limit.
-    //
-    // Slow path: streams without an FCS header (some hand-built test
-    // fixtures, or ZIMs from older writers) fall back to streaming with
-    // an 8× capacity guess, which grows transparently up to the limit.
+    // Small pledged frames can use the bulk fast path. Large declarations
+    // are untrusted: stream those so a tiny malformed frame cannot force
+    // a multi-gigabyte allocation before the decoder examines its payload.
     if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(body) {
         if size > limit {
             return Err(Error::Decompression(format!(
                 "zstd: declared cluster size {size} exceeds {limit}-byte limit"
             )));
         }
-        return zstd::bulk::decompress(body, size as usize)
-            .map_err(|e| Error::Decompression(format!("zstd: {e}")));
+        if size <= 8 << 20 {
+            return zstd::bulk::decompress(body, size as usize)
+                .map_err(|e| Error::Decompression(format!("zstd: {e}")));
+        }
     }
-    let cap = (body.len().saturating_mul(8) as u64).min(limit) as usize;
+    let cap = (body.len().saturating_mul(8) as u64)
+        .min(limit)
+        .min(1 << 20) as usize;
     let mut out = Vec::with_capacity(cap);
     let dec = zstd::stream::read::Decoder::new(body)
         .map_err(|e| Error::Decompression(format!("zstd init: {e}")))?;

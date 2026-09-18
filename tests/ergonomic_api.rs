@@ -202,8 +202,8 @@ fn build_test_zim() -> Vec<u8> {
     // --- render file ---
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC.to_le_bytes());
-    out.extend_from_slice(&5u16.to_le_bytes()); // major
-    out.extend_from_slice(&1u16.to_le_bytes()); // minor = 1 = new namespaces
+    out.extend_from_slice(&6u16.to_le_bytes()); // major
+    out.extend_from_slice(&1u16.to_le_bytes()); // version 6.1: new namespaces
     let uuid: [u8; 16] = *b"zimru-api-tests!";
     out.extend_from_slice(&uuid);
     out.extend_from_slice(&entry_count.to_le_bytes());

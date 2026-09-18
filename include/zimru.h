@@ -109,6 +109,36 @@
 #define DEFAULT_ZSTD_LEVEL 19
 
 /**
+ * Numeric error codes corresponding to [`crate::Error`] variants. Stable
+ * across releases — new variants are added at the end.
+ */
+enum zimru_error_code_t
+#ifdef __cplusplus
+  : int32_t
+#endif // __cplusplus
+ {
+  zimru_error_code_t_Unknown = 0,
+  zimru_error_code_t_Io = 1,
+  zimru_error_code_t_BadMagic = 2,
+  zimru_error_code_t_Truncated = 3,
+  zimru_error_code_t_UnsupportedCompression = 4,
+  zimru_error_code_t_UnsupportedVersion = 5,
+  zimru_error_code_t_EntryNotFound = 6,
+  zimru_error_code_t_NoMainEntry = 7,
+  zimru_error_code_t_NoChecksum = 8,
+  zimru_error_code_t_BadIndex = 9,
+  zimru_error_code_t_Decompression = 10,
+  zimru_error_code_t_RedirectLoop = 11,
+  zimru_error_code_t_BadUtf8 = 12,
+  zimru_error_code_t_BadMimeIndex = 13,
+  zimru_error_code_t_ChecksumMismatch = 14,
+  zimru_error_code_t_NotAnItem = 15,
+};
+#ifndef __cplusplus
+typedef int32_t zimru_error_code_t;
+#endif // __cplusplus
+
+/**
  * Opaque handle wrapping a [`crate::Archive`] plus the caches used to
  * give C callers stable pointers.
  */
@@ -279,7 +309,9 @@ extern "C" {
  bool zimru_archive_check(const struct zimru_archive_t *arc, struct zimru_error_t **err);
 
 /**
- * Look up an entry by its full namespaced path (e.g. `"C/index.html"`).
+ * Look up a content entry by path (e.g. `"home"`) on modern archives.
+ * Legacy archives require a full namespaced path (e.g. `"A/home"`).
+ * Use [`zimru_archive_get_entry_by_ns_path`] for explicit namespaces.
  * Returns NULL with `*err` set if not found.
  */
 
@@ -442,7 +474,7 @@ struct zimru_entry_t *zimru_archive_main_entry(const struct zimru_archive_t *arc
 
 /**
  * URL-pointer index of the archive's main entry, or
- * [`NO_MAIN_PAGE`] (`0xFFFFFFFF`) when no main entry is set in the
+ * [`crate::header::NO_MAIN_PAGE`] (`0xFFFFFFFF`) when no main entry is set in the
  * header. Cheaper than [`zimru_archive_main_entry`] — avoids the
  * dirent parse and the entry-handle allocation — for callers that
  * only need the index (e.g. the libzim-shim's `getMainEntryIndex()`,
@@ -608,7 +640,7 @@ struct zimru_entry_t *zimru_archive_random_entry(const struct zimru_archive_t *a
  * * `5` — zstd, the default (`Compression::Zstd`)
  *
  * Other IDs return `false` with `*err` set to
- * [`zimru_error_code::UnsupportedCompression`].
+ * [`crate::cffi::error::zimru_error_code_t::UnsupportedCompression`].
  */
 
 bool zimru_creator_set_compression(struct zimru_creator_t *c,
@@ -841,16 +873,16 @@ bool zimru_creator_start_writing(struct zimru_creator_t *c,
  * Pass `0` for `namespace` to use the default routing
  * (`X/...` peel, otherwise `'C'`).
  *
- * `size_hint` is a non-binding capacity hint used to pre-allocate
- * the in-flight buffer. Pass `0` to skip.
+ * `size_hint` is non-binding: the body may be shorter or longer.
+ * Currently ignored; chunks are buffered until `end_item`. Pass `0`
+ * when the size is unknown.
  *
  * Errors:
  *
  * * Creator not in streaming mode → `*err` set, returns `false`.
  *   Call `start_writing` first.
  * * Another chunked item is already in flight → `*err` set,
- *   returns `false`. Call `end_item` (or `cancel_item` — TODO if
- *   needed) before starting a new one.
+ *   returns `false`. Call `end_item` before starting a new one.
  */
 
 bool zimru_creator_begin_item(struct zimru_creator_t *c,
@@ -945,7 +977,7 @@ struct zimru_entry_t *zimru_entry_get_redirect_entry(const struct zimru_entry_t 
  const char *zimru_error_message(const struct zimru_error_t *err);
 
 /**
- * Numeric error code (see `zimru_error_code` enum).
+ * Numeric error code (see [`zimru_error_code_t`]).
  */
  int32_t zimru_error_code(const struct zimru_error_t *err);
 
@@ -980,7 +1012,7 @@ struct zimru_entry_t *zimru_entry_get_redirect_entry(const struct zimru_entry_t 
 
 /**
  * Cluster index this item's bytes live in. Combine with
- * [`zimru_archive_cluster_offset`] to find where the cluster starts
+ * [`crate::cffi::archive::zimru_archive_cluster_offset`] to find where the cluster starts
  * in the file, or with [`zimru_item_blob_index`] +
  * [`zimru_item_direct_access`] to address the blob within the
  * cluster. Returns `0` on a NULL item — callers that care must not

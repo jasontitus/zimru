@@ -30,6 +30,9 @@
 # Usage: ./bench/creation-bench.sh [zim ...]
 #   env: UPSTREAM_DIR RUNS THREADS OUT XAPIANBUILDER LEVEL
 set -uo pipefail
+source "$(dirname "$0")/verify-common.sh"
+[[ $# -gt 0 ]] || { echo "usage: $0 <zim>..." >&2; exit 1; }
+failed=0
 
 UPSTREAM_DIR="${UPSTREAM_DIR:-/opt/zim-tools-upstream/zim-tools_linux-x86_64-3.8.0}"
 UP_RECREATE="$UPSTREAM_DIR/zimrecreate"
@@ -37,18 +40,22 @@ UP_CHECK="$UPSTREAM_DIR/zimcheck"
 UP_SEARCH="$UPSTREAM_DIR/zimsearch"
 ZIMRU_RECREATE="${ZIMRU_RECREATE:-./target/release/zimrecreate}"
 ZIMRU_DUMP="${ZIMRU_DUMP:-./target/release/zimdump}"
-export XAPIANBUILDER="${XAPIANBUILDER:-/home/user/xapianbuilder/target/release/xapianbuilder}"
+export XAPIANBUILDER="${XAPIANBUILDER:-../xapianbuilder/target/release/xapianbuilder}"
 # One "pair" is a full ABBA cycle: two runs of each tool. Raising it trades
 # wall-clock for a tighter best-of.
 PAIRS="${PAIRS:-1}"
-THREADS="${THREADS:-$(nproc)}"
+THREADS="${THREADS:-1}"
 LEVEL="${LEVEL:-19}"
-OUT="${OUT:-/tmp/zbench}"
-mkdir -p "$OUT"
+OUT="${OUT:-$(mktemp -d "${TMPDIR:-/tmp}/zbench.XXXXXX")}"
+mkdir -p "$OUT" || exit 1
 DETAIL="${DETAIL:-$OUT/run-times.log}"
 : > "$DETAIL"
 
 [[ -x "$UP_RECREATE" ]] || { echo "upstream zimrecreate not found at $UP_RECREATE" >&2; exit 1; }
+for tool in "$UP_CHECK" "$UP_SEARCH" "$ZIMRU_RECREATE" "$ZIMRU_DUMP"; do
+    [[ -x "$tool" ]] || { echo "missing executable: $tool" >&2; exit 1; }
+done
+[[ $PAIRS =~ ^[1-9][0-9]*$ ]] || { echo "PAIRS must be positive" >&2; exit 1; }
 [[ -x "$XAPIANBUILDER" ]] || echo "warning: xapianbuilder not executable at $XAPIANBUILDER — zimru will build no index" >&2
 
 human() { numfmt --to=iec --suffix=B "$1"; }
@@ -66,14 +73,14 @@ run_once() {
     local outfile="$1" src="$2"; shift 2
     local start end rc
     rm -f "$outfile"
-    cat "$src" > /dev/null 2>&1
+    cat "$src" > /dev/null || return 1
     start=$(date +%s.%N)
-    "$@" >/dev/null 2>&1; rc=$?
+    "$@" > "$outfile.stdout" 2> "$outfile.stderr"; rc=$?
     end=$(date +%s.%N)
     # Outside the timed region: flush this run's writes so the next run does
     # not inherit them as background writeback.
     sync
-    if [[ $rc -ne 0 ]]; then echo FAIL; return 1; fi
+    if [[ $rc -ne 0 || ! -s "$outfile" ]]; then echo FAIL; return 1; fi
     awk "BEGIN{printf \"%.2f\", $end - $start}"
 }
 
@@ -91,13 +98,11 @@ ab_compare() {
     for ((i = 1; i <= PAIRS; i++)); do
         for slot in zr up up zr; do
             if [[ $slot == zr ]]; then
-                t=$(run_once "$zr_out" "$src" "${ZR_CMD[@]}")
-                [[ "$t" == FAIL ]] && { echo "FAIL FAIL"; return 1; }
+                t=$(run_once "$zr_out" "$src" "${ZR_CMD[@]}") || { echo "FAIL FAIL"; return 1; }
                 echo "$label run$i zimru    $t" >> "$DETAIL"
                 if [[ -z "$zr_best" ]] || awk "BEGIN{exit !($t < $zr_best)}"; then zr_best=$t; fi
             else
-                t=$(run_once "$up_out" "$src" "${UP_CMD[@]}")
-                [[ "$t" == FAIL ]] && { echo "$zr_best FAIL"; return 1; }
+                t=$(run_once "$up_out" "$src" "${UP_CMD[@]}") || { echo "$zr_best FAIL"; return 1; }
                 echo "$label run$i upstream $t" >> "$DETAIL"
                 if [[ -z "$up_best" ]] || awk "BEGIN{exit !($t < $up_best)}"; then up_best=$t; fi
             fi
@@ -122,20 +127,9 @@ ab_compare() {
 # exactly once per archive and derive both the pass/fail and the error-class
 # set from the same captured report; the source's classes are computed once
 # per file and reused across modes.
-check_report() { $UP_CHECK -A "$1" 2>/dev/null; }
-classes_of()   { sed -n 's/^\[ERROR\] \([A-Za-z ]*\):.*/\1/p' "$1" | sort -u; }
-
-SRC_CLASSES=""   # per-file temp file, set in the loop below
+SRC_REPORT=""
 zimcheck_verdict() {
-    local out="$1" rep="$OUT/.check.$$"
-    check_report "$out" > "$rep"
-    if grep -q "Overall Test Status: Pass" "$rep"; then
-        rm -f "$rep"; echo PASS; return
-    fi
-    local extra
-    extra=$(classes_of "$rep" | comm -13 "$SRC_CLASSES" -)
-    rm -f "$rep"
-    if [[ -z "$extra" ]]; then echo "=src"; else echo "REGRESS"; fi
+    check_verdict "$UP_CHECK" "$1" "$1.check" "$SRC_REPORT"
 }
 
 # "OK" when both index entries exist and zimsearch's top hit matches the
@@ -143,21 +137,24 @@ zimcheck_verdict() {
 index_verdict() {
     local out="$1" src="$2" query="$3"
     local have
-    have=$($ZIMRU_DUMP list --ns=X "$out" 2>/dev/null | grep -c 'xapian$')
-    [[ "$have" == "2" ]] || { echo "NOIDX($have/2)"; return; }
-    [[ -n "$query" ]] || { echo "NOQUERY"; return; }
+    "$ZIMRU_DUMP" list --ns=X "$out" > "$out.index-list" 2> "$out.index-list.stderr" || { echo ERROR; return 1; }
+    have=$(grep -c 'xapian$' "$out.index-list")
+    [[ "$have" == "2" ]] || { echo "NOIDX($have/2)"; return 1; }
+    [[ -n "$query" ]] || { echo "NOQUERY"; return 1; }
     local a b
-    a=$($UP_SEARCH "$src" "$query" 2>/dev/null | grep -m1 '^score' | cut -f3-)
-    b=$($UP_SEARCH "$out" "$query" 2>/dev/null | grep -m1 '^score' | cut -f3-)
-    if [[ -z "$a$b" ]]; then echo "NOHITS"
+    "$UP_SEARCH" "$src" "$query" > "$out.source-search" 2> "$out.source-search.stderr" || { echo ERROR; return 1; }
+    "$UP_SEARCH" "$out" "$query" > "$out.search" 2> "$out.search.stderr" || { echo ERROR; return 1; }
+    a=$(awk -F '\\t' '/^score/ { sub(/^[^\\t]*\\t[^\\t]*\\t/, ""); print; exit }' "$out.source-search")
+    b=$(awk -F '\\t' '/^score/ { sub(/^[^\\t]*\\t[^\\t]*\\t/, ""); print; exit }' "$out.search")
+    if [[ -z "$a" || -z "$b" ]]; then echo NOHITS; return 1
     elif [[ "$a" == "$b" ]]; then echo OK
-    else echo "MISMATCH"; fi
+    else echo MISMATCH; return 1; fi
 }
 
 # Total bytes of the two X/*/xapian blobs, so the two indexers' output sizes
 # can be compared directly rather than inferred from whole-file sizes.
 index_bytes() {
-    $ZIMRU_DUMP analyze --by-item "$1" 2>/dev/null \
+    "$ZIMRU_DUMP" analyze --by-item "$1" 2> "$1.analyze.stderr" \
         | awk '/X\/(fulltext|title)\/xapian$/ { s += $5 } END { print s + 0 }'
 }
 
@@ -181,14 +178,14 @@ printf "%-40s %9s %6s %10s %10s %8s %10s %10s %8s %7s %9s %13s\n" \
 printf -- "%s\n" "$(printf '%.0s-' {1..160})"
 
 for src in "$@"; do
-    [[ -f "$src" ]] || { echo "skip (missing): $src" >&2; continue; }
+    [[ -f "$src" ]] || { echo "missing: $src" >&2; failed=1; continue; }
     name=$(basename "$src" .zim)
-    size=$(stat -c%s "$src")
+    size=$(file_size "$src") || { failed=1; continue; }
+    SRC_REPORT="$OUT/$name.src.check"
+    if ! check_report "$UP_CHECK" "$src" "$SRC_REPORT"; then
+        echo "$name: ERROR reading source checker report" >&2; failed=1; continue
+    fi
     query=$(pick_query "$src")
-    SRC_CLASSES="$OUT/.srcclasses.$$"
-    check_report "$src" > "$OUT/.srcreport.$$"
-    classes_of "$OUT/.srcreport.$$" > "$SRC_CLASSES"
-    rm -f "$OUT/.srcreport.$$"
 
     for mode in index noft; do
         zr_out="$OUT/$name.zr.$mode.zim"
@@ -206,9 +203,12 @@ for src in "$@"; do
         ZR_CMD=("$ZIMRU_RECREATE" "$src" "$zr_out" --compression zstd
                 --compression-level "$LEVEL" -J "$THREADS" "${zr_extra[@]}")
         UP_CMD=("$UP_RECREATE" "$src" "$up_out" -J "$THREADS" "${up_extra[@]}")
-        read -r zr_t up_t < <(ab_compare "$zr_out" "$up_out" "$src" "$name/$mode")
-        zr_sz=$(stat -c%s "$zr_out" 2>/dev/null || echo 0)
-        up_sz=$(stat -c%s "$up_out" 2>/dev/null || echo 0)
+        if ! times=$(ab_compare "$zr_out" "$up_out" "$src" "$name/$mode"); then
+            echo "$name/$mode: execution FAILED (see $OUT)" >&2; failed=1; continue
+        fi
+        read -r zr_t up_t <<< "$times"
+        zr_sz=$(file_size "$zr_out") || { failed=1; continue; }
+        up_sz=$(file_size "$up_out") || { failed=1; continue; }
 
         if [[ "$zr_t" == FAIL || "$up_t" == FAIL ]]; then
             speedup="-"
@@ -226,9 +226,13 @@ for src in "$@"; do
         if [[ "$zr_t" == FAIL ]]; then
             chk="-"; idx="-"; idxsz="-"
         else
-            chk=$(zimcheck_verdict "$zr_out")
+            chk=$(zimcheck_verdict "$zr_out") || failed=1
+            up_chk=$(zimcheck_verdict "$up_out") || failed=1
+            chk="$chk/$up_chk"
             if [[ $mode == index ]]; then
-                idx=$(index_verdict "$zr_out" "$src" "$query")
+                idx=$(index_verdict "$zr_out" "$src" "$query") || failed=1
+                up_idx=$(index_verdict "$up_out" "$src" "$query") || failed=1
+                idx="$idx/$up_idx"
                 if [[ "$up_t" == FAIL ]]; then
                     idxsz="$(human "$(index_bytes "$zr_out")")/-"
                 else
@@ -245,7 +249,7 @@ for src in "$@"; do
             "$chk" "$idx" "$idxsz"
         # Multi-GB sources produce multi-GB outputs on both sides; keeping
         # four of them per file fills the disk before the suite finishes.
-        [[ -n "${KEEP:-}" ]] || rm -f "$zr_out" "$up_out"
+        [[ $failed == 0 && -z "${KEEP:-}" ]] && rm -f "$zr_out" "$up_out"
     done
-    rm -f "$SRC_CLASSES"
 done
+exit "$failed"

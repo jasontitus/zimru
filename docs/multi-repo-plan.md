@@ -1,5 +1,10 @@
 # Multi-repo roadmap
 
+> **Historical note.** This document describes an earlier revision and its
+> measurements or plans at the time of writing. It is not a statement of
+> current behavior, support or open bugs; for those see the README
+> compatibility matrix, the generated API docs and CHANGELOG.md.
+
 This document describes the repo-level architecture needed to make zimru
 a viable replacement for libzim under existing GPL-licensed consumers
 (libkiwix, kiwix-tools, kiwix-serve, kiwix-desktop, kiwix-android,

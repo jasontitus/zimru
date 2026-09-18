@@ -8,7 +8,7 @@
 //! 3. Run the resulting binary with the ZIM path as argv[1].
 //! 4. Assert exit 0.
 //!
-//! Each variant skips silently if its compiler isn't on PATH.
+//! Requires C and C++ compilers and the current profile's C ABI library.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,15 +21,17 @@ fn manifest_dir() -> PathBuf {
 }
 
 fn target_dir() -> PathBuf {
-    // The test binary lives at target/<profile>/deps/<name>-<hash>, so
-    // the cdylib is two levels up — resolving it this way works for
-    // both a plain `cargo test --features cffi` (debug) and
-    // `cargo test --release`, instead of hard-coding target/release.
+    // Cargo emits the test build's cdylib beside the test executable.
+    // Prefer it over a potentially stale top-level `cargo build` artifact.
     let exe = std::env::current_exe().expect("current_exe");
-    exe.parent()
-        .and_then(Path::parent)
-        .expect("test exe not under target/<profile>/deps")
-        .to_path_buf()
+    let deps = exe.parent().expect("test exe has no parent");
+    if deps.join(dylib_name()).is_file() {
+        deps.to_path_buf()
+    } else {
+        deps.parent()
+            .expect("test exe not under target/<profile>/deps")
+            .to_path_buf()
+    }
 }
 
 fn first_compiler(candidates: &[&'static str]) -> Option<&'static str> {
@@ -90,16 +92,11 @@ fn build_and_run(label: &str, compiler: &str, extra: &[&str], src: &Path, zim_pa
         "include/zimru.h missing — did `cargo build --features cffi` run?"
     );
     let dylib_path = lib_dir.join(dylib_name());
-    if !dylib_path.exists() {
-        // `cargo test` alone doesn't emit the cdylib — skip (like the
-        // missing-compiler case) instead of failing with a panic, and
-        // say exactly which build produces it for this profile.
-        eprintln!(
-            "[cffi_smoke] {} not found — run `cargo build --features cffi` (same profile) first; skipping {label}",
-            dylib_path.display()
-        );
-        return;
-    }
+    assert!(
+        dylib_path.is_file(),
+        "{} missing — run `cargo build --features cffi` with the same profile",
+        dylib_path.display()
+    );
 
     let bin = unique_tmp(&format!("zimru_{label}"), "");
     let rpath_arg = format!("-Wl,-rpath,{}", lib_dir.display());
@@ -144,10 +141,7 @@ fn build_and_run(label: &str, compiler: &str, extra: &[&str], src: &Path, zim_pa
 
 #[test]
 fn c_consumer_can_read_a_zim_via_the_c_abi() {
-    let Some(cc) = cc() else {
-        eprintln!("skip: no C compiler on PATH");
-        return;
-    };
+    let cc = cc().expect("C ABI smoke requires a C compiler on PATH");
     let zim = unique_tmp("cffi-smoke-c", ".zim");
     build_test_zim(&zim);
     let src = manifest_dir().join("tests").join("cffi_smoke.c");
@@ -163,10 +157,7 @@ fn c_consumer_can_read_a_zim_via_the_c_abi() {
 
 #[test]
 fn cpp_consumer_can_read_a_zim_via_the_c_abi() {
-    let Some(cxx) = cxx() else {
-        eprintln!("skip: no C++ compiler on PATH");
-        return;
-    };
+    let cxx = cxx().expect("C ABI smoke requires a C++ compiler on PATH");
     let zim = unique_tmp("cffi-smoke-cpp", ".zim");
     build_test_zim(&zim);
     let src = manifest_dir().join("tests").join("cffi_smoke.cpp");

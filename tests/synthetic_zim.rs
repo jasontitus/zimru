@@ -921,3 +921,335 @@ fn detects_corrupted_checksum() {
     assert!(!arc.check().unwrap());
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn version_60_retains_legacy_namespaces_and_layout_paths() {
+    let dirents = [
+        Dir::Art(Article {
+            namespace: b'-',
+            url: "style.css",
+            title: "Style",
+            mime: 1,
+            cluster: 0,
+            blob: 0,
+        }),
+        Dir::Art(Article {
+            namespace: b'A',
+            url: "home",
+            title: "Home",
+            mime: 0,
+            cluster: 0,
+            blob: 1,
+        }),
+        Dir::Art(Article {
+            namespace: b'I',
+            url: "image",
+            title: "Image",
+            mime: 1,
+            cluster: 0,
+            blob: 2,
+        }),
+    ];
+    let mut zim = build_zim(
+        false,
+        Some(1),
+        &dirents,
+        &[0, 1, 2],
+        &[build_uncompressed_cluster(&[
+            b"body{}",
+            b"<h1>Home</h1>",
+            b"pixels",
+        ])],
+        &["text/html", "text/plain"],
+        false,
+    );
+    zim[4..6].copy_from_slice(&6u16.to_le_bytes());
+    let path = write_temp("legacy_60", &zim);
+    let archive = Archive::open(&path).unwrap();
+    assert!(!archive.header().uses_new_namespaces());
+    assert_eq!(archive.get_bytes("-/style.css").unwrap(), b"body{}");
+    assert_eq!(archive.get_bytes("A/home").unwrap(), b"<h1>Home</h1>");
+    assert_eq!(archive.get_bytes("home").unwrap(), b"<h1>Home</h1>");
+    assert_eq!(archive.get_bytes("I/image").unwrap(), b"pixels");
+    assert_eq!(
+        archive.get_entry_by_title("Home").unwrap().namespace(),
+        b'A'
+    );
+    assert_eq!(archive.article_and_media_counts().unwrap(), (1, 2));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn checksum_offset_overflow_is_a_truncation_error() {
+    let mut zim = build_zim(true, None, &[], &[], &[], &[], false);
+    zim[72..80].copy_from_slice(&u64::MAX.to_le_bytes());
+    let path = write_temp("checksum_max", &zim);
+    let archive = Archive::open(&path).unwrap();
+    assert!(matches!(
+        archive.checksum(),
+        Err(Error::Truncated(u64::MAX))
+    ));
+    std::fs::remove_file(path).unwrap();
+}
+
+fn coexistence_zim(header: &[u32], v0: &[u32], v1: &[u32]) -> Vec<u8> {
+    let dirents = [
+        Dir::Art(Article {
+            namespace: b'C',
+            url: "alpha",
+            title: "",
+            mime: 0,
+            cluster: 0,
+            blob: 0,
+        }),
+        Dir::Art(Article {
+            namespace: b'C',
+            url: "beta",
+            title: "Beta",
+            mime: 0,
+            cluster: 0,
+            blob: 1,
+        }),
+        Dir::Art(Article {
+            namespace: b'C',
+            url: "image",
+            title: "Icon",
+            mime: 1,
+            cluster: 0,
+            blob: 2,
+        }),
+        Dir::Art(Article {
+            namespace: b'M',
+            url: "Title",
+            title: "",
+            mime: 1,
+            cluster: 0,
+            blob: 3,
+        }),
+        Dir::Art(Article {
+            namespace: b'X',
+            url: "listing/titleOrdered/v0",
+            title: "",
+            mime: 1,
+            cluster: 0,
+            blob: 4,
+        }),
+        Dir::Art(Article {
+            namespace: b'X',
+            url: "listing/titleOrdered/v1",
+            title: "",
+            mime: 1,
+            cluster: 0,
+            blob: 5,
+        }),
+    ];
+    let v0: Vec<u8> = v0.iter().flat_map(|i| i.to_le_bytes()).collect();
+    let v1: Vec<u8> = v1.iter().flat_map(|i| i.to_le_bytes()).collect();
+    build_zim(
+        true,
+        Some(0),
+        &dirents,
+        header,
+        &[build_uncompressed_cluster(&[
+            b"alpha body",
+            b"beta body",
+            b"pixels",
+            b"Catalog",
+            &v0,
+            &v1,
+        ])],
+        &["text/html", "application/octet-stream"],
+        false,
+    )
+}
+
+#[test]
+fn modern_article_listing_wins_over_coexisting_full_tables() {
+    let full = [1, 2, 0, 3, 4, 5];
+    let zim = coexistence_zim(&full, &full, &[1, 0]);
+    let path = write_temp("titles_coexist", &zim);
+    let archive = Archive::open(&path).unwrap();
+    assert_eq!(archive.title_listing().unwrap().as_ref(), &[1, 0]);
+    assert_eq!(archive.title_count().unwrap(), 2);
+    let titles: Vec<_> = archive
+        .iter_by_title()
+        .map(|e| e.unwrap().title().to_owned())
+        .collect();
+    assert_eq!(titles, ["Beta", "alpha"]);
+    assert_eq!(archive.title_prefix_range(b'C', "a").unwrap(), 1..2);
+    // The article subset does not make ordinary title/path lookup lose media.
+    assert_eq!(archive.get_entry_by_title("Icon").unwrap().path(), "image");
+    assert_eq!(
+        archive.entry_by_ns_title(b'M', "Title").unwrap().path(),
+        "Title"
+    );
+    assert_eq!(archive.get_bytes("image").unwrap(), b"pixels");
+    assert!(archive.check_title_index().unwrap());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn title_integrity_checks_every_table_not_just_the_selected_subset() {
+    let full = [1, 2, 0, 3, 4, 5];
+    let duplicate = [1, 2, 0, 3, 4, 4];
+    for (name, header, v0, v1) in [
+        (
+            "bad_header",
+            duplicate.as_slice(),
+            full.as_slice(),
+            &[1, 0][..],
+        ),
+        ("bad_v0", full.as_slice(), duplicate.as_slice(), &[1, 0][..]),
+        ("short_v0", full.as_slice(), &[1, 0][..], &[1, 0][..]),
+        ("unsorted_v1", full.as_slice(), full.as_slice(), &[0, 1][..]),
+        ("metadata_v1", full.as_slice(), full.as_slice(), &[1, 3][..]),
+        (
+            "duplicate_v1",
+            full.as_slice(),
+            full.as_slice(),
+            &[1, 1][..],
+        ),
+        (
+            "out_of_range_v1",
+            full.as_slice(),
+            full.as_slice(),
+            &[6][..],
+        ),
+    ] {
+        let path = write_temp(name, &coexistence_zim(header, v0, v1));
+        let archive = Archive::open(&path).unwrap();
+        assert!(!archive.check_title_index().unwrap(), "{name}");
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn empty_modern_article_subset_does_not_fall_back_to_full_table() {
+    let full = [1, 2, 0, 3, 4, 5];
+    let path = write_temp("titles_empty_subset", &coexistence_zim(&full, &full, &[]));
+    let archive = Archive::open(&path).unwrap();
+    assert_eq!(archive.title_count().unwrap(), 0);
+    assert_eq!(archive.iter_by_title().count(), 0);
+    assert_eq!(archive.get_entry_by_title("Beta").unwrap().path(), "beta");
+    assert!(archive.check_title_index().unwrap());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn malformed_pointer_tables_fail_before_declared_count_allocations() {
+    let mut zim = build_zim(true, None, &[], &[], &[], &[], false);
+    zim[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+    let path = write_temp("huge_title_count", &zim);
+    let archive = Archive::open(&path).unwrap();
+    assert!(matches!(archive.title_listing(), Err(Error::Truncated(_))));
+    assert!(matches!(
+        archive.entry_by_url_index(0),
+        Err(Error::Truncated(_))
+    ));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn malformed_cluster_offsets_reject_unaligned_and_header_overlapping_ranges() {
+    for (name, words, blob) in [
+        ("unaligned", vec![9u32, 12, 12], 0),
+        ("inside_table", vec![12u32, 8, 12], 1),
+        ("past_payload", vec![8u32, u32::MAX, 12], 0),
+    ] {
+        let mut cluster = vec![1];
+        cluster.extend(words.into_iter().flat_map(u32::to_le_bytes));
+        let dirents = [Dir::Art(Article {
+            namespace: b'C',
+            url: "bad",
+            title: "",
+            mime: 0,
+            cluster: 0,
+            blob,
+        })];
+        let zim = build_zim(
+            true,
+            None,
+            &dirents,
+            &[0],
+            &[cluster],
+            &["text/plain"],
+            false,
+        );
+        let path = write_temp(name, &zim);
+        let archive = Archive::open(&path).unwrap();
+        assert!(archive.validate_cluster(0).is_err(), "{name}");
+        assert!(archive.blob_direct_access(0, blob).is_err(), "{name}");
+        assert!(archive.get_bytes("bad").is_err(), "{name}");
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn cluster_reference_validation_checks_compressed_and_direct_blob_indices() {
+    for (name, cluster) in [
+        ("refs_direct", build_uncompressed_cluster(&[b"body"])),
+        ("refs_compressed", build_zstd_cluster(&[b"body"])),
+    ] {
+        let dirents = [Dir::Art(Article {
+            namespace: b'C',
+            url: "home",
+            title: "",
+            mime: 0,
+            cluster: 0,
+            blob: 0,
+        })];
+        let zim = build_zim(
+            true,
+            None,
+            &dirents,
+            &[0],
+            &[cluster],
+            &["text/plain"],
+            false,
+        );
+        let path = write_temp(name, &zim);
+        let archive = Archive::open(&path).unwrap();
+        archive.validate_cluster_references(0, &[0]).unwrap();
+        assert!(matches!(
+            archive.validate_cluster_references(0, &[1]),
+            Err(Error::BadBlobIndex {
+                blob: 1,
+                count: 1,
+                ..
+            })
+        ));
+        assert_eq!(archive.get_bytes("home").unwrap(), b"body");
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn modern_v0_only_archive_keeps_its_full_title_listing() {
+    let full = [1, 2, 0, 3, 4, 5];
+    let mut zim = coexistence_zim(&full, &full, &[]);
+    zim[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+    // Rename v1 to an ordinary index entry, leaving only v0 available.
+    let name = b"listing/titleOrdered/v1";
+    let start = zim.windows(name.len()).position(|s| s == name).unwrap();
+    zim[start + name.len() - 1] = b'2';
+    let path = write_temp("titles_v0_only", &zim);
+    let archive = Archive::open(&path).unwrap();
+    assert_eq!(archive.title_count().unwrap(), 6);
+    let paths: Vec<_> = archive
+        .iter_by_title()
+        .map(|e| e.unwrap().path().to_owned())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "beta",
+            "image",
+            "alpha",
+            "Title",
+            "listing/titleOrdered/v0",
+            "listing/titleOrdered/v2"
+        ]
+    );
+    assert!(archive.check_title_index().unwrap());
+    std::fs::remove_file(path).unwrap();
+}

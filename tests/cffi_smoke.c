@@ -77,12 +77,16 @@ int main(int argc, char **argv) {
     if (!e) {
         DIE("get_entry_by_path(home): %s", err ? zimru_error_message(err) : "?");
     }
+    if (strcmp(zimru_entry_path(e), "home") != 0)
+        DIE("modern entry path must be home without namespace prefix");
     fprintf(stderr, "home title: %s\n", zimru_entry_title(e));
 
     zimru_item_t *it = zimru_entry_get_item(e, true, &err);
     if (!it) {
         DIE("get_item: %s", err ? zimru_error_message(err) : "?");
     }
+    if (strcmp(zimru_item_path(it), "home") != 0)
+        DIE("modern item path must be home without namespace prefix");
     const char *mime = zimru_item_mimetype(it);
     fprintf(stderr, "home mime: %s\n", mime);
     if (strcmp(mime, "text/html") != 0) {

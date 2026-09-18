@@ -1,5 +1,10 @@
 # Wikipedia ZIM build — the highest-value target for zimru
 
+> **Historical note.** This document describes an earlier revision and its
+> measurements or plans at the time of writing. It is not a statement of
+> current behavior, support or open bugs; for those see the README
+> compatibility matrix, the generated API docs and CHANGELOG.md.
+
 The Kiwix zim farm at <https://farm.openzim.org> builds the world's
 public ZIM corpus on a fleet of worker bots. The biggest, slowest,
 and most user-visible job in that fleet is **English Wikipedia

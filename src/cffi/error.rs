@@ -14,7 +14,7 @@ pub struct zimru_error_t {
 /// Numeric error codes corresponding to [`crate::Error`] variants. Stable
 /// across releases — new variants are added at the end.
 #[repr(i32)]
-pub enum zimru_error_code {
+pub enum zimru_error_code_t {
     Unknown = 0,
     Io = 1,
     BadMagic = 2,
@@ -33,27 +33,27 @@ pub enum zimru_error_code {
     NotAnItem = 15,
 }
 
-impl From<&Error> for zimru_error_code {
+impl From<&Error> for zimru_error_code_t {
     fn from(e: &Error) -> Self {
         match e {
-            Error::Io(_) => zimru_error_code::Io,
-            Error::BadMagic(_) => zimru_error_code::BadMagic,
-            Error::Truncated(_) => zimru_error_code::Truncated,
-            Error::UnsupportedCompression(_) => zimru_error_code::UnsupportedCompression,
-            Error::UnsupportedVersion { .. } => zimru_error_code::UnsupportedVersion,
-            Error::EntryNotFound => zimru_error_code::EntryNotFound,
-            Error::NoMainEntry => zimru_error_code::NoMainEntry,
-            Error::NoChecksum => zimru_error_code::NoChecksum,
+            Error::Io(_) => Self::Io,
+            Error::BadMagic(_) => Self::BadMagic,
+            Error::Truncated(_) => Self::Truncated,
+            Error::UnsupportedCompression(_) => Self::UnsupportedCompression,
+            Error::UnsupportedVersion { .. } => Self::UnsupportedVersion,
+            Error::EntryNotFound => Self::EntryNotFound,
+            Error::NoMainEntry => Self::NoMainEntry,
+            Error::NoChecksum => Self::NoChecksum,
             Error::BadUrlIndex(_, _)
             | Error::BadTitleIndex(_, _)
             | Error::BadClusterIndex(_, _)
-            | Error::BadBlobIndex { .. } => zimru_error_code::BadIndex,
-            Error::Decompression(_) => zimru_error_code::Decompression,
-            Error::RedirectLoop => zimru_error_code::RedirectLoop,
-            Error::BadUtf8(_) => zimru_error_code::BadUtf8,
-            Error::BadMimeIndex(_) => zimru_error_code::BadMimeIndex,
-            Error::ChecksumMismatch { .. } => zimru_error_code::ChecksumMismatch,
-            Error::NotAnItem => zimru_error_code::NotAnItem,
+            | Error::BadBlobIndex { .. } => Self::BadIndex,
+            Error::Decompression(_) => Self::Decompression,
+            Error::RedirectLoop => Self::RedirectLoop,
+            Error::BadUtf8(_) => Self::BadUtf8,
+            Error::BadMimeIndex(_) => Self::BadMimeIndex,
+            Error::ChecksumMismatch { .. } => Self::ChecksumMismatch,
+            Error::NotAnItem => Self::NotAnItem,
         }
     }
 }
@@ -65,7 +65,7 @@ pub(crate) fn set_err(out: *mut *mut zimru_error_t, err: Error) {
     if out.is_null() {
         return;
     }
-    let code = zimru_error_code::from(&err) as i32;
+    let code = zimru_error_code_t::from(&err) as i32;
     let msg = CString::new(err.to_string()).unwrap_or_else(|_| CString::new("error").unwrap());
     let boxed = Box::new(zimru_error_t { code, message: msg });
     unsafe {
@@ -83,11 +83,11 @@ pub unsafe extern "C" fn zimru_error_message(err: *const zimru_error_t) -> *cons
     (*err).message.as_ptr()
 }
 
-/// Numeric error code (see `zimru_error_code` enum).
+/// Numeric error code (see [`zimru_error_code_t`]).
 #[no_mangle]
 pub unsafe extern "C" fn zimru_error_code(err: *const zimru_error_t) -> i32 {
     if err.is_null() {
-        return zimru_error_code::Unknown as i32;
+        return zimru_error_code_t::Unknown as i32;
     }
     (*err).code
 }
