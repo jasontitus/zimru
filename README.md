@@ -69,7 +69,7 @@ memory for entry indexes, worker state and the largest active clusters.
 | Binary | Purpose | Important distinction |
 |---|---|---|
 | `zimru` | Inspect, fetch content, verify checksums, read all blobs | Native interface; put the archive path before `readall` flags. |
-| `zimcheck` | Structural, checksum, metadata and content checks | `-I` checks structure and references; `-C` checks MD5; neither establishes the correctness of HTML itself. |
+| `zimcheck` | Structural, checksum, metadata and content checks | `-I` checks structure and references; `-C` checks MD5; neither establishes the correctness of HTML itself. `-A` reports every dangling internal link it finds; on some archives upstream 3.8.0 reports a subset (observed: 44 vs 75 verified-missing targets on `wikipedia_zh_chemistry_mini_2026-09`), so `bench/parity.sh` can show a `zimcheck-all` DIFF that is not a zimru defect. |
 | `zimdump` | `info`, `list`, `show`, `dump`, `analyze` | `analyze` is a zimru extension. Extraction rejects unsafe filesystem destinations; HTML redirects differ from symlink redirects. |
 | `zimbench` | Sequential/random read workloads | Its workload and reports are not a general speed comparison with upstream. |
 | `zimsplit` | Split a ZIM at cluster boundaries | Refuses existing output parts and source aliases. A cluster may exceed the requested part-size target. |

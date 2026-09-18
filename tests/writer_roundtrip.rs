@@ -546,6 +546,14 @@ fn auto_counter_counts_pending_content() {
     c.set_main_path("home");
     c.add_item(Item::html("home", "Home", "<html><body>a</body></html>"));
     c.add_item(Item::html("about", "About", "<html><body>b</body></html>"));
+    // Parameterised media types fold onto the bare type: zimcheck's Counter
+    // grammar admits neither `;` nor spaces inside a key.
+    c.add_item(Item::new(
+        "legacy",
+        "Legacy",
+        "text/html; charset=iso-8859-1",
+        b"<html><body>c</body></html>".to_vec(),
+    ));
     c.add_item(Item::new(
         "logo.png",
         "Logo",
@@ -560,8 +568,12 @@ fn auto_counter_counts_pending_content() {
     let counter = String::from_utf8(arc.get_metadata("Counter").expect("Counter present"))
         .expect("Counter is utf8");
     assert!(
-        counter.contains("text/html=2"),
-        "counter should count both html articles, got {counter:?}"
+        counter.contains("text/html=3"),
+        "counter should fold the charset variant into text/html, got {counter:?}"
+    );
+    assert!(
+        !counter.contains("charset"),
+        "counter keys must not carry MIME parameters, got {counter:?}"
     );
     assert!(
         counter.contains("image/png=1"),

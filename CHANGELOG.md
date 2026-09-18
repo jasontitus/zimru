@@ -216,5 +216,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every namespace. `dump_errors.log` is written only when an entry failed.
   Verified on Linux against official zim-tools 3.8.0: dump trees identical
   on all three fixtures.
+- `writer`: the auto-generated `M/Counter` folds MIME parameters onto the
+  bare media type (`text/html; charset=iso-8859-1` counts as `text/html`),
+  matching libzim and zimcheck's Counter grammar; previously such an item
+  produced an invalid Counter entry on recreate.
+- Known difference: `zimcheck -A` reports every dangling internal link;
+  upstream 3.8.0 omits some on certain archives (see README tool table).
 
 [Unreleased]: https://github.com/jasontitus/zimru/compare/main...HEAD

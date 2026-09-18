@@ -1305,13 +1305,14 @@ fn intern_mime(m: &str, mimes: &mut Vec<String>, index: &mut BTreeMap<String, u1
 /// only content-namespace (`C`) article dirents — redirect dirents
 /// have no body / no mime, and metadata / index entries are excluded
 /// to match libzim's Counter semantics (and zimcheck's counter
-/// validation). `article_mimes` must yield the `(namespace,
+/// validation). Media-type parameters are folded away: an item typed
+/// `text/html; charset=iso-8859-1` counts under `text/html`, since the
+/// Counter grammar checked by zimcheck admits neither `;` nor spaces
+/// inside a key. `article_mimes` must yield the `(namespace,
 /// mime_idx)` of every article that will land in the archive —
 /// committed dirents AND still-pending bucket entries, since Counter
-/// is generated before the final flush. Returned in the order mimes
-/// were interned, which is also the order they appear in the
-/// trailing mime list — so `Counter` parses one-pass alongside the
-/// mime list.
+/// is generated before the final flush. Keys appear in the order their
+/// first mime was interned, matching the trailing mime list.
 fn build_counter_string(
     mimes: &[String],
     article_mimes: impl Iterator<Item = (u8, u16)>,
@@ -1326,19 +1327,27 @@ fn build_counter_string(
             counts[i] += 1;
         }
     }
-    let mut out = String::new();
-    let mut first = true;
+    // Fold parameterised variants onto their bare media type, keeping
+    // first-seen order.
+    let mut keys: Vec<(&str, u64)> = Vec::new();
     for (i, m) in mimes.iter().enumerate() {
         if counts[i] == 0 {
             continue;
         }
-        if !first {
+        let key = m.split(';').next().unwrap_or(m).trim();
+        match keys.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += counts[i],
+            None => keys.push((key, counts[i])),
+        }
+    }
+    let mut out = String::new();
+    for (i, (key, n)) in keys.iter().enumerate() {
+        if i > 0 {
             out.push(';');
         }
-        first = false;
-        out.push_str(m);
+        out.push_str(key);
         out.push('=');
-        out.push_str(&counts[i].to_string());
+        out.push_str(&n.to_string());
     }
     out
 }
