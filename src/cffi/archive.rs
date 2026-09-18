@@ -516,7 +516,7 @@ pub unsafe extern "C" fn zimru_archive_checksum_hex(
         }
     };
     static HEX: &[u8; 16] = b"0123456789abcdef";
-    let out_bytes = std::slice::from_raw_parts_mut(out as *mut u8, 32);
+    let out_bytes = std::slice::from_raw_parts_mut(out.cast::<u8>(), 32);
     for (i, &b) in bytes.iter().enumerate() {
         out_bytes[i * 2] = HEX[(b >> 4) as usize];
         out_bytes[i * 2 + 1] = HEX[(b & 0x0f) as usize];
